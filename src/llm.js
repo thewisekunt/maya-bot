@@ -8,39 +8,87 @@ const FALLBACKS = [
   "Arey, kuch toh hua — phir try kar! 😬",
 ];
 
-const SYSTEM_PROMPT = `You are Maya — a witty, slightly savage Discord bestie from India.
+const BASE_SYSTEM = `You are Maya — a witty, slightly savage Discord bestie from India.
 You speak Hinglish (casual mix of Hindi and English) when it fits naturally.
 Be warm, playful, and sometimes sarcastic — but NEVER rude, offensive, or mean-spirited.
 Keep replies SHORT: 1–2 punchy sentences max. Use emojis sparingly but naturally.
 Never admit you are an AI. Never break character. Never give long essays.
 
 IMPORTANT — Sometimes a simple reaction is better than a reply.
-If the message is something you'd just react to in real life (a meme, a one-word message,
-someone saying "lol", "same", "ok", "haha", "nice", a simple statement that needs no response, etc.)
-respond with ONLY this format:
+If the message is something you'd just react to in real life (a meme, "lol", "same",
+"ok", "nice", a simple statement needing no response) respond ONLY with:
   REACT:<emoji>
-For example:  REACT:😂  or  REACT:💀  or  REACT:👀
-Use REACT only when a reaction genuinely fits better than words.
-Otherwise reply normally as Maya.`;
+For example: REACT:😂  or REACT:💀  or REACT:👀
+Use REACT only when a reaction genuinely fits better than words. Otherwise reply normally.`;
 
 /**
- * Call the OpenRouter LLM.
- * Returns either:
- *   { type: 'reply',  text: '...' }
- *   { type: 'react',  emoji: '😂' }
+ * Call the LLM with full context awareness.
+ *
+ * @returns {{ type: 'reply', text: string } | { type: 'react', emoji: string }}
  */
-export async function getMayaReply({ prefName, context, message, entropy, zone, zoneLine }) {
-  const userPrompt =
-    `Entropy: ${entropy} | Zone: ${zone}\n` +
-    `${zoneLine}\n\n` +
-    (context ? `Recent conversation:\n${context}\n\n` : '') +
-    `${prefName}: ${message}\n` +
-    `Maya:`;
+export async function getMayaReply({
+  prefName,
+  context,
+  message,
+  entropy,
+  zone,
+  zoneLine,
+  contextLine,      // "You are in #general on XYZ server" or DM line
+  knownFacts,       // string[] of known user facts
+  relationship,     // { trustLevel, vibe, nickname, insideJokes, ... }
+  frequentFriends,  // [{ name, count }] people they talk to a lot
+}) {
+  // ── Build dynamic system prompt ─────────────────────────────────────────────
+  const parts = [BASE_SYSTEM, ''];
 
+  // Context awareness
+  if (contextLine) parts.push(contextLine);
+
+  // Relationship layer
+  if (relationship) {
+    const trust = relationship.trustLevel;
+    const vibeMap = {
+      1: 'This is basically a stranger — be polite but guarded.',
+      2: 'You\'ve talked a bit — be friendly but not too familiar.',
+      3: 'You know this person — be yourself, casual and warm.',
+      4: 'You\'re pretty close — be playful, tease a little.',
+      5: 'This is your bestie — full sass, inside jokes, no filter (but stay kind).',
+    };
+    parts.push(`Relationship with ${prefName}: Trust level ${trust}/5. ${vibeMap[trust] || vibeMap[3]}`);
+    if (relationship.vibe !== 'neutral') parts.push(`Their vibe with you: ${relationship.vibe}`);
+    if (relationship.nickname) parts.push(`You call them: "${relationship.nickname}"`);
+    if (relationship.insideJokes?.length) {
+      parts.push(`Running jokes between you: ${relationship.insideJokes.slice(0,3).join(', ')}`);
+    }
+    if (relationship.topicsTheyLike?.length) {
+      parts.push(`They enjoy talking about: ${relationship.topicsTheyLike.slice(0,3).join(', ')}`);
+    }
+  }
+
+  // Known facts about the user
+  if (knownFacts?.length) {
+    parts.push(`What you know about ${prefName}: ${knownFacts.slice(0,5).join('; ')}`);
+  }
+
+  // Who they frequently talk to (social awareness)
+  if (frequentFriends?.length) {
+    const names = frequentFriends.map(f => f.name).join(', ');
+    parts.push(`${prefName} often chats with: ${names}`);
+  }
+
+  const systemPrompt = parts.join('\n');
+
+  // ── Build user prompt ───────────────────────────────────────────────────────
+  const userPrompt =
+    `Entropy: ${entropy} | Zone: ${zone}\n${zoneLine}\n\n` +
+    (context ? `Recent conversation:\n${context}\n\n` : '') +
+    `${prefName}: ${message}\nMaya:`;
+
+  // ── Call LLM ────────────────────────────────────────────────────────────────
   const payload = {
     model:       config.llm.model,
     messages:    [
-      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'system', content: systemPrompt },
       { role: 'user',   content: userPrompt },
     ],
     temperature: config.llm.temperature,
@@ -50,7 +98,6 @@ export async function getMayaReply({ prefName, context, message, entropy, zone, 
   const retries = 2;
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (attempt > 0) await sleep(900 * attempt);
-
     try {
       const { data, status } = await axios.post(config.llm.endpoint, payload, {
         headers: {
@@ -63,29 +110,18 @@ export async function getMayaReply({ prefName, context, message, entropy, zone, 
         validateStatus: () => true,
       });
 
-      if (status === 429) {
-        console.warn(`[llm] 429 rate limit — attempt ${attempt + 1}`);
-        await sleep(2000);
-        continue;
-      }
-      if (status !== 200) {
-        console.error(`[llm] HTTP ${status}:`, JSON.stringify(data).slice(0, 200));
-        break;
-      }
+      if (status === 429) { await sleep(2000); continue; }
+      if (status !== 200) { console.error(`[llm] HTTP ${status}`); break; }
 
       const raw = data?.choices?.[0]?.message?.content?.trim();
-      if (!raw) { console.warn('[llm] Empty reply'); break; }
+      if (!raw) break;
 
-      // Parse REACT:<emoji> format
       const reactMatch = raw.match(/^REACT:(\S+)$/i);
-      if (reactMatch) {
-        return { type: 'react', emoji: reactMatch[1] };
-      }
-
+      if (reactMatch) return { type: 'react', emoji: reactMatch[1] };
       return { type: 'reply', text: raw };
 
     } catch (err) {
-      console.error(`[llm] Request error (attempt ${attempt + 1}):`, err.message);
+      console.error(`[llm] attempt ${attempt + 1}:`, err.message);
     }
   }
 
