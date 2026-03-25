@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { Client, GatewayIntentBits, Partials, Events, ActivityType } from 'discord.js';
 import { config } from './config.js';
 import { handleMessage } from './handler.js';
+import { acquireLock, releaseLock } from './lock.js';
 
 // ── Discord client ────────────────────────────────────────────────────────────
 const client = new Client({
@@ -13,10 +14,6 @@ const client = new Client({
   ],
   partials: [Partials.Channel],
 });
-
-// ── Deduplication — prevents double processing if event fires twice ───────────
-// Stores message IDs currently being processed. Cleared after response sent.
-const processing = new Set();
 
 // ── Ready ─────────────────────────────────────────────────────────────────────
 client.once(Events.ClientReady, () => {
@@ -32,28 +29,34 @@ client.on(Events.MessageCreate, async (msg) => {
   const content = msg.content.trim();
   if (!content) return;
 
-  // ── Dedup guard — drop if already handling this message ID ─────────────────
-  if (processing.has(msg.id)) return;
-
   // ── Channel filter ──────────────────────────────────────────────────────────
   const allowed = config.discord.allowedChannels;
   if (allowed.length > 0 && msg.guild && !allowed.includes(msg.channel.id)) return;
 
-  // ── Trigger: @mention OR DM only (no prefix anymore) ───────────────────────
-  const isMention = msg.mentions.has(client.user);
-  const isDM      = !msg.guild;
+  // ── Trigger detection ───────────────────────────────────────────────────────
+  const isMention  = msg.mentions.has(client.user);
+  const isDM       = !msg.guild;
+  // Keyword match: message contains "maya" as a word (case-insensitive)
+  const hasKeyword = /\bmaya\b/i.test(content);
 
-  if (!isMention && !isDM) return;
+  if (!isMention && !isDM && !hasKeyword) return;
 
-  // Mark as being processed immediately to block any duplicate event
-  processing.add(msg.id);
+  // ── Distributed lock — only ONE instance processes each message ─────────────
+  // Uses the DB so all Koyeb instances share the same lock state
+  const lockKey = `msg_${msg.id}`;
+  const locked  = await acquireLock(lockKey);
+  if (!locked) {
+    // Another instance already grabbed this message — skip silently
+    console.log(`[bot] Lock miss for ${msg.id} — another instance handling it`);
+    return;
+  }
 
-  // Strip the @mention from text
+  // ── Clean text: strip @mentions ────────────────────────────────────────────
   let text = content.replace(/<@!?\d+>/g, '').trim();
 
   if (!text) {
     await msg.reply('Bol bhai, kuch toh bol! 😏').catch(() => {});
-    processing.delete(msg.id);
+    await releaseLock(lockKey);
     return;
   }
 
@@ -74,19 +77,15 @@ client.on(Events.MessageCreate, async (msg) => {
     });
 
     if (result.type === 'react') {
-      // Just add an emoji reaction — no text reply
       await msg.react(result.emoji).catch(async () => {
-        // If reaction fails (invalid emoji, missing perms), fall back to a reply
         await msg.reply('😏').catch(() => {});
       });
-
     } else {
-      // Normal text reply — split if over Discord's 2000 char limit
-      const text = result.text;
-      if (text.length <= 2000) {
-        await msg.reply(text);
+      const replyText = result.text;
+      if (replyText.length <= 2000) {
+        await msg.reply(replyText);
       } else {
-        const chunks = text.match(/[\s\S]{1,1990}/g) || [text];
+        const chunks = replyText.match(/[\s\S]{1,1990}/g) || [replyText];
         for (const chunk of chunks) {
           await msg.channel.send(chunk);
         }
@@ -97,8 +96,7 @@ client.on(Events.MessageCreate, async (msg) => {
     console.error('[bot] handleMessage error:', err);
     await msg.reply('Yaar kuch gadbad ho gayi, try again kar! 😅').catch(() => {});
   } finally {
-    // Always clear the dedup entry when done
-    processing.delete(msg.id);
+    await releaseLock(lockKey);
   }
 });
 
