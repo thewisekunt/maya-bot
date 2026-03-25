@@ -94,7 +94,7 @@ client.on(Events.MessageCreate, async (msg) => {
     }
 
   } catch (err) {
-    console.error('[bot] handleMessage error:', err);
+    console.error('[bot] handleMessage FULL ERROR:', err);
     await msg.reply('Yaar kuch gadbad ho gayi, try again kar! 😅').catch(() => {});
   } finally {
     await releaseLock(lockKey);

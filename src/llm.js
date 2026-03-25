@@ -99,6 +99,9 @@ export async function getMayaReply({
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (attempt > 0) await sleep(900 * attempt);
     try {
+      console.log(`[llm] attempt ${attempt + 1} — model: ${config.llm.model}`);
+      console.log(`[llm] apiKey present: ${!!config.llm.apiKey}, length: ${config.llm.apiKey?.length}`);
+
       const { data, status } = await axios.post(config.llm.endpoint, payload, {
         headers: {
           'Content-Type':  'application/json',
@@ -110,11 +113,23 @@ export async function getMayaReply({
         validateStatus: () => true,
       });
 
-      if (status === 429) { await sleep(2000); continue; }
-      if (status !== 200) { console.error(`[llm] HTTP ${status}`); break; }
+      console.log(`[llm] response status: ${status}`);
+
+      if (status === 429) {
+        console.error('[llm] 429 rate limited');
+        await sleep(2000); continue;
+      }
+      if (status !== 200) {
+        console.error(`[llm] HTTP ${status} — full body:`, JSON.stringify(data));
+        break;
+      }
 
       const raw = data?.choices?.[0]?.message?.content?.trim();
-      if (!raw) break;
+      console.log(`[llm] raw reply: ${raw?.slice(0, 100)}`);
+      if (!raw) {
+        console.error('[llm] empty reply — full response:', JSON.stringify(data));
+        break;
+      }
 
       const reactMatch = raw.match(/^REACT:(\S+)$/i);
       if (reactMatch) return { type: 'react', emoji: reactMatch[1] };
