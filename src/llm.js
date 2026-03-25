@@ -12,18 +12,22 @@ const SYSTEM_PROMPT = `You are Maya — a witty, slightly savage Discord bestie 
 You speak Hinglish (casual mix of Hindi and English) when it fits naturally.
 Be warm, playful, and sometimes sarcastic — but NEVER rude, offensive, or mean-spirited.
 Keep replies SHORT: 1–2 punchy sentences max. Use emojis sparingly but naturally.
-Never admit you are an AI. Never break character. Never give long essays.`;
+Never admit you are an AI. Never break character. Never give long essays.
+
+IMPORTANT — Sometimes a simple reaction is better than a reply.
+If the message is something you'd just react to in real life (a meme, a one-word message,
+someone saying "lol", "same", "ok", "haha", "nice", a simple statement that needs no response, etc.)
+respond with ONLY this format:
+  REACT:<emoji>
+For example:  REACT:😂  or  REACT:💀  or  REACT:👀
+Use REACT only when a reaction genuinely fits better than words.
+Otherwise reply normally as Maya.`;
 
 /**
- * Call the OpenRouter LLM and return Maya's reply string.
- *
- * @param {string} prefName    - The user's preferred display name
- * @param {string} context     - Recent conversation history block
- * @param {string} message     - The new user message
- * @param {number} entropy     - 0.0–1.0 mood signal
- * @param {string} zone        - 'Restful' | 'Social' | 'Chaos'
- * @param {string} zoneLine    - Human-readable zone description
- * @returns {Promise<string>}
+ * Call the OpenRouter LLM.
+ * Returns either:
+ *   { type: 'reply',  text: '...' }
+ *   { type: 'react',  emoji: '😂' }
  */
 export async function getMayaReply({ prefName, context, message, entropy, zone, zoneLine }) {
   const userPrompt =
@@ -56,7 +60,7 @@ export async function getMayaReply({ prefName, context, message, entropy, zone, 
           'X-Title':       'MayaDiscordBot',
         },
         timeout: 30_000,
-        validateStatus: () => true,   // handle all status codes ourselves
+        validateStatus: () => true,
       });
 
       if (status === 429) {
@@ -69,18 +73,23 @@ export async function getMayaReply({ prefName, context, message, entropy, zone, 
         break;
       }
 
-      const reply = data?.choices?.[0]?.message?.content?.trim();
-      if (reply) return reply;
+      const raw = data?.choices?.[0]?.message?.content?.trim();
+      if (!raw) { console.warn('[llm] Empty reply'); break; }
 
-      console.warn('[llm] Empty reply from model');
-      break;
+      // Parse REACT:<emoji> format
+      const reactMatch = raw.match(/^REACT:(\S+)$/i);
+      if (reactMatch) {
+        return { type: 'react', emoji: reactMatch[1] };
+      }
+
+      return { type: 'reply', text: raw };
 
     } catch (err) {
       console.error(`[llm] Request error (attempt ${attempt + 1}):`, err.message);
     }
   }
 
-  return FALLBACKS[Math.floor(Math.random() * FALLBACKS.length)];
+  return { type: 'reply', text: FALLBACKS[Math.floor(Math.random() * FALLBACKS.length)] };
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
