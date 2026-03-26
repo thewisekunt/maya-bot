@@ -75,14 +75,15 @@ const REACT_EMOJIS = {
  */
 export function checkSalience({
   text,
-  isMention  = false,
-  isDM       = false,
-  isReply    = false,
-  hasMedia   = false,
-  isLurking  = false,
-  lurkDepth  = 0,
-  trustLevel = 3,
-  entropy    = 0.4,
+  isMention          = false,
+  isDM               = false,
+  isReply            = false,
+  hasMedia           = false,
+  mediaSuggestsReply = false,  // vision layer hint: image/embed is worth discussing
+  isLurking          = false,
+  lurkDepth          = 0,
+  trustLevel         = 3,
+  entropy            = 0.4,
 }) {
   const words     = text.trim().split(/\s+/).filter(Boolean);
   const wordCount = words.length;
@@ -104,6 +105,16 @@ export function checkSalience({
   // She won't spam every message, but she'll engage selectively.
   if (isLurking) {
     return evaluateLurk({ text, wordCount, entropy, trustLevel, lurkDepth, hasMedia });
+  }
+
+  // ── RULE 1.5: Media with real content (vision said it's interesting) ───────
+  // Not a mention, but vision analysed the image and it seems worth discussing
+  if (hasMedia && mediaSuggestsReply && trustLevel >= 3) {
+    return reply('vision: media suggests reply');
+  }
+  // GIF / sticker / low-value media without mention → react at most
+  if (hasMedia && !mediaSuggestsReply && !isMention && !isDM) {
+    return react(pickEmoji('neutral'), 'media: low value, react only');
   }
 
   // ── RULE 2: Force-reply patterns (no ping needed) ────────────────────────
@@ -159,9 +170,13 @@ export function checkSalience({
  */
 function evaluateLurk({ text, wordCount, entropy, trustLevel, lurkDepth, hasMedia }) {
 
-  // Images/embeds in an active thread always get at least a react
-  if (hasMedia && lurkDepth <= 4) {
-    return react(pickEmoji('neutral'), `lurk: media at depth ${lurkDepth}`);
+  // Media in lurk: don't blindly react — run through normal content rules first.
+  // Only react if the content itself doesn't warrant a reply or ignore.
+  // The media description is already in `text` at this point (from vision.js),
+  // so we let the word/entropy/pattern rules below decide.
+  // Exception: pure media with no description → minimal react if very fresh
+  if (hasMedia && text === '[image: image]' && lurkDepth <= 2) {
+    return react(pickEmoji('neutral'), `lurk: bare image, fresh window`);
   }
 
   // Questions always worth answering even mid-lurk

@@ -8,23 +8,26 @@ const FALLBACKS = [
   "Arey, kuch toh hua — phir try kar! 😬",
 ];
 
+// Base system prompt — REACT instruction conditionally appended
 const BASE_SYSTEM = `You are Maya — a witty, slightly savage Discord bestie from India.
 You speak Hinglish (casual mix of Hindi and English) when it fits naturally.
 Be warm, playful, and sometimes sarcastic — but NEVER rude, offensive, or mean-spirited.
 Keep replies SHORT: 1–2 punchy sentences max. Use emojis sparingly but naturally.
-Never admit you are an AI. Never break character. Never give long essays.
+Never admit you are an AI. Never break character. Never give long essays.`;
 
-IMPORTANT — Sometimes a simple reaction is better than a reply.
+// Only injected when Maya is NOT in forceVerbal mode
+const REACT_INSTRUCTION = `
+
+OPTIONAL — Sometimes a simple reaction is better than a reply.
 If the message is something you'd just react to in real life (a meme, "lol", "same",
-"ok", "nice", a simple statement needing no response) respond ONLY with:
-  REACT:<emoji>
-For example: REACT:😂  or REACT:💀  or REACT:👀
-Use REACT only when a reaction genuinely fits better than words. Otherwise reply normally.`;
+"ok", "nice") respond ONLY with:  REACT:<emoji>
+Example: REACT:😂  or REACT:💀
+Use REACT only when a reaction genuinely fits. Otherwise reply normally with words.`;
 
 /**
- * Call the LLM with full context awareness.
- *
- * @returns {{ type: 'reply', text: string } | { type: 'react', emoji: string }}
+ * @param {object} params
+ * @param {boolean} forceVerbal — true = NEVER output REACT, must use words
+ * @returns {{ type: 'reply', text } | { type: 'react', emoji }}
  */
 export async function getMayaReply({
   prefName,
@@ -37,60 +40,56 @@ export async function getMayaReply({
   knownFacts,
   relationship,
   frequentFriends,
-  forceVerbal = false,  // when true: REACT is not allowed, must reply with words
+  forceVerbal = false,
 }) {
-  // ── Build dynamic system prompt ─────────────────────────────────────────────
-  const parts = [BASE_SYSTEM, ''];
+  // ── Build system prompt ───────────────────────────────────────────────────
+  // When forceVerbal: strip REACT instruction entirely so the model never
+  // even considers it as an option. This is more reliable than retrying.
+  const parts = [BASE_SYSTEM];
+  if (!forceVerbal) parts.push(REACT_INSTRUCTION);
+  parts.push('');
 
-  // Context awareness
   if (contextLine) parts.push(contextLine);
 
-  // Relationship layer
   if (relationship) {
     const trust = relationship.trustLevel;
     const vibeMap = {
       1: 'This is basically a stranger — be polite but guarded.',
-      2: 'You\'ve talked a bit — be friendly but not too familiar.',
+      2: "You've talked a bit — be friendly but not too familiar.",
       3: 'You know this person — be yourself, casual and warm.',
       4: 'You\'re pretty close — be playful, tease a little.',
       5: 'This is your bestie — full sass, inside jokes, no filter (but stay kind).',
     };
     parts.push(`Relationship with ${prefName}: Trust level ${trust}/5. ${vibeMap[trust] || vibeMap[3]}`);
-    if (relationship.vibe !== 'neutral') parts.push(`Their vibe with you: ${relationship.vibe}`);
+    if (relationship.vibe !== 'neutral') parts.push(`Their vibe: ${relationship.vibe}`);
     if (relationship.nickname) parts.push(`You call them: "${relationship.nickname}"`);
-    if (relationship.insideJokes?.length) {
-      parts.push(`Running jokes between you: ${relationship.insideJokes.slice(0,3).join(', ')}`);
-    }
-    if (relationship.topicsTheyLike?.length) {
-      parts.push(`They enjoy talking about: ${relationship.topicsTheyLike.slice(0,3).join(', ')}`);
-    }
+    if (relationship.insideJokes?.length)
+      parts.push(`Running jokes: ${relationship.insideJokes.slice(0,3).join(', ')}`);
+    if (relationship.topicsTheyLike?.length)
+      parts.push(`They like talking about: ${relationship.topicsTheyLike.slice(0,3).join(', ')}`);
   }
 
-  // Known facts about the user
-  if (knownFacts?.length) {
+  if (knownFacts?.length)
     parts.push(`What you know about ${prefName}: ${knownFacts.slice(0,5).join('; ')}`);
-  }
 
-  // Who they frequently talk to (social awareness)
-  if (frequentFriends?.length) {
-    const names = frequentFriends.map(f => f.name).join(', ');
-    parts.push(`${prefName} often chats with: ${names}`);
-  }
+  if (frequentFriends?.length)
+    parts.push(`${prefName} often chats with: ${frequentFriends.map(f=>f.name).join(', ')}`);
+
+  if (forceVerbal)
+    parts.push(`IMPORTANT: You MUST respond with actual words. No emoji-only responses.`);
 
   const systemPrompt = parts.join('\n');
 
-  // ── Build user prompt ───────────────────────────────────────────────────────
   const userPrompt =
     `Entropy: ${entropy} | Zone: ${zone}\n${zoneLine}\n\n` +
     (context ? `Recent conversation:\n${context}\n\n` : '') +
     `${prefName}: ${message}\nMaya:`;
 
-  // ── Call LLM ────────────────────────────────────────────────────────────────
   const payload = {
     model:       config.llm.model,
-    messages:    [
+    messages: [
       { role: 'system', content: systemPrompt },
-      { role: 'user',   content: userPrompt },
+      { role: 'user',   content: userPrompt   },
     ],
     temperature: config.llm.temperature,
     max_tokens:  config.llm.maxTokens,
@@ -100,8 +99,7 @@ export async function getMayaReply({
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (attempt > 0) await sleep(900 * attempt);
     try {
-      console.log(`[llm] attempt ${attempt + 1} — model: ${config.llm.model}`);
-      console.log(`[llm] apiKey present: ${!!config.llm.apiKey}, length: ${config.llm.apiKey?.length}`);
+      console.log(`[llm] attempt ${attempt + 1} — model: ${config.llm.model} forceVerbal: ${forceVerbal}`);
 
       const { data, status } = await axios.post(config.llm.endpoint, payload, {
         headers: {
@@ -114,35 +112,32 @@ export async function getMayaReply({
         validateStatus: () => true,
       });
 
-      console.log(`[llm] response status: ${status}`);
-
-      if (status === 429) {
-        console.error('[llm] 429 rate limited');
-        await sleep(2000); continue;
-      }
+      console.log(`[llm] status: ${status}`);
+      if (status === 429) { await sleep(2000); continue; }
       if (status !== 200) {
-        console.error(`[llm] HTTP ${status} — full body:`, JSON.stringify(data));
+        console.error(`[llm] HTTP ${status}:`, JSON.stringify(data).slice(0,300));
         break;
       }
 
       const raw = data?.choices?.[0]?.message?.content?.trim();
-      console.log(`[llm] raw reply: ${raw?.slice(0, 100)}`);
-      if (!raw) {
-        console.error('[llm] empty reply — full response:', JSON.stringify(data));
-        break;
-      }
+      console.log(`[llm] raw: ${raw?.slice(0, 120)}`);
+      if (!raw) break;
 
-      // If salience forced a verbal reply (e.g. mention+media), ignore REACT
+      // Parse REACT only when NOT forceVerbal
       if (!forceVerbal) {
         const reactMatch = raw.match(/^REACT:(\S+)$/i);
         if (reactMatch) return { type: 'react', emoji: reactMatch[1] };
       }
-      // Strip any REACT: prefix that slipped through
+
+      // Strip any accidental REACT: prefix (model sometimes adds it anyway)
       const cleaned = raw.replace(/^REACT:\S+\s*/i, '').trim();
-      return { type: 'reply', text: cleaned || raw };
+      if (cleaned) return { type: 'reply', text: cleaned };
+
+      // If stripping left nothing, retry
+      console.warn('[llm] reply was only a REACT token, retrying');
 
     } catch (err) {
-      console.error(`[llm] attempt ${attempt + 1}:`, err.message);
+      console.error(`[llm] error attempt ${attempt + 1}:`, err.message);
     }
   }
 

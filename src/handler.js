@@ -62,19 +62,19 @@ export async function handleMessage({
   let mediaContext = '';
   let richMessageText = message;
 
+  let mediaSuggestsReply = false;
   if (hasMedia) {
     try {
       const media = await extractMediaContext(msg);
       if (media.hasMedia) {
-        mediaContext = media.mediaContext;
-        // Build enriched message for salience + LLM
-        // Replace placeholder or append to existing text
+        mediaContext       = media.mediaContext;
+        mediaSuggestsReply = media.suggestReply;
         if (message === '[media]') {
           richMessageText = mediaContext;
         } else {
           richMessageText = `${message}\n${mediaContext}`;
         }
-        console.log(`[vision] extracted: ${mediaContext.slice(0, 120)}`);
+        console.log(`[vision] extracted (suggestReply=${media.suggestReply}): ${mediaContext.slice(0, 120)}`);
       }
     } catch (e) {
       console.error('[handler] vision extraction failed:', e.message);
@@ -95,20 +95,24 @@ export async function handleMessage({
   } catch { /* default */ }
 
   // ── 6. SALIENCE GATE ──────────────────────────────────────────────────────
-  // If message has media and is a mention/DM, bump entropy so salience
-  // doesn't ignore it (images shared to Maya should get a response)
-  const salienceEntropy = (hasMedia && (isMention || isDM)) ? 0.8 : entropy;
+  // Bump entropy when:
+  //   - directly mentioned with media (user shared something TO Maya)
+  //   - vision says the image/embed is worth talking about
+  const salienceEntropy = (isMention || isDM || mediaSuggestsReply)
+    ? Math.max(entropy, 0.75)
+    : entropy;
 
   const salience = checkSalience({
-    text:       richMessageText,
+    text:              richMessageText,
     isMention,
     isDM,
     isReply,
     hasMedia,
+    mediaSuggestsReply,
     isLurking,
     lurkDepth,
     trustLevel,
-    entropy:    salienceEntropy,
+    entropy:           salienceEntropy,
   });
 
   console.log(`[salience] user=${prefName} action=${salience.action} reason="${salience.reason}" media=${hasMedia}`);
