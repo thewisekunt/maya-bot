@@ -204,19 +204,33 @@ export function isConfigured() {
   return !!(QDRANT_URL && QDRANT_API_KEY);
 }
 
-// Qdrant requires UUID-format IDs. We hash our string IDs into UUID v5 format.
+// Convert any string ID to a valid UUID v4-format string.
+// UUID format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx (8-4-4-4-12)
 function _toUuid(id) {
-  // Simple deterministic UUID from string using fnv32 hash
-  const str  = String(id);
+  const str = String(id);
+  // FNV-1a 32-bit hash — fast, deterministic
   let h = 2166136261;
   for (let i = 0; i < str.length; i++) {
     h ^= str.charCodeAt(i);
-    h = (h * 16777619) >>> 0;
+    h = Math.imul(h, 16777619);
+    h = h >>> 0;  // keep unsigned 32-bit
   }
-  const hex = h.toString(16).padStart(8, '0');
-  // Fill remaining UUID segments deterministically
-  const h2 = (h * 1000003) >>> 0;
-  const h3 = (h2 * 1000003) >>> 0;
-  const h4 = (h3 * 1000003) >>> 0;
-  return `${hex}-${h2.toString(16).padStart(4,'0')}-4${h3.toString(16).padStart(3,'0')}-8${h4.toString(16).padStart(3,'0')}-${str.length.toString(16).padStart(12,'0')}`;
+  // Generate 4 independent hash values by chaining
+  const h1 = h;
+  const h2 = ((h * 1000003) ^ (str.length * 31)) >>> 0;
+  const h3 = ((h2 * 1000003) ^ h1) >>> 0;
+  const h4 = ((h3 * 1000003) ^ h2) >>> 0;
+  const h5 = ((h4 * 1000003) ^ h3) >>> 0;
+
+  // Format as proper UUID: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+  const p1 = h1.toString(16).padStart(8, '0');                    // 8 chars
+  const p2 = (h2 & 0xffff).toString(16).padStart(4, '0');         // 4 chars
+  const p3 = '4' + (h3 & 0x0fff).toString(16).padStart(3, '0');  // 4 chars (version 4)
+  const p4 = (0x8 | (h4 & 0x3)).toString(16)                      // variant bit
+           + (h4 & 0x0fff).toString(16).padStart(3, '0');         // 4 chars total
+  const h6 = ((h5 * 1000003) ^ h4) >>> 0;
+  // p5 must be exactly 12 hex chars — two clean 32-bit values
+  const p5 = (h5.toString(16).padStart(8, '0') + h6.toString(16).padStart(8, '0')).slice(0, 12);
+
+  return `${p1}-${p2}-${p3}-${p4}-${p5}`;
 }

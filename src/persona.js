@@ -32,16 +32,31 @@ import db from './db.js';
 function calcTrust(dmCount, serverCount, daysSinceFirst, daysSinceLast) {
   // DMs are 3x more intimate than server messages
   const weighted = (dmCount * 3) + serverCount;
-  // Recency bonus: talked in last 7 days
-  const recencyBonus = daysSinceLast <= 7 ? 10 : daysSinceLast <= 30 ? 5 : 0;
-  // Consistency: been around for a while
-  const consistencyBonus = daysSinceFirst >= 30 ? 8 : daysSinceFirst >= 7 ? 4 : 0;
+
+  // Recency: talked recently = still relevant
+  const recencyBonus = daysSinceLast <= 1  ? 15
+                     : daysSinceLast <= 7  ? 10
+                     : daysSinceLast <= 30 ? 5
+                     : 0;
+
+  // Consistency: relationship built over time
+  const consistencyBonus = daysSinceFirst >= 60  ? 15
+                         : daysSinceFirst >= 30  ? 8
+                         : daysSinceFirst >= 7   ? 4
+                         : 0;
+
   const score = weighted + recencyBonus + consistencyBonus;
 
-  if (score >= 200) return 5;
-  if (score >= 80)  return 4;
-  if (score >= 30)  return 3;
-  if (score >= 10)  return 2;
+  // Trust levels:
+  //   1 = stranger      (< 5 weighted interactions)
+  //   2 = acquaintance  (5–20)
+  //   3 = known         (20–60, default zone)
+  //   4 = friend        (60–150)
+  //   5 = close friend  (150+)
+  if (score >= 150) return 5;
+  if (score >= 60)  return 4;
+  if (score >= 20)  return 3;
+  if (score >= 5)   return 2;
   return 1;
 }
 
@@ -137,17 +152,20 @@ export async function getOrCreateRelationship(userId, contextType) {
     daysSinceLast
   );
 
-  // Update if trust changed
-  if (newTrust !== rel.trust_level) {
+  // Cap trust drops at 1 level per recalculation (prevents sudden cliff drops)
+  const currentTrust = rel.trust_level || 3;
+  const clampedTrust = Math.max(newTrust, currentTrust - 1);
+
+  if (clampedTrust !== currentTrust) {
     await db.execute(
       `UPDATE maya_user_relationships SET trust_level = ? WHERE discord_user_id = ?`,
-      [newTrust, userId]
+      [clampedTrust, userId]
     ).catch(() => {});
-    console.log(`[trust] ${userId} → trust ${rel.trust_level} → ${newTrust} (dm=${rel.dm_count} srv=${rel.server_count} days=${daysSinceFirst})`);
+    console.log(`[trust] ${userId} → trust ${currentTrust} → ${clampedTrust} (dm=${rel.dm_count} srv=${rel.server_count} days=${daysSinceFirst})`);
   }
 
   return {
-    trustLevel:     newTrust,
+    trustLevel:     clampedTrust,
     vibe:           rel.vibe          || 'neutral',
     nickname:       rel.nickname_for_user || null,
     insideJokes:    _parseJson(rel.inside_jokes,    []),
