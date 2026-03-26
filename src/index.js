@@ -23,7 +23,15 @@ client.on(Events.MessageCreate, async (msg) => {
   if (msg.author.bot) return;
 
   const content = msg.content.trim();
-  if (!content) return;
+
+  // ── Check for rich content (images, embeds, stickers) ──────────────────
+  const hasAttachments = msg.attachments.size > 0;
+  const hasEmbeds      = msg.embeds.length > 0;
+  const hasStickers    = msg.stickers.size > 0;
+  const hasMedia       = hasAttachments || hasEmbeds || hasStickers;
+
+  // Skip if no text AND no media
+  if (!content && !hasMedia) return;
 
   // ── Channel filter ──────────────────────────────────────────────────────
   const allowed = config.discord.allowedChannels;
@@ -34,7 +42,11 @@ client.on(Events.MessageCreate, async (msg) => {
   const isDM       = !msg.guild;
   const hasKeyword = /\bmaya\b/i.test(content);
 
-  if (!isMention && !isDM && !hasKeyword) return;
+  // For media-only messages (no text): only respond if mentioned or DM
+  // Don't react to every image posted in a server
+  if (!content && hasMedia && !isMention && !isDM) return;
+
+  if (!isMention && !isDM && !hasKeyword && !hasMedia) return;
 
   // ── Distributed lock ────────────────────────────────────────────────────
   const lockKey = `msg_${msg.id}`;
@@ -52,15 +64,17 @@ client.on(Events.MessageCreate, async (msg) => {
 
   // ── Clean text ──────────────────────────────────────────────────────────
   let text = content.replace(/<@!?\d+>/g, '').trim();
+
+  // If no text but has media, use a placeholder so pipeline doesn't break
+  if (!text && hasMedia) text = '[media]';
+
   if (!text) {
     await msg.reply('Bol bhai, kuch toh bol! 😏').catch(() => {});
     await releaseLock(lockKey);
     return;
   }
 
-  if (config.bot.typingIndicator && !isDM) {
-    // Only show typing if salience will likely result in a reply
-    // We show it optimistically — salience decides after
+  if (config.bot.typingIndicator) {
     await msg.channel.sendTyping().catch(() => {});
   }
 
@@ -75,17 +89,15 @@ client.on(Events.MessageCreate, async (msg) => {
       msg,
       isMention,
       isReply,
+      hasMedia,   // signal to handler to run vision extraction
     });
 
-    // null = salience said IGNORE — do nothing, no reply
     if (result === null) return;
 
     if (result.type === 'react') {
-      await msg.react(result.emoji).catch(async () => {
-        // React failed (invalid emoji / missing perms) — silent fail
+      await msg.react(result.emoji).catch(() => {
         console.warn(`[bot] react failed for emoji: ${result.emoji}`);
       });
-
     } else {
       const replyText = result.text;
       if (replyText.length <= 2000) {

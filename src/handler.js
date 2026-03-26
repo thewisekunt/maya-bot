@@ -1,21 +1,24 @@
 /**
- * handler.js — Master pipeline with salience gate.
+ * handler.js — Full pipeline with salience + vision.
  *
- * Flow: context → user → salience check → (ignore/react/LLM) → persist
+ * Flow:
+ *   context → user → vision extract (if media) →
+ *   salience → (ignore/react/LLM reply) → persist
  */
 
 import { estimateEntropy, getEntropyZone } from './persona.js';
 import { getMayaReply } from './llm.js';
 import { buildContextLine } from './context.js';
 import { checkSalience } from './salience.js';
+import { extractMediaContext } from './vision.js';
 import { debugLog } from './logger.js';
 import db from './db.js';
 
 export async function handleMessage({
-  userId, username, displayName, avatarUrl, message, guildId,
-  msg,        // raw Discord.js Message
-  isMention,  // bool
-  isReply,    // bool — is this a reply to Maya's message?
+  userId, username, displayName, avatarUrl,
+  message, guildId, msg,
+  isMention, isReply,
+  hasMedia = false,
 }) {
   // ── 1. Context basics ─────────────────────────────────────────────────────
   const isDM        = !msg.guild;
@@ -43,7 +46,6 @@ export async function handleMessage({
     } catch { /* use displayName */ }
   }
 
-  // "My name is X"
   const nameMatch = message.match(/\bmy\s+name\s+is\s+([a-zA-Z][a-zA-Z\s]{0,30})/i);
   if (nameMatch) {
     const newName = nameMatch[1].trim();
@@ -54,49 +56,76 @@ export async function handleMessage({
         [newName, userId]).catch(() => {}));
   }
 
-  // ── 3. Entropy + zone ─────────────────────────────────────────────────────
-  const entropy = estimateEntropy(message);
+  // ── 3. Vision extraction (run before salience so salience knows about media) 
+  let mediaContext = '';
+  let richMessageText = message;
+
+  if (hasMedia) {
+    try {
+      const media = await extractMediaContext(msg);
+      if (media.hasMedia) {
+        mediaContext = media.mediaContext;
+        // Build enriched message for salience + LLM
+        // Replace placeholder or append to existing text
+        if (message === '[media]') {
+          richMessageText = mediaContext;
+        } else {
+          richMessageText = `${message}\n${mediaContext}`;
+        }
+        console.log(`[vision] extracted: ${mediaContext.slice(0, 120)}`);
+      }
+    } catch (e) {
+      console.error('[handler] vision extraction failed:', e.message);
+    }
+  }
+
+  // ── 4. Entropy + zone (based on enriched text) ────────────────────────────
+  const entropy = estimateEntropy(richMessageText);
   const { zone, line: zoneLine } = getEntropyZone(entropy);
 
-  // ── 4. Load trust level for salience ─────────────────────────────────────
+  // ── 5. Trust level for salience ───────────────────────────────────────────
   let trustLevel = 3;
   try {
     const [[rel]] = await db.execute(
       `SELECT trust_level FROM maya_user_relationships
        WHERE discord_user_id=? LIMIT 1`, [userId]);
     if (rel) trustLevel = rel.trust_level || 3;
-  } catch { /* default 3 */ }
+  } catch { /* default */ }
 
-  // ── 5. SALIENCE GATE — decide before calling LLM ─────────────────────────
+  // ── 6. SALIENCE GATE ──────────────────────────────────────────────────────
+  // If message has media and is a mention/DM, bump entropy so salience
+  // doesn't ignore it (images shared to Maya should get a response)
+  const salienceEntropy = (hasMedia && (isMention || isDM)) ? 0.8 : entropy;
+
   const salience = checkSalience({
-    text: message,
+    text:       richMessageText,
     isMention,
     isDM,
     isReply,
     trustLevel,
-    entropy,
+    entropy:    salienceEntropy,
   });
 
-  console.log(`[salience] user=${prefName} action=${salience.action} reason="${salience.reason}"`);
+  console.log(`[salience] user=${prefName} action=${salience.action} reason="${salience.reason}" media=${hasMedia}`);
 
-  // ── IGNORE — save message to memory, return null (no response) ───────────
+  // ── IGNORE ────────────────────────────────────────────────────────────────
   if (salience.action === 'ignore') {
-    _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate, entropy, message, null);
-    debugLog({ userId, prefName, entropy, zone, message, reply: '[IGNORED]' });
+    _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate,
+      entropy, message, null);
+    debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: '[IGNORED]' });
     return null;
   }
 
-  // ── REACT — return emoji immediately, no LLM call ────────────────────────
+  // ── REACT ─────────────────────────────────────────────────────────────────
   if (salience.action === 'react') {
-    _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate, entropy,
-      message, `*reacted with ${salience.emoji}*`);
-    debugLog({ userId, prefName, entropy, zone, message, reply: `REACT:${salience.emoji}` });
+    _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate,
+      entropy, message, `*reacted with ${salience.emoji}*`);
+    debugLog({ userId, prefName, entropy, zone, message: richMessageText,
+      reply: `REACT:${salience.emoji}` });
     return { type: 'react', emoji: salience.emoji };
   }
 
   // ── REPLY — fetch memory + call LLM ──────────────────────────────────────
-
-  // Memory context
   let context = '';
   try {
     const [rows] = isDM
@@ -134,46 +163,63 @@ export async function handleMessage({
     ).catch(() => {})
   );
 
-  // Call LLM
+  // Call LLM with enriched message (includes image/embed descriptions)
   const result = await getMayaReply({
-    prefName, context, message, entropy, zone, zoneLine,
-    contextLine, knownFacts: [], relationship: null, frequentFriends: [],
+    prefName,
+    context,
+    message:     richMessageText,   // ← enriched with media context
+    entropy,
+    zone,
+    zoneLine,
+    contextLine,
+    knownFacts:      [],
+    relationship:    null,
+    frequentFriends: [],
   });
 
   const savedReply = result.type === 'react'
     ? `*reacted with ${result.emoji}*`
     : result.text;
 
+  // Save original message text to memory (not the enriched version)
   _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate,
-    entropy, message, savedReply);
-  debugLog({ userId, prefName, entropy, zone, message, reply: savedReply });
+    entropy, message === '[media]' ? mediaContext : message, savedReply);
+  debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: savedReply });
 
   return result;
 }
 
-// ── Save both sides of exchange to memory ────────────────────────────────────
+// ── Save exchange to memory ───────────────────────────────────────────────────
 function _saveMemory(userId, prefName, guildId, channelId, contextType,
                      isPrivate, entropy, userMsg, mayaReply) {
   const saveNew = () => db.execute(
     `INSERT INTO maya_memory
-       (discord_user_id, user_name, guild_id, channel_id, context_type, is_private, sender, message, entropy)
+       (discord_user_id, user_name, guild_id, channel_id,
+        context_type, is_private, sender, message, entropy)
      VALUES (?,?,?,?,?,?,?,?,?)`,
-    [userId, prefName, guildId||null, channelId, contextType, isPrivate?1:0, 'user', userMsg, entropy]
+    [userId, prefName, guildId||null, channelId,
+     contextType, isPrivate?1:0, 'user', userMsg, entropy]
   ).then(() => mayaReply ? db.execute(
     `INSERT INTO maya_memory
-       (discord_user_id, user_name, guild_id, channel_id, context_type, is_private, sender, message, entropy)
+       (discord_user_id, user_name, guild_id, channel_id,
+        context_type, is_private, sender, message, entropy)
      VALUES (?,?,?,?,?,?,?,?,?)`,
-    [userId, prefName, guildId||null, channelId, contextType, isPrivate?1:0, 'maya', mayaReply, entropy]
+    [userId, prefName, guildId||null, channelId,
+     contextType, isPrivate?1:0, 'maya', mayaReply, entropy]
   ) : Promise.resolve());
 
   const saveOld = () => db.execute(
-    `INSERT INTO maya_memory (discord_user_id, user_name, guild_id, sender, message, entropy)
-     VALUES (?,?,?,'user',?,?)`, [userId, prefName, guildId||null, userMsg, entropy]
+    `INSERT INTO maya_memory
+       (discord_user_id, user_name, guild_id, sender, message, entropy)
+     VALUES (?,?,?,'user',?,?)`,
+    [userId, prefName, guildId||null, userMsg, entropy]
   ).then(() => mayaReply ? db.execute(
-    `INSERT INTO maya_memory (discord_user_id, user_name, guild_id, sender, message, entropy)
-     VALUES (?,?,?,'maya',?,?)`, [userId, prefName, guildId||null, mayaReply, entropy]
+    `INSERT INTO maya_memory
+       (discord_user_id, user_name, guild_id, sender, message, entropy)
+     VALUES (?,?,?,'maya',?,?)`,
+    [userId, prefName, guildId||null, mayaReply, entropy]
   ) : Promise.resolve());
 
-  saveNew().catch(() => saveOld().catch(e =>
-    console.error('[handler] save failed:', e.message)));
+  saveNew().catch(() =>
+    saveOld().catch(e => console.error('[handler] save failed:', e.message)));
 }
