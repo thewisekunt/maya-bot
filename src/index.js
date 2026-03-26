@@ -3,6 +3,8 @@ import { Client, GatewayIntentBits, Partials, Events, ActivityType } from 'disco
 import { config } from './config.js';
 import { handleMessage } from './handler.js';
 import { acquireLock, releaseLock } from './lock.js';
+import { startDreamLoop } from './dream.js';
+import { ensureCollection } from './vector.js';
 import { triggerLurk, checkLurk } from './lurk.js';
 
 const client = new Client({
@@ -15,9 +17,12 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-client.once(Events.ClientReady, () => {
+client.once(Events.ClientReady, async () => {
   console.log(`[bot] Logged in as ${client.user.tag} ✓`);
   client.user.setActivity('your messages 👀', { type: ActivityType.Watching });
+  // Start vector memory systems
+  await ensureCollection().catch(e => console.warn('[bot] Qdrant setup:', e.message));
+  startDreamLoop();
 });
 
 client.on(Events.MessageCreate, async (msg) => {

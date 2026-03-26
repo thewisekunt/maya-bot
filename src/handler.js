@@ -3,6 +3,7 @@
  * context → user → aliases → trust → vision → salience → LLM → persist → facts
  */
 
+import { buildContext } from './memory.js';
 import { estimateEntropy, getEntropyZone, getKnownNames, getConfirmedFacts,
          extractAndStoreFact, getOrCreateRelationship, recordUserInteraction,
          upsertUser, detectNameSet, getFrequentInteractors } from './persona.js';
@@ -60,7 +61,7 @@ export async function handleMessage({
 
   // ── 4. Sync aliases — register all known names for this user ─────────────
   // Non-blocking: runs in background
-  upsertUser(userId, username, displayName, prefName, guildId).catch(() => {});
+  upsertUser({ userId, username, displayName, avatarUrl, guildId, channelId }).catch(() => {});
 
   // ── 5. Trust — compute dynamically from interaction history ───────────────
   let trustLevel = 3;
@@ -84,9 +85,9 @@ export async function handleMessage({
   }
 
   // ── 6. Known names in guild (for lurk friend-awareness) ──────────────────
-  let knownUserNames = [];
+  let knownNames = [];
   if (isLurking && guildId) {
-    knownUserNames = await getKnownNames(guildId).catch(() => []);
+    knownNames = await getKnownNames(guildId).catch(() => []);
   }
 
   // ── 7. Vision extraction ──────────────────────────────────────────────────
@@ -129,7 +130,7 @@ export async function handleMessage({
     lurkDepth,
     trustLevel,
     entropy:       salienceEntropy,
-    knownUserNames,
+    knownNames,
   });
 
   console.log(`[salience] user=${prefName} action=${salience.action} reason="${salience.reason}" trust=${trustLevel} media=${hasMedia}`);
@@ -151,28 +152,12 @@ export async function handleMessage({
 
   // ── REPLY — fetch memory + known facts + call LLM ────────────────────────
 
-  // Memory context
+  // Hybrid memory context: SQL recent + Qdrant semantic
   let context = '';
   try {
-    const [rows] = isDM
-      ? await db.execute(
-          `SELECT sender, message FROM maya_memory
-           WHERE discord_user_id=? AND context_type='dm'
-           ORDER BY created_at DESC LIMIT 20`, [userId])
-      : await db.execute(
-          `SELECT sender, message FROM maya_memory
-           WHERE discord_user_id=? AND context_type='server'
-           ORDER BY created_at DESC LIMIT 20`, [userId]);
-    context = rows.reverse().map(r =>
-      `${r.sender === 'maya' ? 'Maya' : prefName}: ${r.message}`).join('\n');
-  } catch {
-    try {
-      const [rows] = await db.execute(
-        `SELECT sender, message FROM maya_memory
-         WHERE discord_user_id=? ORDER BY created_at DESC LIMIT 20`, [userId]);
-      context = rows.reverse().map(r =>
-        `${r.sender === 'maya' ? 'Maya' : prefName}: ${r.message}`).join('\n');
-    } catch { /* no context */ }
+    context = await buildContext(userId, prefName, contextType, guildId, message);
+  } catch (e) {
+    console.error('[handler] buildContext error:', e.message);
   }
 
   // Reliable facts about this user
