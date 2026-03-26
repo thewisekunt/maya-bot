@@ -217,19 +217,8 @@ export async function handleMessage({
     entropy, message === '[media]' ? mediaContext : message, savedReply);
   debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: savedReply });
 
-  // ── Extract and store facts from this message (background) ────────────────
-  const facts = extractAndStoreFact(message);
-  for (const f of facts) {
-    extractAndStoreFact({
-      subjectUserId: userId,
-      subjectName:   prefName,
-      factText:      f.factText,
-      factType:      f.factType,
-      confidence:    f.confidence,
-      sourceMessage: message,
-      guildId,
-    }).catch(() => {});
-  }
+  // ── Extract and store facts from this message (fire and forget) ─────────────
+  extractAndStoreFact(userId, message).catch(() => {});
 
   return result;
 }
