@@ -1,9 +1,6 @@
 /**
- * handler.js — Full pipeline with salience + vision.
- *
- * Flow:
- *   context → user → vision extract (if media) →
- *   salience → (ignore/react/LLM reply) → persist
+ * handler.js — Full pipeline.
+ * context → user → aliases → trust → vision → salience → LLM → persist → facts
  */
 
 import { estimateEntropy, getEntropyZone } from './persona.js';
@@ -12,17 +9,21 @@ import { buildContextLine } from './context.js';
 import { checkSalience } from './salience.js';
 import { extractMediaContext } from './vision.js';
 import { debugLog } from './logger.js';
+import {
+  updateTrust, syncUserAliases, getKnownNamesInGuild,
+  getReliableFacts, storeFact, extractFacts,
+} from './trust.js';
 import db from './db.js';
 
 export async function handleMessage({
   userId, username, displayName, avatarUrl,
   message, guildId, msg,
   isMention, isReply,
-  hasMedia = false,
-  isLurking = false,
-  lurkDepth = 0,
+  hasMedia   = false,
+  isLurking  = false,
+  lurkDepth  = 0,
 }) {
-  // ── 1. Context basics ─────────────────────────────────────────────────────
+  // ── 1. Context ────────────────────────────────────────────────────────────
   const isDM        = !msg.guild;
   const contextType = isDM ? 'dm' : 'server';
   const isPrivate   = isDM;
@@ -37,17 +38,18 @@ export async function handleMessage({
   try {
     const [[u]] = await db.execute(
       `SELECT preferred_name, display_name, username FROM maya_users
-       WHERE discord_user_id=? LIMIT 1`, [userId]);
+       WHERE discord_user_id = ? LIMIT 1`, [userId]);
     if (u) prefName = u.preferred_name || u.display_name || u.username || prefName;
   } catch {
     try {
       const [[p]] = await db.execute(
         `SELECT preferred_name, display_name, username FROM maya_personas
-         WHERE discord_user_id=? LIMIT 1`, [userId]);
+         WHERE discord_user_id = ? LIMIT 1`, [userId]);
       if (p) prefName = p.preferred_name || p.display_name || p.username || prefName;
     } catch { /* use displayName */ }
   }
 
+  // ── 3. Name override ─────────────────────────────────────────────────────
   const nameMatch = message.match(/\bmy\s+name\s+is\s+([a-zA-Z][a-zA-Z\s]{0,30})/i);
   if (nameMatch) {
     const newName = nameMatch[1].trim();
@@ -58,7 +60,38 @@ export async function handleMessage({
         [newName, userId]).catch(() => {}));
   }
 
-  // ── 3. Vision extraction (run before salience so salience knows about media) 
+  // ── 4. Sync aliases — register all known names for this user ─────────────
+  // Non-blocking: runs in background
+  syncUserAliases(userId, username, displayName, prefName, guildId).catch(() => {});
+
+  // ── 5. Trust — compute dynamically from interaction history ───────────────
+  let trustLevel = 3;
+  try {
+    // First upsert the relationship row
+    const counterCol = contextType === 'dm' ? 'dm_count' : 'server_count';
+    await db.execute(
+      `INSERT INTO maya_user_relationships
+         (discord_user_id, total_messages, ${counterCol}, last_interaction)
+       VALUES (?, 1, 1, NOW())
+       ON DUPLICATE KEY UPDATE
+         total_messages   = total_messages + 1,
+         ${counterCol}    = ${counterCol} + 1,
+         last_interaction = NOW()`,
+      [userId]
+    );
+    // Then recalculate trust from the updated stats
+    trustLevel = await updateTrust(userId);
+  } catch (e) {
+    console.error('[handler] trust update:', e.message);
+  }
+
+  // ── 6. Known names in guild (for lurk friend-awareness) ──────────────────
+  let knownUserNames = [];
+  if (isLurking && guildId) {
+    knownUserNames = await getKnownNamesInGuild(guildId).catch(() => []);
+  }
+
+  // ── 7. Vision extraction ──────────────────────────────────────────────────
   let mediaContext    = '';
   let richMessageText = message;
   let visionWorked    = false;
@@ -68,42 +101,28 @@ export async function handleMessage({
       const media = await extractMediaContext(msg);
       if (media.hasMedia) {
         mediaContext = media.mediaContext;
-        visionWorked = media.visionWorked;   // true only if image was actually described
-        if (message === '[media]') {
-          richMessageText = mediaContext;
-        } else {
-          richMessageText = `${message}\n${mediaContext}`;
-        }
-        console.log(`[vision] extracted (visionWorked=${visionWorked}): ${mediaContext.slice(0, 120)}`);
+        visionWorked = media.visionWorked;
+        richMessageText = message === '[media]'
+          ? mediaContext
+          : `${message}\n${mediaContext}`;
+        console.log(`[vision] extracted (visionWorked=${visionWorked}): ${mediaContext.slice(0, 100)}`);
       }
     } catch (e) {
-      console.error('[handler] vision extraction failed:', e.message);
+      console.error('[handler] vision:', e.message);
     }
   }
 
-  // ── 4. Entropy + zone (based on enriched text) ────────────────────────────
+  // ── 8. Entropy + zone ─────────────────────────────────────────────────────
   const entropy = estimateEntropy(richMessageText);
   const { zone, line: zoneLine } = getEntropyZone(entropy);
 
-  // ── 5. Trust level for salience ───────────────────────────────────────────
-  let trustLevel = 3;
-  try {
-    const [[rel]] = await db.execute(
-      `SELECT trust_level FROM maya_user_relationships
-       WHERE discord_user_id=? LIMIT 1`, [userId]);
-    if (rel) trustLevel = rel.trust_level || 3;
-  } catch { /* default */ }
-
-  // ── 6. SALIENCE GATE ──────────────────────────────────────────────────────
-  // Bump entropy when:
-  //   - directly mentioned with media (user shared something TO Maya)
-  //   - vision says the image/embed is worth talking about
+  // ── 9. SALIENCE GATE ──────────────────────────────────────────────────────
   const salienceEntropy = (isMention || isDM || (hasMedia && visionWorked))
-    ? Math.max(entropy, 0.75)
+    ? Math.max(entropy, 0.6)
     : entropy;
 
   const salience = checkSalience({
-    text:              richMessageText,
+    text:          richMessageText,
     isMention,
     isDM,
     isReply,
@@ -111,29 +130,30 @@ export async function handleMessage({
     isLurking,
     lurkDepth,
     trustLevel,
-    entropy:           salienceEntropy,
+    entropy:       salienceEntropy,
+    knownUserNames,
   });
 
-  console.log(`[salience] user=${prefName} action=${salience.action} reason="${salience.reason}" media=${hasMedia}`);
+  console.log(`[salience] user=${prefName} action=${salience.action} reason="${salience.reason}" trust=${trustLevel} media=${hasMedia}`);
 
   // ── IGNORE ────────────────────────────────────────────────────────────────
   if (salience.action === 'ignore') {
-    _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate,
-      entropy, message, null);
+    _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate, entropy, message, null);
     debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: '[IGNORED]' });
     return null;
   }
 
   // ── REACT ─────────────────────────────────────────────────────────────────
   if (salience.action === 'react') {
-    _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate,
-      entropy, message, `*reacted with ${salience.emoji}*`);
-    debugLog({ userId, prefName, entropy, zone, message: richMessageText,
-      reply: `REACT:${salience.emoji}` });
+    _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate, entropy,
+      message, `*reacted with ${salience.emoji}*`);
+    debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: `REACT:${salience.emoji}` });
     return { type: 'react', emoji: salience.emoji };
   }
 
-  // ── REPLY — fetch memory + call LLM ──────────────────────────────────────
+  // ── REPLY — fetch memory + known facts + call LLM ────────────────────────
+
+  // Memory context
   let context = '';
   try {
     const [rows] = isDM
@@ -157,11 +177,15 @@ export async function handleMessage({
     } catch { /* no context */ }
   }
 
+  // Reliable facts about this user
+  const knownFacts = await getReliableFacts(userId).catch(() => []);
+
   // Upsert user (non-fatal)
   db.execute(
     `INSERT INTO maya_users (discord_user_id, username, display_name, avatar_url, message_count)
      VALUES (?,?,?,?,1)
-     ON DUPLICATE KEY UPDATE display_name=VALUES(display_name), message_count=message_count+1, last_seen=NOW()`,
+     ON DUPLICATE KEY UPDATE
+       display_name=VALUES(display_name), message_count=message_count+1, last_seen=NOW()`,
     [userId, username, displayName||username, avatarUrl||'']
   ).catch(() =>
     db.execute(
@@ -171,47 +195,48 @@ export async function handleMessage({
     ).catch(() => {})
   );
 
-  // Call LLM with enriched message (includes image/embed descriptions)
-  // forceVerbal: when Maya was directly addressed, she must reply with words
-  const forceVerbal = isMention || isDM || isReply;
-
-  // If media was attached but vision failed, tell Maya explicitly so she
-  // doesn't hallucinate content based on filename or prior context
+  // Build final message (inject "cannot see" if vision failed)
   let finalMessage = richMessageText;
   if (hasMedia && !visionWorked && message !== '[media]') {
-    finalMessage = `${message}\n[Note: user sent an image/file but I cannot view it]`;
+    finalMessage = `${message}\n[Note: image/file attached but I cannot view it]`;
   } else if (hasMedia && !visionWorked && message === '[media]') {
-    finalMessage = `[User sent an image/file that I cannot view]`;
+    finalMessage = `[User sent an image I cannot view]`;
   }
 
+  const forceVerbal = isMention || isDM || isReply;
+
   const result = await getMayaReply({
-    prefName,
-    context,
-    message:         finalMessage,
-    entropy,
-    zone,
-    zoneLine,
-    contextLine,
-    knownFacts:      [],
-    relationship:    null,
-    frequentFriends: [],
-    forceVerbal,
-    visionWorked,
+    prefName, context, message: finalMessage, entropy, zone, zoneLine,
+    contextLine, knownFacts, relationship: { trustLevel },
+    frequentFriends: [], forceVerbal,
   });
 
   const savedReply = result.type === 'react'
     ? `*reacted with ${result.emoji}*`
     : result.text;
 
-  // Save original message text to memory (not the enriched version)
   _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate,
     entropy, message === '[media]' ? mediaContext : message, savedReply);
   debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: savedReply });
 
+  // ── Extract and store facts from this message (background) ────────────────
+  const facts = extractFacts(message);
+  for (const f of facts) {
+    storeFact({
+      subjectUserId: userId,
+      subjectName:   prefName,
+      factText:      f.factText,
+      factType:      f.factType,
+      confidence:    f.confidence,
+      sourceMessage: message,
+      guildId,
+    }).catch(() => {});
+  }
+
   return result;
 }
 
-// ── Save exchange to memory ───────────────────────────────────────────────────
+// ── Memory save ───────────────────────────────────────────────────────────────
 function _saveMemory(userId, prefName, guildId, channelId, contextType,
                      isPrivate, entropy, userMsg, mayaReply) {
   const saveNew = () => db.execute(
@@ -231,17 +256,12 @@ function _saveMemory(userId, prefName, guildId, channelId, contextType,
   ) : Promise.resolve());
 
   const saveOld = () => db.execute(
-    `INSERT INTO maya_memory
-       (discord_user_id, user_name, guild_id, sender, message, entropy)
-     VALUES (?,?,?,'user',?,?)`,
-    [userId, prefName, guildId||null, userMsg, entropy]
+    `INSERT INTO maya_memory (discord_user_id, user_name, guild_id, sender, message, entropy)
+     VALUES (?,?,?,'user',?,?)`, [userId, prefName, guildId||null, userMsg, entropy]
   ).then(() => mayaReply ? db.execute(
-    `INSERT INTO maya_memory
-       (discord_user_id, user_name, guild_id, sender, message, entropy)
-     VALUES (?,?,?,'maya',?,?)`,
-    [userId, prefName, guildId||null, mayaReply, entropy]
+    `INSERT INTO maya_memory (discord_user_id, user_name, guild_id, sender, message, entropy)
+     VALUES (?,?,?,'maya',?,?)`, [userId, prefName, guildId||null, mayaReply, entropy]
   ) : Promise.resolve());
 
-  saveNew().catch(() =>
-    saveOld().catch(e => console.error('[handler] save failed:', e.message)));
+  saveNew().catch(() => saveOld().catch(e => console.error('[handler] save:', e.message)));
 }

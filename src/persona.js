@@ -1,18 +1,52 @@
 /**
- * persona.js
+ * persona.js — User profiles, trust, aliases, and structured facts
  *
- * Manages the maya_users table (rich user profiles) and
- * maya_user_relationships (Maya↔User bond tracking).
+ * Trust model (1–5):
+ *   Calculated from interaction history, not static.
+ *   DMs count more than server (3x weight — more personal).
+ *   Consistency over time matters — someone who talked once 3 months ago
+ *   is less trusted than someone who talks every day.
+ *   Thresholds (total weighted score):
+ *     < 10   → 1 (stranger)
+ *     10–30  → 2 (acquaintance)
+ *     30–80  → 3 (known)
+ *     80–200 → 4 (friend)
+ *     > 200  → 5 (close friend)
+ *
+ * Alias system:
+ *   When Maya hears "ask Mario" or "Mario said", she extracts "Mario"
+ *   and tries to map it to a known discord user in the same guild.
+ *   self_declared (conflict_score=0) > observed > inferred.
+ *
+ * Fact system:
+ *   Facts have conflict_score 0–1.
+ *   0 = objective/confirmed (laws of physics, self-declared identity).
+ *   0.5 = inferred from speech (I love X → probably true).
+ *   1 = contested (contradicted by other statements).
+ *   Only conflict_score < 0.3 facts are injected into LLM context.
  */
 
 import db from './db.js';
 
+// ── Trust thresholds ──────────────────────────────────────────────────────────
+function calcTrust(dmCount, serverCount, daysSinceFirst, daysSinceLast) {
+  // DMs are 3x more intimate than server messages
+  const weighted = (dmCount * 3) + serverCount;
+  // Recency bonus: talked in last 7 days
+  const recencyBonus = daysSinceLast <= 7 ? 10 : daysSinceLast <= 30 ? 5 : 0;
+  // Consistency: been around for a while
+  const consistencyBonus = daysSinceFirst >= 30 ? 8 : daysSinceFirst >= 7 ? 4 : 0;
+  const score = weighted + recencyBonus + consistencyBonus;
+
+  if (score >= 200) return 5;
+  if (score >= 80)  return 4;
+  if (score >= 30)  return 3;
+  if (score >= 10)  return 2;
+  return 1;
+}
+
 // ── User upsert ───────────────────────────────────────────────────────────────
 
-/**
- * Upsert user into maya_users.
- * Returns the user's preferred display name.
- */
 export async function upsertUser({ userId, username, displayName, avatarUrl, guildId, channelId }) {
   await db.execute(
     `INSERT INTO maya_users
@@ -20,34 +54,35 @@ export async function upsertUser({ userId, username, displayName, avatarUrl, gui
         last_active_guild, last_active_channel, message_count)
      VALUES (?, ?, ?, ?, ?, ?, 1)
      ON DUPLICATE KEY UPDATE
-       username              = VALUES(username),
-       display_name          = VALUES(display_name),
-       avatar_url            = VALUES(avatar_url),
-       last_active_guild     = COALESCE(VALUES(last_active_guild), last_active_guild),
-       last_active_channel   = COALESCE(VALUES(last_active_channel), last_active_channel),
-       message_count         = message_count + 1,
-       last_seen             = CURRENT_TIMESTAMP`,
+       username             = VALUES(username),
+       display_name         = VALUES(display_name),
+       avatar_url           = VALUES(avatar_url),
+       last_active_guild    = COALESCE(VALUES(last_active_guild), last_active_guild),
+       last_active_channel  = COALESCE(VALUES(last_active_channel), last_active_channel),
+       message_count        = message_count + 1,
+       last_seen            = CURRENT_TIMESTAMP`,
     [userId, username, displayName || username, avatarUrl || '',
      guildId || null, channelId || null]
   );
 
   const [[row]] = await db.execute(
-    `SELECT preferred_name, display_name, username, known_facts
-     FROM maya_users WHERE discord_user_id = ? LIMIT 1`,
+    `SELECT preferred_name, display_name, username FROM maya_users
+     WHERE discord_user_id = ? LIMIT 1`,
     [userId]
   );
 
-  return {
-    prefName:   row?.preferred_name || row?.display_name || row?.username || username,
-    knownFacts: _parseJson(row?.known_facts, []),
-  };
+  // Register self-declared aliases (username and display name)
+  await _registerAlias(userId, username, guildId, 'self_declared', 0.0);
+  if (displayName && displayName !== username) {
+    await _registerAlias(userId, displayName, guildId, 'self_declared', 0.0);
+  }
+
+  return row?.preferred_name || row?.display_name || row?.username || username;
 }
 
-/**
- * Check for "my name is X" and persist it.
- * Returns new name or null.
- */
-export async function detectNameSet(userId, message) {
+// ── Preferred name set ────────────────────────────────────────────────────────
+
+export async function detectNameSet(userId, message, guildId) {
   const m = message.match(/\bmy\s+name\s+is\s+([a-zA-Z][a-zA-Z\s]{0,30})/i);
   if (!m) return null;
   const newName = m[1].trim();
@@ -55,113 +90,235 @@ export async function detectNameSet(userId, message) {
     `UPDATE maya_users SET preferred_name = ? WHERE discord_user_id = ?`,
     [newName, userId]
   );
+  // Self-declared name → conflict_score = 0 (confirmed fact)
+  await _registerAlias(userId, newName, guildId, 'self_declared', 0.0);
   return newName;
 }
 
-/**
- * Detect and persist quick facts from user messages.
- * Looks for patterns like "I love X", "I hate X", "I'm a X", "I work at X"
- */
-export async function extractAndStoreFact(userId, message) {
-  const patterns = [
-    /\bi (?:love|really love|adore)\s+(.{3,40})/i,
-    /\bi (?:hate|can't stand|dislike)\s+(.{3,40})/i,
-    /\bi(?:'m| am) (?:a |an )?(.{3,40})/i,
-    /\bi work (?:at|in|for)\s+(.{3,40})/i,
-    /\bmy (?:fav(?:ou?rite)?)\s+(?:is\s+)?(.{3,40})/i,
-  ];
+// ── Relationship: trust + context ─────────────────────────────────────────────
 
-  for (const pattern of patterns) {
-    const m = message.match(pattern);
-    if (!m) continue;
-    const fact = m[0].trim().slice(0, 80);
-    // Load existing facts, add new one if not duplicate
-    const [[row]] = await db.execute(
-      `SELECT known_facts FROM maya_users WHERE discord_user_id = ? LIMIT 1`,
-      [userId]
-    );
-    const facts = _parseJson(row?.known_facts, []);
-    if (!facts.includes(fact) && facts.length < 20) {
-      facts.push(fact);
-      await db.execute(
-        `UPDATE maya_users SET known_facts = ? WHERE discord_user_id = ?`,
-        [JSON.stringify(facts), userId]
-      );
-    }
-    break; // one fact per message is enough
-  }
-}
-
-// ── Maya↔User relationship ────────────────────────────────────────────────────
-
-/**
- * Upsert the Maya↔User relationship row and return relationship context.
- */
 export async function getOrCreateRelationship(userId, contextType) {
-  // Increment appropriate counter
-  const counterCol = contextType === 'dm' ? 'dm_count' : 'server_count';
+  const col = contextType === 'dm' ? 'dm_count' : 'server_count';
 
   await db.execute(
     `INSERT INTO maya_user_relationships
-       (discord_user_id, total_messages, ${counterCol}, last_interaction)
+       (discord_user_id, total_messages, ${col}, last_interaction)
      VALUES (?, 1, 1, NOW())
      ON DUPLICATE KEY UPDATE
-       total_messages  = total_messages + 1,
-       ${counterCol}   = ${counterCol} + 1,
-       last_interaction= NOW(),
-       updated_at      = CURRENT_TIMESTAMP`,
+       total_messages   = total_messages + 1,
+       ${col}           = ${col} + 1,
+       last_interaction = NOW()`,
     [userId]
   );
 
   const [[rel]] = await db.execute(
-    `SELECT trust_level, vibe, nickname_for_user,
-            inside_jokes, topics_they_like, topics_to_avoid,
-            total_messages, dm_count, server_count
-     FROM maya_user_relationships
-     WHERE discord_user_id = ? LIMIT 1`,
+    `SELECT r.trust_level, r.vibe, r.nickname_for_user,
+            r.inside_jokes, r.topics_they_like,
+            r.total_messages, r.dm_count, r.server_count,
+            r.created_at, r.last_interaction
+     FROM maya_user_relationships r
+     WHERE r.discord_user_id = ? LIMIT 1`,
     [userId]
   );
 
+  if (!rel) return _defaultRel();
+
+  // ── Recalculate trust dynamically ─────────────────────────────────────────
+  const now           = Date.now();
+  const firstMs       = new Date(rel.created_at).getTime();
+  const lastMs        = new Date(rel.last_interaction).getTime();
+  const daysSinceFirst = Math.floor((now - firstMs) / 86400000);
+  const daysSinceLast  = Math.floor((now - lastMs)  / 86400000);
+
+  const newTrust = calcTrust(
+    rel.dm_count     || 0,
+    rel.server_count || 0,
+    daysSinceFirst,
+    daysSinceLast
+  );
+
+  // Update if trust changed
+  if (newTrust !== rel.trust_level) {
+    await db.execute(
+      `UPDATE maya_user_relationships SET trust_level = ? WHERE discord_user_id = ?`,
+      [newTrust, userId]
+    ).catch(() => {});
+    console.log(`[trust] ${userId} → trust ${rel.trust_level} → ${newTrust} (dm=${rel.dm_count} srv=${rel.server_count} days=${daysSinceFirst})`);
+  }
+
   return {
-    trustLevel:       rel?.trust_level    || 3,
-    vibe:             rel?.vibe           || 'neutral',
-    nickname:         rel?.nickname_for_user || null,
-    insideJokes:      _parseJson(rel?.inside_jokes, []),
-    topicsTheyLike:   _parseJson(rel?.topics_they_like, []),
-    topicsToAvoid:    _parseJson(rel?.topics_to_avoid, []),
-    totalMessages:    rel?.total_messages || 0,
-    dmCount:          rel?.dm_count       || 0,
-    serverCount:      rel?.server_count   || 0,
+    trustLevel:     newTrust,
+    vibe:           rel.vibe          || 'neutral',
+    nickname:       rel.nickname_for_user || null,
+    insideJokes:    _parseJson(rel.inside_jokes,    []),
+    topicsTheyLike: _parseJson(rel.topics_they_like, []),
+    totalMessages:  rel.total_messages || 0,
+    dmCount:        rel.dm_count       || 0,
+    serverCount:    rel.server_count   || 0,
   };
 }
 
+function _defaultRel() {
+  return { trustLevel: 1, vibe: 'neutral', nickname: null,
+           insideJokes: [], topicsTheyLike: [], totalMessages: 0,
+           dmCount: 0, serverCount: 0 };
+}
+
+// ── Alias extraction ──────────────────────────────────────────────────────────
+
 /**
- * Update Maya's vibe/trust toward a user after an exchange.
- * Called optionally after LLM reply to nudge relationship over time.
+ * Scan a message for name references and try to map them to known users.
+ * "ask Mario", "Mario said", "@Mario" → look up who Mario is in this guild.
  */
-export async function nudgeRelationship(userId, { positiveSignal = false, negativeSignal = false } = {}) {
-  if (!positiveSignal && !negativeSignal) return;
-  try {
-    if (positiveSignal) {
-      await db.execute(
-        `UPDATE maya_user_relationships
-         SET positive_reactions = positive_reactions + 1,
-             trust_level = LEAST(5, trust_level + 0)  -- upgrade manually via admin
-         WHERE discord_user_id = ?`,
-        [userId]
-      );
+export async function extractAliasReferences(message, guildId, mentionedUserIds = []) {
+  // Extract @mentions directly — these are ground truth
+  for (const uid of mentionedUserIds) {
+    // The display name of this mentioned user is a confirmed alias
+    // Already handled in upsertUser — nothing extra needed
+  }
+
+  // Extract name references from text patterns
+  const namePatterns = [
+    /\b([A-Z][a-z]{2,20})\s+(?:said|says|told|mentioned|asked|bro|yaar|ne)/g,
+    /\bask\s+([A-Z][a-z]{2,20})\b/gi,
+    /\btell\s+([A-Z][a-z]{2,20})\b/gi,
+    /^([A-Z][a-z]{2,20})[,:]?\s/gm,   // "Mario: hey" or "Mario, what"
+  ];
+
+  const foundNames = new Set();
+  for (const pat of namePatterns) {
+    let m;
+    while ((m = pat.exec(message)) !== null) {
+      const name = m[1].trim();
+      if (name.length >= 3) foundNames.add(name);
     }
-  } catch (e) {
-    // non-fatal
+  }
+
+  return [...foundNames];
+}
+
+/**
+ * Given a name string, find which discord user it maps to in this guild.
+ */
+export async function resolveAlias(name, guildId) {
+  if (!name || name.length < 2) return null;
+  try {
+    const [rows] = await db.execute(
+      `SELECT a.discord_user_id, a.conflict_score, a.source,
+              u.preferred_name, u.display_name, u.username
+       FROM maya_aliases a
+       JOIN maya_users u ON u.discord_user_id = a.discord_user_id
+       WHERE a.alias LIKE ?
+         AND (a.guild_id = ? OR a.guild_id IS NULL)
+       ORDER BY a.conflict_score ASC, a.mention_count DESC
+       LIMIT 1`,
+      [`%${name}%`, guildId || null]
+    );
+    return rows[0] || null;
+  } catch { return null; }
+}
+
+/**
+ * Register an alias for a user. Increments mention_count if already exists.
+ */
+async function _registerAlias(userId, alias, guildId, source = 'observed', conflictScore = 0.5) {
+  if (!alias || alias.length < 2) return;
+  try {
+    await db.execute(
+      `INSERT INTO maya_aliases (discord_user_id, alias, guild_id, source, conflict_score)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         mention_count  = mention_count + 1,
+         conflict_score = LEAST(conflict_score, VALUES(conflict_score)),
+         updated_at     = CURRENT_TIMESTAMP`,
+      [userId, alias.slice(0, 100), guildId || null, source, conflictScore]
+    );
+  } catch { /* non-fatal */ }
+}
+
+export async function registerObservedAlias(userId, alias, guildId) {
+  await _registerAlias(userId, alias, guildId, 'observed', 0.4);
+}
+
+// ── Get all known names in a guild (for lurk salience) ───────────────────────
+
+export async function getKnownNames(guildId, limit = 30) {
+  try {
+    const [rows] = await db.execute(
+      `SELECT DISTINCT alias FROM maya_aliases
+       WHERE (guild_id = ? OR guild_id IS NULL)
+         AND conflict_score < 0.5
+         AND LENGTH(alias) >= 3
+       ORDER BY mention_count DESC
+       LIMIT ?`,
+      [guildId || null, limit]
+    );
+    return rows.map(r => r.alias);
+  } catch { return []; }
+}
+
+// ── Structured facts ──────────────────────────────────────────────────────────
+
+const FACT_PATTERNS = [
+  { re: /\bi (?:love|really love|adore)\s+(.{3,50})/i,          cat: 'preference',  score: 0.3 },
+  { re: /\bi (?:hate|can't stand|dislike)\s+(.{3,50})/i,        cat: 'preference',  score: 0.3 },
+  { re: /\bi(?:'m| am) (?:a |an )?([a-zA-Z\s]{3,40})/i,        cat: 'identity',    score: 0.2 },
+  { re: /\bi work (?:at|in|for)\s+(.{3,50})/i,                  cat: 'identity',    score: 0.2 },
+  { re: /\bmy (?:name) is\s+([a-zA-Z\s]{2,30})/i,               cat: 'identity',    score: 0.0 },
+  { re: /\bi(?:'m| am) from\s+(.{3,40})/i,                      cat: 'identity',    score: 0.1 },
+  { re: /\bi (?:study|studied)\s+(.{3,50})/i,                   cat: 'identity',    score: 0.3 },
+  { re: /\bmy (?:fav(?:ou?rite)?)\s+(?:is\s+)?(.{3,40})/i,     cat: 'preference',  score: 0.4 },
+  // Objective facts (user states something about the world, not themselves)
+  { re: /\b(?:the\s+)?(?:first|second|third) law (?:of\s+)?(.{5,60})/i, cat: 'objective', score: 0.0 },
+  { re: /\bscience says\s+(.{5,80})/i,                          cat: 'objective',   score: 0.1 },
+];
+
+export async function extractAndStoreFact(userId, message) {
+  for (const { re, cat, score } of FACT_PATTERNS) {
+    const m = message.match(re);
+    if (!m) continue;
+    const fact = m[0].trim().slice(0, 200);
+    try {
+      // Check for conflict — if similar fact exists with different content
+      const [existing] = await db.execute(
+        `SELECT id, fact, conflict_score FROM maya_facts
+         WHERE discord_user_id = ? AND category = ?
+         ORDER BY created_at DESC LIMIT 5`,
+        [userId, cat]
+      );
+      // Simple conflict detection: if category already has a fact, bump score slightly
+      const adjustedScore = existing.length > 0 ? Math.min(score + 0.1, 0.9) : score;
+
+      await db.execute(
+        `INSERT INTO maya_facts
+           (discord_user_id, fact, category, conflict_score, source_message)
+         VALUES (?, ?, ?, ?, ?)`,
+        [userId, fact, cat, adjustedScore, message.slice(0, 500)]
+      );
+    } catch { /* non-fatal */ }
+    break; // one fact per message
   }
 }
 
-// ── User↔User observed relationships ─────────────────────────────────────────
-
 /**
- * Record that Maya saw two users interacting.
- * user_a_id is always the lower snowflake so pairs are canonical.
+ * Get confirmed/low-conflict facts for a user to inject into LLM context.
+ * Only returns facts with conflict_score < 0.4.
  */
+export async function getConfirmedFacts(userId, limit = 6) {
+  try {
+    const [rows] = await db.execute(
+      `SELECT fact, category, conflict_score FROM maya_facts
+       WHERE discord_user_id = ? AND conflict_score < 0.4
+       ORDER BY conflict_score ASC, updated_at DESC
+       LIMIT ?`,
+      [userId, limit]
+    );
+    return rows.map(r => `[${r.category}] ${r.fact}`);
+  } catch { return []; }
+}
+
+// ── User↔User observed relations ─────────────────────────────────────────────
+
 export async function recordUserInteraction(userAId, userBId, guildId) {
   if (!userAId || !userBId || userAId === userBId) return;
   const [a, b] = userAId < userBId ? [userAId, userBId] : [userBId, userAId];
@@ -175,60 +332,41 @@ export async function recordUserInteraction(userAId, userBId, guildId) {
          updated_at = CURRENT_TIMESTAMP`,
       [a, b, guildId || null]
     );
-  } catch (e) {
-    // non-fatal
-  }
+  } catch { /* non-fatal */ }
 }
 
-/**
- * Get users that frequently interact with this user (for context).
- */
 export async function getFrequentInteractors(userId, guildId, limit = 3) {
   try {
     const [rows] = await db.execute(
-      `SELECT
-         CASE WHEN user_a_id = ? THEN user_b_id ELSE user_a_id END AS other_user_id,
-         interaction_count
+      `SELECT CASE WHEN user_a_id=? THEN user_b_id ELSE user_a_id END AS other_id,
+              interaction_count
        FROM maya_observed_relations
-       WHERE (user_a_id = ? OR user_b_id = ?)
-         AND (guild_id = ? OR guild_id IS NULL)
-       ORDER BY interaction_count DESC
-       LIMIT ?`,
+       WHERE (user_a_id=? OR user_b_id=?)
+         AND (guild_id=? OR guild_id IS NULL)
+       ORDER BY interaction_count DESC LIMIT ?`,
       [userId, userId, userId, guildId || null, limit]
     );
-
     if (!rows.length) return [];
-
-    // Get usernames for those IDs
-    const ids = rows.map(r => r.other_user_id);
-    const placeholders = ids.map(() => '?').join(',');
+    const ids = rows.map(r => r.other_id);
+    const ph  = ids.map(() => '?').join(',');
     const [users] = await db.execute(
       `SELECT discord_user_id, preferred_name, display_name, username
-       FROM maya_users WHERE discord_user_id IN (${placeholders})`,
-      ids
+       FROM maya_users WHERE discord_user_id IN (${ph})`, ids
     );
-
     return users.map(u => ({
-      id:   u.discord_user_id,
-      name: u.preferred_name || u.display_name || u.username,
-      count: rows.find(r => r.other_user_id === u.discord_user_id)?.interaction_count || 0,
+      id:    u.discord_user_id,
+      name:  u.preferred_name || u.display_name || u.username,
+      count: rows.find(r => r.other_id === u.discord_user_id)?.interaction_count || 0,
     }));
-  } catch (e) {
-    return [];
-  }
+  } catch { return []; }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function _parseJson(str, fallback) {
-  if (!str) return fallback;
-  try { return JSON.parse(str); } catch { return fallback; }
-}
+// ── Entropy helpers ───────────────────────────────────────────────────────────
 
-// ── Entropy utils (unchanged) ─────────────────────────────────────────────────
 export function getEntropyZone(entropy) {
-  if (entropy < 0.3)  return { zone: 'Restful', line: 'Mood: chill, laid-back 🫶' };
-  if (entropy > 0.7)  return { zone: 'Chaos',   line: 'Mood: high-energy, full-on tease 😏' };
-  return               { zone: 'Social',  line: 'Mood: casual friendly vibe ✨' };
+  if (entropy < 0.3) return { zone: 'Restful', line: 'low energy' };
+  if (entropy > 0.7) return { zone: 'Chaos',   line: 'high energy' };
+  return              { zone: 'Social',  line: 'normal energy' };
 }
 
 export function estimateEntropy(text) {
@@ -238,4 +376,10 @@ export function estimateEntropy(text) {
   const caps         = (text.match(/\b[A-Z]{2,}\b/g) || []).length;
   const score = 0.1 + len * 0.3 + exclamations * 0.06 + questions * 0.04 + caps * 0.04;
   return Math.min(parseFloat(score.toFixed(2)), 1.0);
+}
+
+// ── Internal ──────────────────────────────────────────────────────────────────
+function _parseJson(str, fallback) {
+  if (!str) return fallback;
+  try { return JSON.parse(str); } catch { return fallback; }
 }
