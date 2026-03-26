@@ -3,16 +3,14 @@
  * context → user → aliases → trust → vision → salience → LLM → persist → facts
  */
 
-import { estimateEntropy, getEntropyZone } from './persona.js';
+import { estimateEntropy, getEntropyZone, getKnownNames, getConfirmedFacts,
+         extractAndStoreFact, getOrCreateRelationship, recordUserInteraction,
+         upsertUser, detectNameSet, getFrequentInteractors } from './persona.js';
 import { getMayaReply } from './llm.js';
 import { buildContextLine } from './context.js';
 import { checkSalience } from './salience.js';
 import { extractMediaContext } from './vision.js';
 import { debugLog } from './logger.js';
-import {
-  updateTrust, syncUserAliases, getKnownNamesInGuild,
-  getReliableFacts, storeFact, extractFacts,
-} from './trust.js';
 import db from './db.js';
 
 export async function handleMessage({
@@ -62,7 +60,7 @@ export async function handleMessage({
 
   // ── 4. Sync aliases — register all known names for this user ─────────────
   // Non-blocking: runs in background
-  syncUserAliases(userId, username, displayName, prefName, guildId).catch(() => {});
+  upsertUser(userId, username, displayName, prefName, guildId).catch(() => {});
 
   // ── 5. Trust — compute dynamically from interaction history ───────────────
   let trustLevel = 3;
@@ -80,7 +78,7 @@ export async function handleMessage({
       [userId]
     );
     // Then recalculate trust from the updated stats
-    trustLevel = await updateTrust(userId);
+    trustLevel = await getOrCreateRelationship(userId, contextType).then(r => r.trustLevel);
   } catch (e) {
     console.error('[handler] trust update:', e.message);
   }
@@ -88,7 +86,7 @@ export async function handleMessage({
   // ── 6. Known names in guild (for lurk friend-awareness) ──────────────────
   let knownUserNames = [];
   if (isLurking && guildId) {
-    knownUserNames = await getKnownNamesInGuild(guildId).catch(() => []);
+    knownUserNames = await getKnownNames(guildId).catch(() => []);
   }
 
   // ── 7. Vision extraction ──────────────────────────────────────────────────
@@ -178,7 +176,7 @@ export async function handleMessage({
   }
 
   // Reliable facts about this user
-  const knownFacts = await getReliableFacts(userId).catch(() => []);
+  const knownFacts = await getConfirmedFacts(userId).catch(() => []);
 
   // Upsert user (non-fatal)
   db.execute(
@@ -220,9 +218,9 @@ export async function handleMessage({
   debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: savedReply });
 
   // ── Extract and store facts from this message (background) ────────────────
-  const facts = extractFacts(message);
+  const facts = extractAndStoreFact(message);
   for (const f of facts) {
-    storeFact({
+    extractAndStoreFact({
       subjectUserId: userId,
       subjectName:   prefName,
       factText:      f.factText,
