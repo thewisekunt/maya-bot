@@ -98,7 +98,7 @@ export async function handleMessage({
   // Bump entropy when:
   //   - directly mentioned with media (user shared something TO Maya)
   //   - vision says the image/embed is worth talking about
-  const salienceEntropy = (isMention || isDM || mediaSuggestsReply)
+  const salienceEntropy = (isMention || isDM || (hasMedia && visionWorked))
     ? Math.max(entropy, 0.75)
     : entropy;
 
@@ -108,7 +108,6 @@ export async function handleMessage({
     isDM,
     isReply,
     hasMedia,
-    mediaSuggestsReply,
     isLurking,
     lurkDepth,
     trustLevel,

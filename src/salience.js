@@ -79,7 +79,6 @@ export function checkSalience({
   isDM               = false,
   isReply            = false,
   hasMedia           = false,
-  mediaSuggestsReply = false,  // vision layer hint: image/embed is worth discussing
   isLurking          = false,
   lurkDepth          = 0,
   trustLevel         = 3,
@@ -109,11 +108,12 @@ export function checkSalience({
 
   // ── RULE 1.5: Media with real content (vision said it's interesting) ───────
   // Not a mention, but vision analysed the image and it seems worth discussing
-  if (hasMedia && mediaSuggestsReply && trustLevel >= 3) {
+  // If media is present and salience reaches here, treat as worth engaging
+  if (hasMedia && trustLevel >= 3) {
     return reply('vision: media suggests reply');
   }
   // GIF / sticker / low-value media without mention → react at most
-  if (hasMedia && !mediaSuggestsReply && !isMention && !isDM) {
+  if (hasMedia && !isMention && !isDM) {
     return react(pickEmoji('neutral'), 'media: low value, react only');
   }
 
