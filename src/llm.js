@@ -33,10 +33,11 @@ export async function getMayaReply({
   entropy,
   zone,
   zoneLine,
-  contextLine,      // "You are in #general on XYZ server" or DM line
-  knownFacts,       // string[] of known user facts
-  relationship,     // { trustLevel, vibe, nickname, insideJokes, ... }
-  frequentFriends,  // [{ name, count }] people they talk to a lot
+  contextLine,
+  knownFacts,
+  relationship,
+  frequentFriends,
+  forceVerbal = false,  // when true: REACT is not allowed, must reply with words
 }) {
   // ── Build dynamic system prompt ─────────────────────────────────────────────
   const parts = [BASE_SYSTEM, ''];
@@ -131,9 +132,14 @@ export async function getMayaReply({
         break;
       }
 
-      const reactMatch = raw.match(/^REACT:(\S+)$/i);
-      if (reactMatch) return { type: 'react', emoji: reactMatch[1] };
-      return { type: 'reply', text: raw };
+      // If salience forced a verbal reply (e.g. mention+media), ignore REACT
+      if (!forceVerbal) {
+        const reactMatch = raw.match(/^REACT:(\S+)$/i);
+        if (reactMatch) return { type: 'react', emoji: reactMatch[1] };
+      }
+      // Strip any REACT: prefix that slipped through
+      const cleaned = raw.replace(/^REACT:\S+\s*/i, '').trim();
+      return { type: 'reply', text: cleaned || raw };
 
     } catch (err) {
       console.error(`[llm] attempt ${attempt + 1}:`, err.message);

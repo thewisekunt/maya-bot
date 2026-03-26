@@ -19,6 +19,8 @@ export async function handleMessage({
   message, guildId, msg,
   isMention, isReply,
   hasMedia = false,
+  isLurking = false,
+  lurkDepth = 0,
 }) {
   // ── 1. Context basics ─────────────────────────────────────────────────────
   const isDM        = !msg.guild;
@@ -102,6 +104,9 @@ export async function handleMessage({
     isMention,
     isDM,
     isReply,
+    hasMedia,
+    isLurking,
+    lurkDepth,
     trustLevel,
     entropy:    salienceEntropy,
   });
@@ -164,10 +169,14 @@ export async function handleMessage({
   );
 
   // Call LLM with enriched message (includes image/embed descriptions)
+  // forceVerbal: when Maya was directly addressed, she must reply with words
+  // not an emoji — the mention implies someone expects a verbal response
+  const forceVerbal = isMention || isDM || isReply;
+
   const result = await getMayaReply({
     prefName,
     context,
-    message:     richMessageText,   // ← enriched with media context
+    message:         richMessageText,   // ← enriched with media context
     entropy,
     zone,
     zoneLine,
@@ -175,6 +184,7 @@ export async function handleMessage({
     knownFacts:      [],
     relationship:    null,
     frequentFriends: [],
+    forceVerbal,
   });
 
   const savedReply = result.type === 'react'

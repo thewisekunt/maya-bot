@@ -3,6 +3,7 @@ import { Client, GatewayIntentBits, Partials, Events, ActivityType } from 'disco
 import { config } from './config.js';
 import { handleMessage } from './handler.js';
 import { acquireLock, releaseLock } from './lock.js';
+import { triggerLurk, checkLurk } from './lurk.js';
 
 const client = new Client({
   intents: [
@@ -22,38 +23,46 @@ client.once(Events.ClientReady, () => {
 client.on(Events.MessageCreate, async (msg) => {
   if (msg.author.bot) return;
 
-  const content = msg.content.trim();
+  const content    = msg.content.trim();
+  const channelId  = msg.channel.id;
+  const isDM       = !msg.guild;
 
-  // ── Check for rich content (images, embeds, stickers) ──────────────────
+  // ── Rich content detection ──────────────────────────────────────────────
   const hasAttachments = msg.attachments.size > 0;
   const hasEmbeds      = msg.embeds.length > 0;
   const hasStickers    = msg.stickers.size > 0;
   const hasMedia       = hasAttachments || hasEmbeds || hasStickers;
 
-  // Skip if no text AND no media
   if (!content && !hasMedia) return;
 
   // ── Channel filter ──────────────────────────────────────────────────────
   const allowed = config.discord.allowedChannels;
-  if (allowed.length > 0 && msg.guild && !allowed.includes(msg.channel.id)) return;
+  if (allowed.length > 0 && msg.guild && !allowed.includes(channelId)) return;
 
   // ── Trigger detection ───────────────────────────────────────────────────
   const isMention  = msg.mentions.has(client.user);
-  const isDM       = !msg.guild;
   const hasKeyword = /\bmaya\b/i.test(content);
 
-  // For media-only messages (no text): only respond if mentioned or DM
-  // Don't react to every image posted in a server
-  if (!content && hasMedia && !isMention && !isDM) return;
+  // ── Lurk check ───────────────────────────────────────────────────────────
+  // Do this BEFORE the trigger gate so lurking messages pass through
+  // even without a mention/keyword
+  const { isLurking, lurkDepth } = isDM ? { isLurking: false, lurkDepth: 0 }
+                                        : checkLurk(channelId);
 
-  if (!isMention && !isDM && !hasKeyword && !hasMedia) return;
+  // ── Gate: should we even process this message? ───────────────────────────
+  const shouldProcess = isMention || isDM || hasKeyword || isLurking;
 
-  // ── Distributed lock ────────────────────────────────────────────────────
+  // For media-only messages in server: only if mentioned or lurking
+  if (!content && hasMedia && !isMention && !isDM && !isLurking) return;
+
+  if (!shouldProcess) return;
+
+  // ── Distributed lock ─────────────────────────────────────────────────────
   const lockKey = `msg_${msg.id}`;
   const locked  = await acquireLock(lockKey);
   if (!locked) return;
 
-  // ── Is this a reply to one of Maya's messages? ──────────────────────────
+  // ── Is this a reply to one of Maya's messages? ───────────────────────────
   let isReply = false;
   if (msg.reference?.messageId) {
     try {
@@ -62,10 +71,8 @@ client.on(Events.MessageCreate, async (msg) => {
     } catch { /* non-fatal */ }
   }
 
-  // ── Clean text ──────────────────────────────────────────────────────────
+  // ── Clean text ───────────────────────────────────────────────────────────
   let text = content.replace(/<@!?\d+>/g, '').trim();
-
-  // If no text but has media, use a placeholder so pipeline doesn't break
   if (!text && hasMedia) text = '[media]';
 
   if (!text) {
@@ -89,16 +96,30 @@ client.on(Events.MessageCreate, async (msg) => {
       msg,
       isMention,
       isReply,
-      hasMedia,   // signal to handler to run vision extraction
+      hasMedia,
+      isLurking,
+      lurkDepth,
     });
+
+    // ── If Maya was just mentioned, open/reset lurk window ─────────────────
+    // Do this AFTER processing so the lurk window starts fresh for follow-ups
+    if (isMention && !isDM) {
+      triggerLurk(channelId, msg.author.id);
+    }
 
     if (result === null) return;
 
     if (result.type === 'react') {
       await msg.react(result.emoji).catch(() => {
-        console.warn(`[bot] react failed for emoji: ${result.emoji}`);
+        console.warn(`[bot] react failed: ${result.emoji}`);
       });
     } else {
+      // Maya replied verbally — refresh lurk so she stays attentive
+      if (isLurking && !isMention) {
+        const { refreshLurk } = await import('./lurk.js');
+        refreshLurk(channelId);
+      }
+
       const replyText = result.text;
       if (replyText.length <= 2000) {
         await msg.reply(replyText);
