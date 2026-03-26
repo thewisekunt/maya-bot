@@ -1,29 +1,43 @@
 /**
- * vision.js — Image and embed reading
+ * vision.js — Image and embed reading for Maya
  *
- * Downloads images first (fixes 404 from direct Discord CDN URLs in
- * some hosting environments), sends as base64 to vision LLM.
+ * Discord CDN URLs expire and are auth-protected, so direct URL
+ * passing to vision LLMs fails with 404.
  *
- * Returns structured media context:
- * {
- *   hasMedia:        bool
- *   hasImage:        bool    — at least one image was described
- *   imageDescs:      string[]
- *   embedSummaries:  string[]
- *   otherMedia:      string[]
- *   mediaContext:    string  — ready to inject into prompt
- *   suggestReply:    bool    — true if content seems worth a verbal reply
- * }
+ * Fix: download image → base64 → send as data URI.
+ *
+ * Returns a structured result including whether the image was
+ * actually described (visionWorked flag). When vision fails,
+ * handler tells Maya explicitly she cannot see the image —
+ * preventing hallucination.
  */
 
 import axios from 'axios';
 import { config } from './config.js';
 
-const VISION_MODEL = process.env.VISION_MODEL || 'google/gemini-flash-1.5';
-const IMAGE_EXTS   = new Set(['jpg','jpeg','png','gif','webp','avif']);
-const VIDEO_EXTS   = new Set(['mp4','mov','webm','avi','mkv']);
-const AUDIO_EXTS   = new Set(['mp3','wav','ogg','flac','m4a']);
+// Use a vision-capable model. gpt-4o-mini supports vision.
+// gemini-flash-1.5 also works but may have different base64 limits.
+const VISION_MODEL = process.env.VISION_MODEL || 'openai/gpt-4o-mini';
 
+const IMAGE_EXTS = new Set(['jpg','jpeg','png','gif','webp','avif','bmp']);
+const VIDEO_EXTS = new Set(['mp4','mov','webm','avi','mkv','m4v']);
+const AUDIO_EXTS = new Set(['mp3','wav','ogg','flac','m4a','aac']);
+
+// Max image size to attempt vision on (5MB — larger images are too slow/expensive)
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @param {Message} msg  Discord.js message
+ * @returns {Promise<{
+ *   hasMedia:        boolean,
+ *   visionWorked:    boolean,   ← true if at least one image was described
+ *   mediaContext:    string,    ← inject into LLM prompt
+ *   embedSummaries:  string[],
+ *   imageDescs:      string[],
+ * }>}
+ */
 export async function extractMediaContext(msg) {
   const imageJobs      = [];
   const embedSummaries = [];
@@ -32,38 +46,37 @@ export async function extractMediaContext(msg) {
   // ── Attachments ───────────────────────────────────────────────────────────
   for (const att of msg.attachments.values()) {
     const ext = att.name?.split('.').pop()?.toLowerCase() || '';
-    if (IMAGE_EXTS.has(ext) || att.contentType?.startsWith('image/')) {
-      imageJobs.push({ url: att.url, name: att.name || 'image', type: 'attachment' });
-    } else if (VIDEO_EXTS.has(ext) || att.contentType?.startsWith('video/')) {
+    const ct  = att.contentType || '';
+    if (IMAGE_EXTS.has(ext) || ct.startsWith('image/')) {
+      imageJobs.push({ url: att.url, name: att.name || 'image', size: att.size || 0 });
+    } else if (VIDEO_EXTS.has(ext) || ct.startsWith('video/')) {
       otherMedia.push(`[shared a video: ${att.name || 'video'}]`);
-    } else if (AUDIO_EXTS.has(ext) || att.contentType?.startsWith('audio/')) {
-      otherMedia.push(`[shared an audio file: ${att.name || 'audio'}]`);
+    } else if (AUDIO_EXTS.has(ext) || ct.startsWith('audio/')) {
+      otherMedia.push(`[shared audio: ${att.name || 'audio'}]`);
     } else if (att.name) {
       otherMedia.push(`[shared a file: ${att.name}]`);
     }
   }
 
   // ── Stickers ──────────────────────────────────────────────────────────────
-  for (const sticker of msg.stickers.values()) {
-    otherMedia.push(`[used sticker: "${sticker.name}"]`);
+  for (const s of msg.stickers.values()) {
+    otherMedia.push(`[used sticker: "${s.name}"]`);
   }
 
   // ── Embeds ────────────────────────────────────────────────────────────────
   for (const embed of msg.embeds) {
-    const summary = summariseEmbed(embed);
-    if (summary) embedSummaries.push(summary);
+    const s = _summariseEmbed(embed);
+    if (s) embedSummaries.push(s);
   }
 
-  // ── Describe images (download first → base64) ─────────────────────────────
-  const imageDescs = await Promise.all(imageJobs.map(img => describeImage(img)));
+  // ── Describe images ───────────────────────────────────────────────────────
+  // Run in parallel but cap at 3 images max
+  const imageResults = await Promise.all(
+    imageJobs.slice(0, 3).map(j => _describeImage(j))
+  );
 
-  // ── Decide if content is worth a verbal reply ─────────────────────────────
-  // Images with real descriptions (not just fallback), questions in embeds,
-  // or interesting media (not just a tenor GIF) suggest a reply is worthwhile
-  const hasRealDescription = imageDescs.some(d => d && !d.includes('[shared an image'));
-  const isJustGif = embedSummaries.every(s => s.toLowerCase().includes('gif'));
-  const hasInterestingEmbed = embedSummaries.length > 0 && !isJustGif;
-  const suggestReply = hasRealDescription || hasInterestingEmbed;
+  const imageDescs   = imageResults.map(r => r.text);
+  const visionWorked = imageResults.some(r => r.described);
 
   const parts = [
     ...imageDescs.filter(Boolean),
@@ -72,37 +85,52 @@ export async function extractMediaContext(msg) {
   ];
 
   return {
-    hasMedia:       parts.length > 0,
-    hasImage:       imageDescs.some(Boolean),
-    imageDescs,
+    hasMedia:      parts.length > 0,
+    visionWorked,
+    mediaContext:  parts.join('\n'),
     embedSummaries,
-    otherMedia,
-    mediaContext:   parts.join('\n'),
-    suggestReply,   // hint for salience: this media is worth talking about
+    imageDescs,
   };
 }
 
 // ── Image description ─────────────────────────────────────────────────────────
 
-async function describeImage({ url, name }) {
-  try {
-    // Step 1: Download the image as base64
-    // This avoids 404s when the hosting environment can't reach Discord CDN directly
-    let base64Data, mimeType;
-    try {
-      const response = await axios.get(url, {
-        responseType: 'arraybuffer',
-        timeout: 15_000,
-        headers: { 'User-Agent': 'MayaBot/1.0' },
-      });
-      base64Data = Buffer.from(response.data).toString('base64');
-      mimeType   = response.headers['content-type']?.split(';')[0] || 'image/jpeg';
-    } catch (dlErr) {
-      console.error(`[vision] download failed for ${name}: ${dlErr.message}`);
-      return `[shared an image: ${name}]`;
-    }
+/**
+ * @returns {{ text: string, described: boolean }}
+ *   described=true  → LLM actually saw and described the image
+ *   described=false → fallback label only, LLM should not speculate
+ */
+async function _describeImage({ url, name, size }) {
+  const fallback = { text: `[image attached: could not view]`, described: false };
 
-    // Step 2: Send to vision LLM as base64
+  // Skip huge images
+  if (size && size > MAX_IMAGE_BYTES) {
+    console.log(`[vision] skipping large image (${Math.round(size/1024)}KB): ${name}`);
+    return { text: `[image attached: too large to view]`, described: false };
+  }
+
+  // ── Step 1: Download as buffer ────────────────────────────────────────────
+  let base64Data, mimeType;
+  try {
+    const res = await axios.get(url, {
+      responseType: 'arraybuffer',
+      timeout:      15_000,
+      maxContentLength: MAX_IMAGE_BYTES,
+      headers: {
+        // Discord CDN requires a browser-like user agent
+        'User-Agent': 'Mozilla/5.0 (compatible; MayaBot/2.0)',
+      },
+    });
+    mimeType   = res.headers['content-type']?.split(';')[0]?.trim() || 'image/jpeg';
+    base64Data = Buffer.from(res.data).toString('base64');
+    console.log(`[vision] downloaded ${name} (${Math.round(res.data.byteLength/1024)}KB, ${mimeType})`);
+  } catch (err) {
+    console.warn(`[vision] download failed for ${name}: ${err.message}`);
+    return fallback;
+  }
+
+  // ── Step 2: Send to vision LLM ────────────────────────────────────────────
+  try {
     const { data, status } = await axios.post(
       config.llm.endpoint,
       {
@@ -111,19 +139,19 @@ async function describeImage({ url, name }) {
           role: 'user',
           content: [
             {
-              type: 'image_url',
-              image_url: {
-                url: `data:${mimeType};base64,${base64Data}`,
-              },
+              type:      'image_url',
+              image_url: { url: `data:${mimeType};base64,${base64Data}` },
             },
             {
               type: 'text',
-              text: 'Describe this image in 1–2 sentences. Be factual. If it\'s a meme, describe what it shows and the text/joke if any.',
+              text: 'Describe this image in 1–2 sentences. Be factual and specific. '
+                  + 'If it\'s a meme, describe what is shown and the text/joke. '
+                  + 'Do not guess or assume anything not visible.',
             },
           ],
         }],
         max_tokens:  150,
-        temperature: 0.2,
+        temperature: 0.1,
       },
       {
         headers: {
@@ -132,60 +160,61 @@ async function describeImage({ url, name }) {
           'HTTP-Referer':  'https://chatmasala.fun',
           'X-Title':       'MayaDiscordBot',
         },
-        timeout: 25_000,
+        timeout:        30_000,
         validateStatus: () => true,
       }
     );
 
     if (status !== 200) {
-      console.error(`[vision] LLM HTTP ${status} for ${name}`);
-      return `[shared an image: ${name}]`;
+      console.warn(`[vision] LLM HTTP ${status} for ${name}:`, JSON.stringify(data).slice(0, 200));
+      return fallback;
     }
 
     const desc = data?.choices?.[0]?.message?.content?.trim();
-    if (!desc) return `[shared an image: ${name}]`;
+    if (!desc) return fallback;
 
-    console.log(`[vision] described "${name}": ${desc.slice(0, 80)}`);
-    return `[image: ${desc}]`;
+    console.log(`[vision] described "${name}": ${desc.slice(0, 100)}`);
+    return { text: `[image: ${desc}]`, described: true };
 
   } catch (err) {
-    console.error(`[vision] describeImage error for ${name}:`, err.message);
-    return `[shared an image: ${name}]`;
+    console.warn(`[vision] LLM call failed for ${name}:`, err.message);
+    return fallback;
   }
 }
 
-// ── Embed text extraction ─────────────────────────────────────────────────────
+// ── Embed summariser ──────────────────────────────────────────────────────────
 
-function summariseEmbed(embed) {
-  const parts = [];
-  const url      = embed.url || '';
-  const provider = embed.provider?.name?.toLowerCase() || '';
+function _summariseEmbed(embed) {
+  const parts   = [];
+  const url     = embed.url || embed.video?.url || '';
+  const prov    = (embed.provider?.name || '').toLowerCase();
 
-  let platform = '';
-  if (provider.includes('youtube') || url.includes('youtu'))   platform = 'YouTube video';
-  else if (provider.includes('spotify') || url.includes('spotify')) platform = 'Spotify';
-  else if (url.includes('twitter.com') || url.includes('x.com'))    platform = 'Tweet';
-  else if (url.includes('instagram.com'))                            platform = 'Instagram post';
-  else if (url.includes('reddit.com'))                               platform = 'Reddit post';
-  else if (url.includes('github.com'))                               platform = 'GitHub';
-  else if (url.includes('tenor.com') || url.includes('giphy.com'))   platform = 'GIF';
-  else if (embed.type === 'image')                                    platform = 'image link';
-  else if (embed.type === 'video')                                    platform = 'video';
-  else platform = provider || 'link';
+  let platform = 'link';
+  if (prov.includes('youtube') || url.includes('youtu'))       platform = 'YouTube video';
+  else if (prov.includes('spotify') || url.includes('spotify')) platform = 'Spotify track';
+  else if (url.includes('twitter.com') || url.includes('x.com')) platform = 'Tweet';
+  else if (url.includes('instagram.com'))  platform = 'Instagram post';
+  else if (url.includes('reddit.com'))     platform = 'Reddit post';
+  else if (url.includes('github.com'))     platform = 'GitHub link';
+  else if (url.includes('tenor.com') || url.includes('giphy.com')) platform = 'GIF';
+  else if (embed.type === 'image')         platform = 'image link';
+  else if (embed.type === 'video')         platform = 'video';
+  else if (prov)                           platform = prov;
 
-  const label = `[${platform}`;
-  if (embed.title)       parts.push(`${label}: "${embed.title}"${url ? ` — ${url}` : ''}]`);
-  else if (embed.description) {
-    const short = embed.description.slice(0,120).replace(/\n/g,' ');
-    parts.push(`${label}: ${short}${embed.description.length > 120 ? '…' : ''}]`);
+  if (embed.title) {
+    parts.push(`[${platform}: "${embed.title}"${url ? ` — ${url}` : ''}]`);
+  } else if (embed.description) {
+    const d = embed.description.slice(0, 120).replace(/\n/g, ' ');
+    parts.push(`[${platform}: ${d}]`);
+  } else if (url) {
+    parts.push(`[${platform}: ${url}]`);
   }
-  else if (url)          parts.push(`${label}: ${url}]`);
 
-  if (embed.author?.name) parts.push(`  by ${embed.author.name}`);
-
+  if (embed.author?.name)   parts.push(`  by ${embed.author.name}`);
   if (embed.fields?.length) {
-    parts.push(embed.fields.slice(0,3)
-      .map(f => `  ${f.name}: ${f.value.slice(0,80)}`).join('\n'));
+    embed.fields.slice(0, 2).forEach(f =>
+      parts.push(`  ${f.name}: ${f.value.slice(0, 60)}`)
+    );
   }
 
   return parts.join('\n') || null;

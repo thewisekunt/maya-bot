@@ -59,22 +59,22 @@ export async function handleMessage({
   }
 
   // ── 3. Vision extraction (run before salience so salience knows about media) 
-  let mediaContext = '';
+  let mediaContext    = '';
   let richMessageText = message;
+  let visionWorked    = false;
 
-  let mediaSuggestsReply = false;
   if (hasMedia) {
     try {
       const media = await extractMediaContext(msg);
       if (media.hasMedia) {
-        mediaContext       = media.mediaContext;
-        mediaSuggestsReply = media.suggestReply;
+        mediaContext = media.mediaContext;
+        visionWorked = media.visionWorked;   // true only if image was actually described
         if (message === '[media]') {
           richMessageText = mediaContext;
         } else {
           richMessageText = `${message}\n${mediaContext}`;
         }
-        console.log(`[vision] extracted (suggestReply=${media.suggestReply}): ${mediaContext.slice(0, 120)}`);
+        console.log(`[vision] extracted (visionWorked=${visionWorked}): ${mediaContext.slice(0, 120)}`);
       }
     } catch (e) {
       console.error('[handler] vision extraction failed:', e.message);
@@ -174,13 +174,21 @@ export async function handleMessage({
 
   // Call LLM with enriched message (includes image/embed descriptions)
   // forceVerbal: when Maya was directly addressed, she must reply with words
-  // not an emoji — the mention implies someone expects a verbal response
   const forceVerbal = isMention || isDM || isReply;
+
+  // If media was attached but vision failed, tell Maya explicitly so she
+  // doesn't hallucinate content based on filename or prior context
+  let finalMessage = richMessageText;
+  if (hasMedia && !visionWorked && message !== '[media]') {
+    finalMessage = `${message}\n[Note: user sent an image/file but I cannot view it]`;
+  } else if (hasMedia && !visionWorked && message === '[media]') {
+    finalMessage = `[User sent an image/file that I cannot view]`;
+  }
 
   const result = await getMayaReply({
     prefName,
     context,
-    message:         richMessageText,   // ← enriched with media context
+    message:         finalMessage,
     entropy,
     zone,
     zoneLine,
@@ -189,6 +197,7 @@ export async function handleMessage({
     relationship:    null,
     frequentFriends: [],
     forceVerbal,
+    visionWorked,
   });
 
   const savedReply = result.type === 'react'
