@@ -1,106 +1,179 @@
 /**
- * handler.js — Master pipeline
+ * handler.js — Master pipeline with salience gate.
  *
- * Orchestrates: context detection → user upsert → relationship load
- *   → fact extraction → memory fetch → LLM call → persist → return
+ * Flow: context → user → salience check → (ignore/react/LLM) → persist
  */
 
-import { upsertUser, detectNameSet, getEntropyZone, estimateEntropy,
-         extractAndStoreFact, getOrCreateRelationship,
-         getFrequentInteractors, recordUserInteraction } from './persona.js';
-import { getContext, saveMessage } from './memory.js';
+import { estimateEntropy, getEntropyZone } from './persona.js';
 import { getMayaReply } from './llm.js';
-import { upsertGuild, upsertChannel, buildContextLine } from './context.js';
+import { buildContextLine } from './context.js';
+import { checkSalience } from './salience.js';
 import { debugLog } from './logger.js';
+import db from './db.js';
 
-/**
- * @param {object} params
- *   userId, username, displayName, avatarUrl, message, guildId,
- *   msg   — the raw Discord.js Message object (for guild/channel details)
- *
- * @returns {{ type: 'reply', text } | { type: 'react', emoji }}
- */
 export async function handleMessage({
-  userId, username, displayName, avatarUrl, message, guildId, msg,
+  userId, username, displayName, avatarUrl, message, guildId,
+  msg,        // raw Discord.js Message
+  isMention,  // bool
+  isReply,    // bool — is this a reply to Maya's message?
 }) {
-  // ── 1. Context: guild + channel ─────────────────────────────────────────────
-  await upsertGuild(msg.guild);
-  const { contextType, isPrivate, channelName, channelId, topic } =
-    await upsertChannel(msg);
-
-  const guildName = msg.guild?.name || null;
+  // ── 1. Context basics ─────────────────────────────────────────────────────
+  const isDM        = !msg.guild;
+  const contextType = isDM ? 'dm' : 'server';
+  const isPrivate   = isDM;
+  const channelId   = msg.channel?.id    || null;
+  const channelName = isDM ? 'DM' : (msg.channel?.name || 'unknown');
+  const guildName   = msg.guild?.name    || null;
+  const topic       = msg.channel?.topic || null;
   const contextLine = buildContextLine(contextType, channelName, guildName, topic);
 
-  // ── 2. User upsert ──────────────────────────────────────────────────────────
-  let { prefName, knownFacts } = await upsertUser({
-    userId, username, displayName, avatarUrl,
-    guildId:   guildId   || null,
-    channelId: channelId || null,
-  });
-
-  // ── 3. Name override ────────────────────────────────────────────────────────
-  const newName = await detectNameSet(userId, message);
-  if (newName) prefName = newName;
-
-  // ── 4. Passive fact extraction (non-blocking) ────────────────────────────────
-  extractAndStoreFact(userId, message).catch(() => {});
-
-  // ── 5. Relationship load ────────────────────────────────────────────────────
-  const relationship = await getOrCreateRelationship(userId, contextType);
-
-  // ── 6. Social graph — who does this user talk to? ───────────────────────────
-  const frequentFriends = await getFrequentInteractors(userId, guildId);
-
-  // If this message was a reply to someone, record that interaction
-  if (msg.reference?.messageId && msg.guild) {
+  // ── 2. Preferred name ─────────────────────────────────────────────────────
+  let prefName = displayName || username;
+  try {
+    const [[u]] = await db.execute(
+      `SELECT preferred_name, display_name, username FROM maya_users
+       WHERE discord_user_id=? LIMIT 1`, [userId]);
+    if (u) prefName = u.preferred_name || u.display_name || u.username || prefName;
+  } catch {
     try {
-      const refMsg = await msg.channel.messages.fetch(msg.reference.messageId);
-      if (refMsg && !refMsg.author.bot && refMsg.author.id !== userId) {
-        await recordUserInteraction(userId, refMsg.author.id, guildId);
-      }
-    } catch { /* non-fatal */ }
+      const [[p]] = await db.execute(
+        `SELECT preferred_name, display_name, username FROM maya_personas
+         WHERE discord_user_id=? LIMIT 1`, [userId]);
+      if (p) prefName = p.preferred_name || p.display_name || p.username || prefName;
+    } catch { /* use displayName */ }
   }
 
-  // ── 7. Entropy + tone zone ──────────────────────────────────────────────────
+  // "My name is X"
+  const nameMatch = message.match(/\bmy\s+name\s+is\s+([a-zA-Z][a-zA-Z\s]{0,30})/i);
+  if (nameMatch) {
+    const newName = nameMatch[1].trim();
+    prefName = newName;
+    db.execute(`UPDATE maya_users SET preferred_name=? WHERE discord_user_id=?`,
+      [newName, userId]).catch(() =>
+      db.execute(`UPDATE maya_personas SET preferred_name=? WHERE discord_user_id=?`,
+        [newName, userId]).catch(() => {}));
+  }
+
+  // ── 3. Entropy + zone ─────────────────────────────────────────────────────
   const entropy = estimateEntropy(message);
   const { zone, line: zoneLine } = getEntropyZone(entropy);
 
-  // ── 8. Fetch memory — scoped by context (DM vs server) ──────────────────────
-  const context = await getContext(userId, prefName, contextType, guildId);
+  // ── 4. Load trust level for salience ─────────────────────────────────────
+  let trustLevel = 3;
+  try {
+    const [[rel]] = await db.execute(
+      `SELECT trust_level FROM maya_user_relationships
+       WHERE discord_user_id=? LIMIT 1`, [userId]);
+    if (rel) trustLevel = rel.trust_level || 3;
+  } catch { /* default 3 */ }
 
-  // ── 9. Call LLM ─────────────────────────────────────────────────────────────
-  const result = await getMayaReply({
-    prefName,
-    context,
-    message,
+  // ── 5. SALIENCE GATE — decide before calling LLM ─────────────────────────
+  const salience = checkSalience({
+    text: message,
+    isMention,
+    isDM,
+    isReply,
+    trustLevel,
     entropy,
-    zone,
-    zoneLine,
-    contextLine,
-    knownFacts,
-    relationship,
-    frequentFriends,
   });
 
-  // ── 10. Persist memory with full context ────────────────────────────────────
-  const memBase = {
-    userId, prefName,
-    guildId:     guildId    || null,
-    channelId:   channelId  || null,
-    contextType,
-    isPrivate,
-    entropy,
-  };
+  console.log(`[salience] user=${prefName} action=${salience.action} reason="${salience.reason}"`);
 
-  await saveMessage({ ...memBase, sender: 'user', message });
+  // ── IGNORE — save message to memory, return null (no response) ───────────
+  if (salience.action === 'ignore') {
+    _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate, entropy, message, null);
+    debugLog({ userId, prefName, entropy, zone, message, reply: '[IGNORED]' });
+    return null;
+  }
+
+  // ── REACT — return emoji immediately, no LLM call ────────────────────────
+  if (salience.action === 'react') {
+    _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate, entropy,
+      message, `*reacted with ${salience.emoji}*`);
+    debugLog({ userId, prefName, entropy, zone, message, reply: `REACT:${salience.emoji}` });
+    return { type: 'react', emoji: salience.emoji };
+  }
+
+  // ── REPLY — fetch memory + call LLM ──────────────────────────────────────
+
+  // Memory context
+  let context = '';
+  try {
+    const [rows] = isDM
+      ? await db.execute(
+          `SELECT sender, message FROM maya_memory
+           WHERE discord_user_id=? AND context_type='dm'
+           ORDER BY created_at DESC LIMIT 20`, [userId])
+      : await db.execute(
+          `SELECT sender, message FROM maya_memory
+           WHERE discord_user_id=? AND context_type='server'
+           ORDER BY created_at DESC LIMIT 20`, [userId]);
+    context = rows.reverse().map(r =>
+      `${r.sender === 'maya' ? 'Maya' : prefName}: ${r.message}`).join('\n');
+  } catch {
+    try {
+      const [rows] = await db.execute(
+        `SELECT sender, message FROM maya_memory
+         WHERE discord_user_id=? ORDER BY created_at DESC LIMIT 20`, [userId]);
+      context = rows.reverse().map(r =>
+        `${r.sender === 'maya' ? 'Maya' : prefName}: ${r.message}`).join('\n');
+    } catch { /* no context */ }
+  }
+
+  // Upsert user (non-fatal)
+  db.execute(
+    `INSERT INTO maya_users (discord_user_id, username, display_name, avatar_url, message_count)
+     VALUES (?,?,?,?,1)
+     ON DUPLICATE KEY UPDATE display_name=VALUES(display_name), message_count=message_count+1, last_seen=NOW()`,
+    [userId, username, displayName||username, avatarUrl||'']
+  ).catch(() =>
+    db.execute(
+      `INSERT INTO maya_personas (discord_user_id, username, display_name, avatar_url)
+       VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE display_name=VALUES(display_name)`,
+      [userId, username, displayName||username, avatarUrl||'']
+    ).catch(() => {})
+  );
+
+  // Call LLM
+  const result = await getMayaReply({
+    prefName, context, message, entropy, zone, zoneLine,
+    contextLine, knownFacts: [], relationship: null, frequentFriends: [],
+  });
 
   const savedReply = result.type === 'react'
     ? `*reacted with ${result.emoji}*`
     : result.text;
-  await saveMessage({ ...memBase, sender: 'maya', message: savedReply });
 
-  // ── 11. Debug log ────────────────────────────────────────────────────────────
+  _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate,
+    entropy, message, savedReply);
   debugLog({ userId, prefName, entropy, zone, message, reply: savedReply });
 
   return result;
+}
+
+// ── Save both sides of exchange to memory ────────────────────────────────────
+function _saveMemory(userId, prefName, guildId, channelId, contextType,
+                     isPrivate, entropy, userMsg, mayaReply) {
+  const saveNew = () => db.execute(
+    `INSERT INTO maya_memory
+       (discord_user_id, user_name, guild_id, channel_id, context_type, is_private, sender, message, entropy)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+    [userId, prefName, guildId||null, channelId, contextType, isPrivate?1:0, 'user', userMsg, entropy]
+  ).then(() => mayaReply ? db.execute(
+    `INSERT INTO maya_memory
+       (discord_user_id, user_name, guild_id, channel_id, context_type, is_private, sender, message, entropy)
+     VALUES (?,?,?,?,?,?,?,?,?)`,
+    [userId, prefName, guildId||null, channelId, contextType, isPrivate?1:0, 'maya', mayaReply, entropy]
+  ) : Promise.resolve());
+
+  const saveOld = () => db.execute(
+    `INSERT INTO maya_memory (discord_user_id, user_name, guild_id, sender, message, entropy)
+     VALUES (?,?,?,'user',?,?)`, [userId, prefName, guildId||null, userMsg, entropy]
+  ).then(() => mayaReply ? db.execute(
+    `INSERT INTO maya_memory (discord_user_id, user_name, guild_id, sender, message, entropy)
+     VALUES (?,?,?,'maya',?,?)`, [userId, prefName, guildId||null, mayaReply, entropy]
+  ) : Promise.resolve());
+
+  saveNew().catch(() => saveOld().catch(e =>
+    console.error('[handler] save failed:', e.message)));
 }
