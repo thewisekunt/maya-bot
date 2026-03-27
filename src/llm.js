@@ -40,9 +40,10 @@ export async function getMayaReply({
   zoneLine,
   contextLine,
   knownFacts,
+  selfTraits     = [],
   relationship,
   frequentFriends,
-  forceVerbal = false,
+  forceVerbal    = false,
 }) {
   // ── Build system prompt ───────────────────────────────────────────────────
   // When forceVerbal: strip REACT instruction entirely so the model never
@@ -71,8 +72,18 @@ export async function getMayaReply({
       parts.push(`They like talking about: ${relationship.topicsTheyLike.slice(0,3).join(', ')}`);
   }
 
-  if (knownFacts?.length)
-    parts.push(`What you know about ${prefName}: ${knownFacts.slice(0,5).join('; ')}`);
+  // Maya's own self-model — injected BEFORE user facts so the LLM
+  // can distinguish "Maya's traits" from "what Maya knows about this user"
+  if (selfTraits?.length) {
+    parts.push(`About yourself (Maya's own traits — be consistent with these):`);
+    selfTraits.slice(0, 5).forEach(t => parts.push(`  • ${t}`));
+  }
+
+  // User facts — clearly attributed to the user, not Maya
+  if (knownFacts?.length) {
+    parts.push(`What you know about ${prefName}:`);
+    knownFacts.slice(0, 5).forEach(f => parts.push(`  • ${f}`));
+  }
 
   if (frequentFriends?.length)
     parts.push(`${prefName} often chats with: ${frequentFriends.map(f=>f.name).join(', ')}`);
@@ -80,7 +91,7 @@ export async function getMayaReply({
   if (forceVerbal)
     parts.push(`IMPORTANT: You MUST respond with actual words. No emoji-only responses.`);
 
-  const systemPrompt = parts.join('\n');
+  const systemPrompt = systemOverride || parts.join('\n');
 
   const userPrompt =
     `Entropy: ${entropy} | Zone: ${zone}\n${zoneLine}\n\n` +

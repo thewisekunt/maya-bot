@@ -6,7 +6,8 @@
 import { buildContext } from './memory.js';
 import { isImageRequest, extractImagePrompt, generateImage } from './imagegen.js';
 import { estimateEntropy, getEntropyZone, getKnownNames, getConfirmedFacts,
-         extractAndStoreFact, getOrCreateRelationship, recordUserInteraction,
+         getMayaSelfTraits, extractAndStoreFact, extractMayaTrait,
+         getOrCreateRelationship, recordUserInteraction,
          upsertUser, detectNameSet, getFrequentInteractors } from './persona.js';
 import { getMayaReply } from './llm.js';
 import { buildContextLine } from './context.js';
@@ -168,8 +169,11 @@ export async function handleMessage({
     console.error('[handler] buildContext error:', e.message);
   }
 
-  // Reliable facts about this user
+  // Facts about this user (attributed: "Danish loves pizza")
   const knownFacts = await getConfirmedFacts(userId).catch(() => []);
+
+  // Maya's own consistent traits ("Maya loves the rain")
+  const selfTraits = await getMayaSelfTraits().catch(() => []);
 
   // Upsert user (non-fatal)
   db.execute(
@@ -198,7 +202,7 @@ export async function handleMessage({
 
   const result = await getMayaReply({
     prefName, context, message: finalMessage, entropy, zone, zoneLine,
-    contextLine, knownFacts, relationship: { trustLevel },
+    contextLine, knownFacts, selfTraits, relationship: { trustLevel },
     frequentFriends: [], forceVerbal,
   });
 
@@ -210,8 +214,13 @@ export async function handleMessage({
     entropy, message === '[media]' ? mediaContext : message, savedReply);
   debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: savedReply });
 
-  // ── Extract and store facts from this message (fire and forget) ─────────────
+  // Extract facts from user message (fire and forget)
   extractAndStoreFact(userId, message).catch(() => {});
+
+  // Extract self-traits from Maya's own reply (fire and forget)
+  if (result.type === 'reply') {
+    extractMayaTrait(result.text).catch(() => {});
+  }
 
   return result;
 }

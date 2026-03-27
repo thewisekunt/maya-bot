@@ -278,33 +278,58 @@ export async function getKnownNames(guildId, limit = 30) {
 // ── Structured facts ──────────────────────────────────────────────────────────
 
 const FACT_PATTERNS = [
-  { re: /\bi (?:love|really love|adore)\s+(.{3,50})/i,          cat: 'preference',  score: 0.3 },
-  { re: /\bi (?:hate|can't stand|dislike)\s+(.{3,50})/i,        cat: 'preference',  score: 0.3 },
-  { re: /\bi(?:'m| am) (?:a |an )?([a-zA-Z\s]{3,40})/i,        cat: 'identity',    score: 0.2 },
-  { re: /\bi work (?:at|in|for)\s+(.{3,50})/i,                  cat: 'identity',    score: 0.2 },
-  { re: /\bmy (?:name) is\s+([a-zA-Z\s]{2,30})/i,               cat: 'identity',    score: 0.0 },
-  { re: /\bi(?:'m| am) from\s+(.{3,40})/i,                      cat: 'identity',    score: 0.1 },
-  { re: /\bi (?:study|studied)\s+(.{3,50})/i,                   cat: 'identity',    score: 0.3 },
-  { re: /\bmy (?:fav(?:ou?rite)?)\s+(?:is\s+)?(.{3,40})/i,     cat: 'preference',  score: 0.4 },
-  // Objective facts (user states something about the world, not themselves)
+  { re: /\bi (?:love|really love|adore)\s+(.{3,50})/i,         cat: 'preference', score: 0.3 },
+  { re: /\bi (?:hate|can't stand|dislike)\s+(.{3,50})/i,       cat: 'preference', score: 0.3 },
+  { re: /\bi(?:'m| am) (?:a |an )?([a-zA-Z\s]{3,40})/i,       cat: 'identity',   score: 0.2 },
+  { re: /\bi work (?:at|in|for)\s+(.{3,50})/i,                 cat: 'identity',   score: 0.2 },
+  { re: /\bmy (?:name) is\s+([a-zA-Z\s]{2,30})/i,             cat: 'identity',   score: 0.0 },
+  { re: /\bi(?:'m| am) from\s+(.{3,40})/i,                     cat: 'identity',   score: 0.1 },
+  { re: /\bi (?:study|studied)\s+(.{3,50})/i,                  cat: 'identity',   score: 0.3 },
+  { re: /\bmy (?:fav(?:ou?rite)?)\s+(?:is\s+)?(.{3,40})/i,   cat: 'preference', score: 0.4 },
+  { re: /\bi (?:like|enjoy|prefer)\s+(.{3,50})/i,              cat: 'preference', score: 0.35 },
+  { re: /\bi (?:play|played|watch|watched|read)\s+(.{3,50})/i, cat: 'preference', score: 0.4 },
+  // Objective facts about the world
   { re: /\b(?:the\s+)?(?:first|second|third) law (?:of\s+)?(.{5,60})/i, cat: 'objective', score: 0.0 },
-  { re: /\bscience says\s+(.{5,80})/i,                          cat: 'objective',   score: 0.1 },
+  { re: /\bscience says\s+(.{5,80})/i,                         cat: 'objective',  score: 0.1 },
 ];
 
+/**
+ * Extract facts from a USER message and store them attributed to that user.
+ * The "I" in user speech = that user, not Maya.
+ * We rewrite first-person to third-person using their name so facts are
+ * unambiguous when retrieved and injected into the LLM prompt later.
+ *
+ * e.g. Danish says "I love pizza"
+ *   stored as: "Danish loves pizza"  ← not "i love pizza"
+ */
 export async function extractAndStoreFact(userId, message) {
+  // Get the user's name for attribution rewriting
+  let userName = 'the user';
+  try {
+    const [[u]] = await db.execute(
+      `SELECT preferred_name, display_name, username FROM maya_users
+       WHERE discord_user_id = ? LIMIT 1`, [userId]
+    );
+    userName = u?.preferred_name || u?.display_name || u?.username || 'the user';
+  } catch { /* non-fatal */ }
+
   for (const { re, cat, score } of FACT_PATTERNS) {
     const m = message.match(re);
     if (!m) continue;
-    const fact = m[0].trim().slice(0, 200);
+
+    // Rewrite first-person to attributed third-person
+    // "i love pizza" → "Danish loves pizza"
+    // "i'm a software engineer" → "Danish is a software engineer"
+    const raw = m[0].trim();
+    const fact = _attributeFact(raw, userName).slice(0, 200);
+
     try {
-      // Check for conflict — if similar fact exists with different content
       const [existing] = await db.execute(
         `SELECT id, fact, conflict_score FROM maya_facts
          WHERE discord_user_id = ? AND category = ?
          ORDER BY created_at DESC LIMIT 5`,
         [userId, cat]
       );
-      // Simple conflict detection: if category already has a fact, bump score slightly
       const adjustedScore = existing.length > 0 ? Math.min(score + 0.1, 0.9) : score;
 
       await db.execute(
@@ -313,9 +338,41 @@ export async function extractAndStoreFact(userId, message) {
          VALUES (?, ?, ?, ?, ?)`,
         [userId, fact, cat, adjustedScore, message.slice(0, 500)]
       );
+      console.log(`[facts] stored for ${userName}: "${fact}" (${cat}, score=${adjustedScore})`);
     } catch { /* non-fatal */ }
-    break; // one fact per message
+    break;
   }
+}
+
+/**
+ * Rewrite a first-person fact string to third-person attribution.
+ * "i love pizza"        → "Danish loves pizza"
+ * "i'm a developer"     → "Danish is a developer"
+ * "i work at Google"    → "Danish works at Google"
+ * "my favourite is X"   → "Danish's favourite is X"
+ */
+function _attributeFact(raw, name) {
+  return raw
+    .replace(/^i love\b/i,             `${name} loves`)
+    .replace(/^i really love\b/i,      `${name} really loves`)
+    .replace(/^i adore\b/i,            `${name} adores`)
+    .replace(/^i hate\b/i,             `${name} hates`)
+    .replace(/^i can't stand\b/i,      `${name} can't stand`)
+    .replace(/^i dislike\b/i,          `${name} dislikes`)
+    .replace(/^i like\b/i,             `${name} likes`)
+    .replace(/^i enjoy\b/i,            `${name} enjoys`)
+    .replace(/^i prefer\b/i,           `${name} prefers`)
+    .replace(/^i play\b/i,             `${name} plays`)
+    .replace(/^i watch\b/i,            `${name} watches`)
+    .replace(/^i read\b/i,             `${name} reads`)
+    .replace(/^i(?:'m| am) (?:a |an )?/i, `${name} is `)
+    .replace(/^i work /i,               `${name} works `)
+    .replace(/^i studied?\b/i,         `${name} studies`)
+    .replace(/^my name is\b/i,         `${name}'s name is`)
+    .replace(/^my favourite\b/i,       `${name}'s favourite`)
+    .replace(/^my favorite\b/i,        `${name}'s favorite`)
+    .replace(/^my fav\b/i,             `${name}'s fav`)
+    .trim();
 }
 
 /**
@@ -327,15 +384,84 @@ export async function getConfirmedFacts(userId, limit = 6) {
     const [rows] = await db.execute(
       `SELECT fact, category, conflict_score FROM maya_facts
        WHERE discord_user_id = ? AND conflict_score < 0.4
+         AND discord_user_id != 'maya'
        ORDER BY conflict_score ASC, updated_at DESC
        LIMIT ?`,
       [userId, limit]
     );
-    return rows.map(r => `[${r.category}] ${r.fact}`);
+    // Facts are already attributed ("Danish loves pizza") — return as-is
+    return rows.map(r => r.fact);
   } catch { return []; }
 }
 
-// ── User↔User observed relations ─────────────────────────────────────────────
+/**
+ * Get Maya's own self-traits — stored under discord_user_id = 'maya'.
+ * These are things Maya has said about herself across conversations.
+ */
+export async function getMayaSelfTraits(limit = 8) {
+  try {
+    const [rows] = await db.execute(
+      `SELECT fact, category FROM maya_facts
+       WHERE discord_user_id = 'maya' AND conflict_score < 0.5
+       ORDER BY conflict_score ASC, updated_at DESC
+       LIMIT ?`,
+      [limit]
+    );
+    return rows.map(r => r.fact);
+  } catch { return []; }
+}
+
+// ── Maya self-model ──────────────────────────────────────────────────────────
+
+/**
+ * Extract traits from Maya's own reply and store under discord_user_id='maya'.
+ * When Maya says "I love the rain" or "I find that boring", that's her opinion —
+ * it should be consistent across conversations.
+ *
+ * Stored with discord_user_id='maya' so it's never confused with user facts.
+ * Rewritten as "Maya loves the rain" for clarity in the LLM prompt.
+ */
+export async function extractMayaTrait(replyText) {
+  if (!replyText || replyText.startsWith('*reacted')) return;
+  if (replyText.length < 10) return;
+
+  for (const { re, cat, score } of FACT_PATTERNS) {
+    const m = replyText.match(re);
+    if (!m) continue;
+
+    const raw  = m[0].trim();
+    const fact = _attributeFact(raw, 'Maya').slice(0, 200);
+
+    // Skip objective facts — Maya stating world facts isn't a self-trait
+    if (cat === 'objective') break;
+
+    try {
+      const [existing] = await db.execute(
+        `SELECT id, fact FROM maya_facts
+         WHERE discord_user_id = 'maya' AND category = ?
+         ORDER BY created_at DESC LIMIT 5`,
+        [cat]
+      );
+
+      // Don't store if identical or near-identical already exists
+      const isDupe = existing.some(r =>
+        r.fact.toLowerCase().slice(0, 40) === fact.toLowerCase().slice(0, 40)
+      );
+      if (isDupe) break;
+
+      await db.execute(
+        `INSERT INTO maya_facts
+           (discord_user_id, fact, category, conflict_score, source_message)
+         VALUES ('maya', ?, ?, ?, ?)`,
+        [fact, cat, score, replyText.slice(0, 500)]
+      );
+      console.log(`[facts] Maya self-trait stored: "${fact}" (${cat})`);
+    } catch { /* non-fatal */ }
+    break;
+  }
+}
+
+// ── User↔User observed relations ─────────────────────────────────────────────────
 
 export async function recordUserInteraction(userAId, userBId, guildId) {
   if (!userAId || !userBId || userAId === userBId) return;
