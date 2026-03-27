@@ -10,7 +10,7 @@
 import axios from 'axios';
 import { config } from './config.js';
 
-const IMAGE_MODEL = process.env.IMAGE_MODEL || 'black-forest-labs/flux-2-flex';
+const IMAGE_MODEL = process.env.IMAGE_MODEL || 'black-forest-labs/flux.2-klein-4b';
 
 // ── Trigger detection ─────────────────────────────────────────────────────────
 // Check before LLM call — no extra API cost for detection
