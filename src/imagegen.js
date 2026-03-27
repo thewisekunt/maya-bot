@@ -67,11 +67,13 @@ export function extractImagePrompt(text) {
 export async function generateImage(prompt) {
   console.log(`[imagegen] generating: "${prompt.slice(0, 80)}"`);
 
+  // OpenRouter FLUX models use the chat completions endpoint with
+  // the prompt inside the messages array as a user message
   const { data, status } = await axios.post(
-    config.llm.endpoint,   // https://openrouter.ai/api/v1/chat/completions
+    config.llm.endpoint,
     {
-      model:  IMAGE_MODEL,
-      prompt: prompt,       // image gen models use 'prompt' not 'messages'
+      model:    IMAGE_MODEL,
+      messages: [{ role: 'user', content: prompt }],
     },
     {
       headers: {
@@ -90,39 +92,44 @@ export async function generateImage(prompt) {
     throw new Error(`Image generation failed (HTTP ${status})`);
   }
 
-  // OpenRouter returns image gen results in data[0].url or b64_json
-  const result = data?.data?.[0];
-  if (!result) {
-    console.error('[imagegen] unexpected response:', JSON.stringify(data).slice(0, 300));
-    throw new Error('No image in response');
+  // OpenRouter returns image URL in the message content
+  // Format: choices[0].message.content = "![image](https://...)" or just the URL
+  const content = data?.choices?.[0]?.message?.content?.trim();
+  console.log('[imagegen] raw response content:', content?.slice(0, 200));
+
+  if (!content) {
+    console.error('[imagegen] unexpected response:', JSON.stringify(data).slice(0, 400));
+    throw new Error('No content in response');
   }
 
-  // If URL returned — download it
-  if (result.url) {
-    console.log(`[imagegen] downloading from: ${result.url.slice(0, 60)}`);
-    const imgRes = await axios.get(result.url, {
-      responseType:    'arraybuffer',
-      timeout:         20_000,
-      validateStatus:  () => true,
-    });
-    if (imgRes.status !== 200) {
-      throw new Error(`Image download failed (HTTP ${imgRes.status})`);
+  // Extract URL from markdown image format ![...](url) or bare URL
+  const urlMatch = content.match(/https?:\/\/[^\s\)"]+/);
+  if (!urlMatch) {
+    // Some models return base64 directly in content
+    if (content.startsWith('data:image')) {
+      const b64 = content.split(',')[1];
+      return { buffer: Buffer.from(b64, 'base64'), filename: 'maya_gen.png', prompt };
     }
-    return {
-      buffer:   Buffer.from(imgRes.data),
-      filename: 'maya_gen.png',
-      prompt,
-    };
+    console.error('[imagegen] no URL in content:', content.slice(0, 200));
+    throw new Error('No image URL in response');
   }
 
-  // If base64 returned
-  if (result.b64_json) {
-    return {
-      buffer:   Buffer.from(result.b64_json, 'base64'),
-      filename: 'maya_gen.png',
-      prompt,
-    };
+  const imageUrl = urlMatch[0];
+  console.log(`[imagegen] downloading from: ${imageUrl.slice(0, 80)}`);
+
+  const imgRes = await axios.get(imageUrl, {
+    responseType:   'arraybuffer',
+    timeout:        30_000,
+    validateStatus: () => true,
+  });
+
+  if (imgRes.status !== 200) {
+    throw new Error(`Image download failed (HTTP ${imgRes.status})`);
   }
 
-  throw new Error('Response had neither url nor b64_json');
+  return {
+    buffer:   Buffer.from(imgRes.data),
+    filename: 'maya_gen.png',
+    prompt,
+  };
 }
