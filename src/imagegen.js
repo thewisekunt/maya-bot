@@ -10,7 +10,7 @@
 import axios from 'axios';
 import { config } from './config.js';
 
-const IMAGE_MODEL = process.env.IMAGE_MODEL || 'black-forest-labs/flux.2-klein-4b';
+const IMAGE_MODEL = process.env.IMAGE_MODEL || 'black-forest-labs/flux-2-flex';
 
 // ── Trigger detection ─────────────────────────────────────────────────────────
 // Check before LLM call — no extra API cost for detection
@@ -92,31 +92,41 @@ export async function generateImage(prompt) {
     throw new Error(`Image generation failed (HTTP ${status})`);
   }
 
-  // OpenRouter returns image URL in the message content
-  // Format: choices[0].message.content = "![image](https://...)" or just the URL
-  const content = data?.choices?.[0]?.message?.content?.trim();
-  console.log('[imagegen] raw response content:', content?.slice(0, 200));
+  const msg = data?.choices?.[0]?.message;
 
-  if (!content) {
-    console.error('[imagegen] unexpected response:', JSON.stringify(data).slice(0, 400));
-    throw new Error('No content in response');
+  // OpenRouter image models return the image in one of three places:
+  // 1. message.images[].image_url.url  (FLUX, most image models)
+  // 2. message.content as a URL or markdown ![](url)
+  // 3. message.content as a data:image/... base64 string
+
+  let imageUrl = null;
+
+  // Check images array first (primary for FLUX on OpenRouter)
+  const images = msg?.images;
+  if (Array.isArray(images) && images.length > 0) {
+    imageUrl = images[0]?.image_url?.url || images[0]?.url || null;
+    console.log(`[imagegen] found in images array: ${imageUrl?.slice(0, 80)}`);
   }
 
-  // Extract URL from markdown image format ![...](url) or bare URL
-  const urlMatch = content.match(/https?:\/\/[^\s\)"]+/);
-  if (!urlMatch) {
-    // Some models return base64 directly in content
-    if (content.startsWith('data:image')) {
-      const b64 = content.split(',')[1];
-      return { buffer: Buffer.from(b64, 'base64'), filename: 'maya_gen.png', prompt };
+  // Fall back to content field
+  if (!imageUrl) {
+    const content = msg?.content;
+    if (content) {
+      if (content.startsWith('data:image')) {
+        const b64 = content.split(',')[1];
+        return { buffer: Buffer.from(b64, 'base64'), filename: 'maya_gen.png', prompt };
+      }
+      const urlMatch = content.match(/https?:\/\/[^\s)"]+/);
+      if (urlMatch) imageUrl = urlMatch[0];
     }
-    console.error('[imagegen] no URL in content:', content.slice(0, 200));
-    throw new Error('No image URL in response');
   }
 
-  const imageUrl = urlMatch[0];
-  console.log(`[imagegen] downloading from: ${imageUrl.slice(0, 80)}`);
+  if (!imageUrl) {
+    console.error('[imagegen] could not find image in response:', JSON.stringify(data).slice(0, 500));
+    throw new Error('No image URL found in response');
+  }
 
+  console.log(`[imagegen] downloading from: ${imageUrl.slice(0, 80)}`);
   const imgRes = await axios.get(imageUrl, {
     responseType:   'arraybuffer',
     timeout:        30_000,
