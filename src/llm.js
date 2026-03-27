@@ -44,6 +44,7 @@ export async function getMayaReply({
   relationship,
   frequentFriends,
   forceVerbal    = false,
+  systemOverride = null,
 }) {
   // ── Build system prompt ───────────────────────────────────────────────────
   // When forceVerbal: strip REACT instruction entirely so the model never
