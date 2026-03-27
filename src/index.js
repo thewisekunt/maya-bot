@@ -4,6 +4,7 @@ import { config } from './config.js';
 import { handleMessage } from './handler.js';
 import { acquireLock, releaseLock } from './lock.js';
 import { startDreamLoop } from './dream.js';
+import { startSTM, openSession, recordSessionMessage } from './stm.js';
 import { generateImage } from './imagegen.js';
 import { ensureCollection } from './vector.js';
 import { triggerLurk, checkLurk } from './lurk.js';
@@ -24,6 +25,7 @@ client.once(Events.ClientReady, async () => {
   // Start vector memory systems
   await ensureCollection().catch(e => console.warn('[bot] Qdrant setup:', e.message));
   startDreamLoop();
+  startSTM();
 });
 
 client.on(Events.MessageCreate, async (msg) => {
@@ -110,7 +112,23 @@ client.on(Events.MessageCreate, async (msg) => {
     // ── If Maya was just mentioned, open/reset lurk window ─────────────────
     // Do this AFTER processing so the lurk window starts fresh for follow-ups
     if (isMention && !isDM) {
+      openSession(channelId, msg.guild?.id || null, msg.author.id).catch(() => {});
       triggerLurk(channelId, msg.author.id);
+    }
+
+    // Record exchange into session STM buffer
+    if (!isDM && channelId) {
+      recordSessionMessage(channelId, {
+        userId: msg.author.id,
+        userName: msg.member?.displayName || msg.author.username,
+        sender: 'user', message: text,
+      }).catch(() => {});
+      if (result?.type === 'reply') {
+        recordSessionMessage(channelId, {
+          userId: 'maya', userName: 'Maya',
+          sender: 'maya', message: result.text,
+        }).catch(() => {});
+      }
     }
 
     if (result === null) return;

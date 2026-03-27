@@ -1,196 +1,121 @@
 /**
- * memory.js — Hybrid memory recall
+ * memory.js — Hybrid recall with memory_type namespacing
  *
- * Context building strategy:
- *   1. SQL: last 5 messages (always relevant, zero latency)
- *   2. Qdrant: top-k semantically relevant long-term memories
- *      - Only if Qdrant is configured
- *      - Filters by context_type (DM vs server)
- *      - Never leaks private DM memories into server context
- *      - Dream summaries (weight=2.0) surface above raw memories
- *   3. Merge: deduplicate, sort by recency+weight, format as context string
+ * Context layers (in order of injection into LLM prompt):
  *
- * Save strategy:
- *   - Always write to MySQL immediately (source of truth)
- *   - Notify dream loop (which handles async embedding)
+ *   1. user_fact   — what Maya knows about THIS user (highest priority)
+ *   2. maya_self   — Maya's own consistent traits
+ *   3. conversation — relevant past conversation snippets
+ *   4. STM session  — current session buffer (from stm.js)
+ *   5. SQL recent   — last 5 messages (always, zero latency)
+ *
+ * Types NEVER mixed in a single query — each Qdrant search
+ * filters by memory_type so facts don't bleed into conversation
+ * memories and vice versa.
  */
 
 import db from './db.js';
-import { config } from './config.js';
 import { embed } from './embedder.js';
-import { searchMemories, buildFilter, isConfigured } from './vector.js';
+import { searchMemories, isConfigured } from './vector.js';
 import { notifyNewMessage } from './dream.js';
+import { getSessionContext } from './stm.js';
 
-const RECENT_SQL_LIMIT    = 5;    // always pull these from SQL
-const SEMANTIC_LIMIT      = 8;    // top-k from Qdrant
-const SCORE_THRESHOLD     = 0.70; // min cosine similarity
+const SQL_LIMIT  = 5;
+const VEC_LIMIT  = 5;
+const THRESHOLD  = 0.68;
 
-// Schema detection cache
-let _hasNewCols = null;
+// Schema cache
+let _newSchema = null;
 async function _hasNewSchema() {
-  if (_hasNewCols !== null) return _hasNewCols;
+  if (_newSchema !== null) return _newSchema;
   try {
     const [cols] = await db.execute('SHOW COLUMNS FROM maya_memory');
-    _hasNewCols = cols.map(c => c.Field).includes('context_type');
-  } catch { _hasNewCols = false; }
-  return _hasNewCols;
+    _newSchema = cols.map(c => c.Field).includes('context_type');
+  } catch { _newSchema = false; }
+  return _newSchema;
 }
 
-// ── Main recall ───────────────────────────────────────────────────────────────
+// ── Main context builder ──────────────────────────────────────────────────────
 
 /**
- * Build the full memory context string for the LLM prompt.
- *
- * @param {string} userId
- * @param {string} prefName
- * @param {'dm'|'server'} contextType
- * @param {string|null} guildId
- * @param {string} currentMessage  — the current user message (used as semantic query)
- *
- * @returns {Promise<string>}
+ * Build the full context string for the LLM.
+ * Each memory type is queried separately and labelled distinctly.
  */
-export async function buildContext(userId, prefName, contextType, guildId, currentMessage) {
-  // ── Layer 1: Recent SQL messages (always) ──────────────────────────────────
-  const recent = await _getRecentSQL(userId, prefName, contextType, guildId);
-
-  // ── Layer 2: Semantic recall from Qdrant (if available) ───────────────────
-  let semantic = [];
-  if (isConfigured() && currentMessage) {
-    try {
-      semantic = await _getSemanticMemories(
-        userId, prefName, contextType, guildId, currentMessage, recent
-      );
-    } catch (e) {
-      console.warn('[memory] semantic recall failed (non-fatal):', e.message);
-    }
-  }
-
-  // ── Merge and format ────────────────────────────────────────────────────────
-  return _formatContext(recent, semantic, prefName);
-}
-
-async function _getRecentSQL(userId, prefName, contextType, guildId) {
-  const newSchema = await _hasNewSchema();
-  let rows = [];
-
-  try {
-    if (newSchema) {
-      [rows] = contextType === 'dm'
-        ? await db.execute(
-            `SELECT sender, message, created_at FROM maya_memory
-             WHERE discord_user_id=? AND context_type='dm'
-             ORDER BY created_at DESC LIMIT ?`,
-            [userId, RECENT_SQL_LIMIT]
-          )
-        : guildId
-          ? await db.execute(
-              `SELECT sender, message, created_at FROM maya_memory
-               WHERE discord_user_id=? AND context_type='server' AND guild_id=?
-               ORDER BY created_at DESC LIMIT ?`,
-              [userId, guildId, RECENT_SQL_LIMIT]
-            )
-          : await db.execute(
-              `SELECT sender, message, created_at FROM maya_memory
-               WHERE discord_user_id=? AND context_type='server'
-               ORDER BY created_at DESC LIMIT ?`,
-              [userId, RECENT_SQL_LIMIT]
-            );
-    } else {
-      [rows] = await db.execute(
-        `SELECT sender, message, created_at FROM maya_memory
-         WHERE discord_user_id=? ORDER BY created_at DESC LIMIT ?`,
-        [userId, RECENT_SQL_LIMIT]
-      );
-    }
-  } catch (e) {
-    console.error('[memory] SQL recall error:', e.message);
-  }
-
-  return rows.reverse().map(r => ({
-    sender:  r.sender,
-    message: r.message,
-    source:  'recent',
-    weight:  1.5,   // recent messages are slightly higher weight
-    ts:      r.created_at,
-  }));
-}
-
-async function _getSemanticMemories(userId, prefName, contextType, guildId,
-                                     currentMessage, recentRows) {
-  // Embed the current message as the query
-  const queryVec = await embed(currentMessage);
-
-  const filter = buildFilter({
-    userId,
-    contextType,
-    guildId: contextType === 'server' ? guildId : null,
-    isDM:    contextType === 'dm',
-  });
-
-  const results = await searchMemories(queryVec, filter, SEMANTIC_LIMIT, SCORE_THRESHOLD);
-
-  // Build set of recent messages to avoid duplicates
-  const recentSet = new Set(recentRows.map(r => r.message));
-
-  return results
-    .filter(r => !recentSet.has(r.message))  // don't repeat recent SQL rows
-    .map(r => ({
-      sender:  r.sender,
-      message: r.message,
-      source:  r.isDream ? 'dream' : 'semantic',
-      weight:  r.weight || 1.0,
-      score:   r.score,
-    }));
-}
-
-function _formatContext(recent, semantic, prefName) {
+export async function buildContext(userId, prefName, contextType, guildId, currentMessage, channelId) {
+  const isDM = contextType === 'dm';
   const parts = [];
 
-  // Semantic / dream memories first (longer-term context)
-  if (semantic.length > 0) {
-    const dreamSummaries = semantic.filter(s => s.source === 'dream');
-    const regularSemantic = semantic.filter(s => s.source === 'semantic');
-
-    if (dreamSummaries.length > 0) {
-      parts.push('--- What Maya remembers ---');
-      dreamSummaries.forEach(s => parts.push(s.message));
-      parts.push('');
-    }
-
-    if (regularSemantic.length > 0) {
-      parts.push('--- Relevant past context ---');
-      regularSemantic.slice(0, 4).forEach(s => {
-        const who = s.sender === 'maya' ? 'Maya' : prefName;
-        parts.push(`${who}: ${s.message}`);
+  // ── Layer 1: Session STM (current conversation) ───────────────────────────
+  if (channelId) {
+    const sessionMsgs = await getSessionContext(channelId, 12).catch(() => []);
+    if (sessionMsgs.length > 0) {
+      parts.push('--- This conversation ---');
+      sessionMsgs.forEach(m => {
+        const who = m.sender === 'maya' ? 'Maya' : (m.user_name || prefName);
+        parts.push(`${who}: ${m.message}`);
       });
       parts.push('');
     }
   }
 
-  // Recent messages last (most immediate context)
-  if (recent.length > 0) {
-    if (semantic.length > 0) parts.push('--- Recent ---');
-    recent.forEach(r => {
-      const who = r.sender === 'maya' ? 'Maya' : prefName;
-      parts.push(`${who}: ${r.message}`);
-    });
+  // ── Layer 2: SQL recent (fallback / bridge) ───────────────────────────────
+  // Only use if no session context (e.g. bot restarted mid-conversation)
+  if (parts.length === 0) {
+    const recent = await _getRecentSQL(userId, contextType, guildId);
+    if (recent.length > 0) {
+      recent.forEach(r => {
+        const who = r.sender === 'maya' ? 'Maya' : prefName;
+        parts.push(`${who}: ${r.message}`);
+      });
+      parts.push('');
+    }
   }
 
-  return parts.join('\n');
+  // ── Semantic layers (only if Qdrant configured and have a query) ──────────
+  if (isConfigured() && currentMessage) {
+    let queryVec;
+    try { queryVec = await embed(currentMessage); } catch { return parts.join('\n'); }
+
+    const userFilter = _typeFilter(userId, 'user_fact', isDM, guildId);
+    const convFilter = _typeFilter(userId, 'conversation', isDM, guildId);
+    const selfFilter = { must: [{ key: 'memory_type', match: { value: 'maya_self' } }] };
+
+    const [userFacts, convMems, selfTraitsVec] = await Promise.all([
+      searchMemories(queryVec, userFilter, VEC_LIMIT, THRESHOLD).catch(() => []),
+      searchMemories(queryVec, convFilter, 3,         THRESHOLD).catch(() => []),
+      searchMemories(queryVec, selfFilter, 3,         THRESHOLD).catch(() => []),
+    ]);
+
+    if (userFacts.length > 0) {
+      parts.push(`--- What Maya knows about ${prefName} ---`);
+      userFacts.forEach(f => parts.push(`• ${f.payload?.fact_text || f.message}`));
+      parts.push('');
+    }
+
+    if (selfTraitsVec.length > 0) {
+      parts.push('--- Maya\'s own traits (be consistent) ---');
+      selfTraitsVec.forEach(t => parts.push(`• ${t.payload?.fact_text || t.message}`));
+      parts.push('');
+    }
+
+    if (convMems.length > 0) {
+      parts.push('--- Past relevant context ---');
+      convMems.forEach(c => parts.push(c.message));
+      parts.push('');
+    }
+  }
+
+  return parts.join('\n').trim();
 }
 
 // ── Save ──────────────────────────────────────────────────────────────────────
 
-/**
- * Save a message to MySQL and notify the dream loop for async embedding.
- */
 export async function saveMessage({
   userId, prefName, guildId, channelId,
   contextType = 'server', isPrivate = false,
   sender, message, entropy,
 }) {
   const newSchema = await _hasNewSchema();
-
   try {
     if (newSchema) {
       await db.execute(
@@ -210,15 +135,57 @@ export async function saveMessage({
       );
     }
   } catch (e) {
-    console.error('[memory] save error:', e.message);
+    console.error('[memory] save:', e.message);
     throw e;
   }
-
-  // Notify dream loop — may trigger embedding if threshold hit
   notifyNewMessage();
 }
 
-// Keep old getContext export for backward compat
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function _typeFilter(userId, memoryType, isDM, guildId) {
+  const must = [
+    { key: 'memory_type',     match: { value: memoryType } },
+    { key: 'discord_user_id', match: { value: userId } },
+  ];
+  if (isDM) {
+    must.push({ key: 'is_private', match: { value: true } });
+  } else if (guildId) {
+    must.push({ key: 'guild_id', match: { value: guildId } });
+  }
+  return { must };
+}
+
+async function _getRecentSQL(userId, contextType, guildId) {
+  const newSchema = await _hasNewSchema();
+  try {
+    let rows;
+    if (newSchema) {
+      [rows] = contextType === 'dm'
+        ? await db.execute(
+            `SELECT sender, message FROM maya_memory
+             WHERE discord_user_id=? AND context_type='dm'
+             ORDER BY created_at DESC LIMIT ?`, [userId, SQL_LIMIT])
+        : guildId
+          ? await db.execute(
+              `SELECT sender, message FROM maya_memory
+               WHERE discord_user_id=? AND context_type='server' AND guild_id=?
+               ORDER BY created_at DESC LIMIT ?`, [userId, guildId, SQL_LIMIT])
+          : await db.execute(
+              `SELECT sender, message FROM maya_memory
+               WHERE discord_user_id=? AND context_type='server'
+               ORDER BY created_at DESC LIMIT ?`, [userId, SQL_LIMIT]);
+    } else {
+      [rows] = await db.execute(
+        `SELECT sender, message FROM maya_memory
+         WHERE discord_user_id=? ORDER BY created_at DESC LIMIT ?`,
+        [userId, SQL_LIMIT]);
+    }
+    return rows.reverse();
+  } catch { return []; }
+}
+
+// Backward compat
 export async function getContext(userId, prefName, contextType = 'server', guildId = null) {
-  return buildContext(userId, prefName, contextType, guildId, null);
+  return buildContext(userId, prefName, contextType, guildId, null, null);
 }

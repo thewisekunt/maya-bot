@@ -1,294 +1,339 @@
 /**
- * dream.js — Background memory consolidation process
+ * dream.js — Session-based memory consolidation
  *
- * "Dreaming" = taking raw recent memories, embedding them into vectors,
- * and consolidating related ones into higher-weight summary memories.
+ * Triggered when a session closes (30 min idle after @mention).
+ * Processes raw session messages into typed LTM entries:
  *
- * Triggers (whichever hits first):
- *   - Time: every DREAM_INTERVAL_MINUTES minutes
- *   - Volume: every DREAM_MESSAGE_THRESHOLD unembedded messages
+ *   user_fact    — things learned about specific users
+ *                  ("Danish loves pizza", "Mario works in IT")
+ *   conversation — what happened in this session
+ *                  ("Group debated cricket, Mario and Sai disagreed")
+ *   maya_self    — things Maya expressed about herself
+ *                  ("Maya finds passive aggression tiring")
  *
- * What it does each cycle:
- *   1. Fetch all unembedded messages from MySQL (embedded=0)
- *   2. Embed them in batches via embedder.js
- *   3. Upsert into Qdrant
- *   4. Mark as embedded in MySQL (embedded=1, vector_id=pointId)
- *   5. Consolidate: if 3+ memories from same user are semantically
- *      close (cosine > 0.88), collapse into a single dream summary
- *      with higher weight — so Maya "remembers" the gist, not
- *      each individual message
+ * Each type goes to Qdrant with memory_type in payload — never mixed in recall.
  *
- * Consolidation example:
- *   "I love cats" + "my cat is named Mochi" + "adopted a cat last year"
- *   → dream: "User loves cats, has a cat named Mochi, adopted last year"
- *   weight: 2.0 (surfaced more strongly in recall)
+ * LLM extracts structured JSON (no narrative voice) so facts are clean
+ * and reusable across contexts.
+ *
+ * Also runs a time/volume triggered pass for raw message embedding.
  */
 
 import db from './db.js';
 import { embed, embedBatch } from './embedder.js';
-import { upsertMemory, upsertBatch, searchMemories,
-         buildFilter, isConfigured } from './vector.js';
-import { getMayaReply } from './llm.js';
+import { upsertMemory, upsertBatch, isConfigured } from './vector.js';
+import axios from 'axios';
+import { config } from './config.js';
 
-const DREAM_INTERVAL_MS  = parseInt(process.env.DREAM_INTERVAL_MINUTES || '30') * 60 * 1000;
-const MSG_THRESHOLD      = parseInt(process.env.DREAM_MESSAGE_THRESHOLD || '50');
-const BATCH_SIZE         = 20;     // embed this many per cycle
-const CONSOLIDATE_THRESH = 0.88;   // cosine similarity to merge memories
-const MIN_CLUSTER_SIZE   = 3;      // min memories needed to consolidate
+const DREAM_INTERVAL_MS = parseInt(process.env.DREAM_INTERVAL_MINUTES || '30') * 60 * 1000;
+const MSG_THRESHOLD     = parseInt(process.env.DREAM_MESSAGE_THRESHOLD || '50');
+const BATCH_SIZE        = 20;
 
-let _timer       = null;
-let _msgCount    = 0;
-let _running     = false;
+let _timer    = null;
+let _msgCount = 0;
+let _running  = false;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/**
- * Start the dream loop. Call once at bot startup.
- */
 export function startDreamLoop() {
   if (!isConfigured()) {
     console.log('[dream] Qdrant not configured — dream loop disabled');
     return;
   }
-
-  console.log(`[dream] loop started (interval=${DREAM_INTERVAL_MS/60000}min, threshold=${MSG_THRESHOLD} msgs)`);
-  _timer = setInterval(() => runDream('timer'), DREAM_INTERVAL_MS);
+  _timer = setInterval(() => _runEmbedPass('timer'), DREAM_INTERVAL_MS);
+  console.log(`[dream] loop started (interval=${DREAM_INTERVAL_MS/60000}min, threshold=${MSG_THRESHOLD})`);
 }
 
-/**
- * Increment message counter. When threshold hit, trigger a dream.
- * Call this after every saved message.
- */
 export function notifyNewMessage() {
   if (!isConfigured()) return;
   _msgCount++;
   if (_msgCount >= MSG_THRESHOLD) {
     _msgCount = 0;
-    runDream('threshold').catch(e => console.error('[dream] threshold trigger error:', e.message));
+    _runEmbedPass('threshold').catch(e => console.error('[dream] embed pass error:', e.message));
   }
 }
 
 /**
- * Run one dream cycle. Safe to call concurrently — skips if already running.
+ * Process a closed session into LTM.
+ * Called by stm.js when a session closes.
  */
-export async function runDream(trigger = 'manual') {
-  if (_running) {
-    console.log(`[dream] already running, skipping (triggered by ${trigger})`);
+export async function processSession(sessionId) {
+  if (!isConfigured()) return;
+  console.log(`[dream] processing session ${sessionId}`);
+
+  // Check it hasn't been processed already
+  const [[sess]] = await db.execute(
+    `SELECT s.*, s.participant_ids FROM maya_sessions s
+     WHERE s.id=? AND s.processed=0 AND s.ended_at IS NOT NULL`,
+    [sessionId]
+  ).catch(() => [[]]);
+
+  if (!sess) {
+    console.log(`[dream] session ${sessionId} already processed or not ended`);
     return;
   }
-  _running = true;
-  const start = Date.now();
-  console.log(`[dream] cycle started (trigger=${trigger})`);
 
-  try {
-    // ── Phase 1: Embed unprocessed memories ────────────────────────────────
-    const embedded = await _embedPendingMemories();
-    console.log(`[dream] embedded ${embedded} new memories`);
+  // Mark as processing immediately (prevent double-processing across instances)
+  await db.execute(
+    `UPDATE maya_sessions SET processed=1 WHERE id=? AND processed=0`,
+    [sessionId]
+  ).catch(() => {});
 
-    // ── Phase 2: Consolidate close memories into dream summaries ───────────
-    if (embedded > 0) {
-      const consolidated = await _consolidateMemories();
-      console.log(`[dream] consolidated ${consolidated} memory clusters`);
-    }
+  // Fetch all messages from this session
+  const [msgs] = await db.execute(
+    `SELECT discord_user_id, user_name, sender, message
+     FROM maya_session_messages
+     WHERE session_id=?
+     ORDER BY created_at ASC`,
+    [sessionId]
+  ).catch(() => [[]]);
 
-  } catch (e) {
-    console.error('[dream] cycle error:', e.message);
-  } finally {
-    _running = false;
-    console.log(`[dream] cycle done in ${Date.now() - start}ms`);
-  }
-}
-
-// ── Phase 1: Embed pending ────────────────────────────────────────────────────
-
-async function _embedPendingMemories() {
-  // Fetch unembedded messages — limit one batch per cycle
-  let rows;
-  try {
-    [rows] = await db.execute(
-      `SELECT id, discord_user_id, user_name, guild_id, channel_id,
-              context_type, is_private, sender, message, entropy, embed_weight
-       FROM maya_memory
-       WHERE embedded = 0
-       ORDER BY created_at ASC
-       LIMIT ?`,
-      [BATCH_SIZE]
-    );
-  } catch (e) {
-    // Fallback: old schema without embedded column
-    try {
-      [rows] = await db.execute(
-        `SELECT id, discord_user_id, user_name, guild_id,
-                sender, message, entropy
-         FROM maya_memory
-         ORDER BY id DESC
-         LIMIT ?`,
-        [BATCH_SIZE]
-      );
-      // Can't track embedded state — just process and move on
-    } catch { return 0; }
+  if (!msgs || msgs.length < 2) {
+    console.log(`[dream] session ${sessionId} too short to process`);
+    return;
   }
 
-  if (!rows || !rows.length) return 0;
-
-  // Build text to embed for each row
-  // Format: "sender_name: message_text" — gives the embedding context about who said it
-  const texts = rows.map(r => {
-    const who = r.sender === 'maya' ? 'Maya' : (r.user_name || 'User');
-    return `${who}: ${r.message}`;
-  });
-
-  // Embed in batch
-  let vectors;
-  try {
-    vectors = await embedBatch(texts);
-  } catch (e) {
-    console.error('[dream] embedBatch failed:', e.message);
-    return 0;
-  }
-
-  // Build Qdrant points
-  const points = rows.map((r, i) => ({
-    id:      `mem_${r.id}`,
-    vector:  vectors[i],
-    payload: {
-      mysql_id:        r.id,
-      discord_user_id: r.discord_user_id,
-      user_name:       r.user_name || '',
-      guild_id:        r.guild_id  || null,
-      context_type:    r.context_type || 'server',
-      is_private:      !!(r.is_private),
-      sender:          r.sender,
-      message:         r.message,
-      entropy:         parseFloat(r.entropy) || 0.4,
-      weight:          parseFloat(r.embed_weight) || 1.0,
-      is_dream:        false,
-      created_at:      new Date().toISOString(),
-    },
-  }));
-
-  try {
-    await upsertBatch(points);
-  } catch (e) {
-    console.error('[dream] upsertBatch failed:', e.message);
-    return 0;
-  }
-
-  // Mark as embedded in MySQL
-  const ids = rows.map(r => r.id);
-  const ph  = ids.map(() => '?').join(',');
-  try {
-    await db.execute(
-      `UPDATE maya_memory SET embedded = 1 WHERE id IN (${ph})`,
-      ids
-    );
-  } catch { /* non-fatal — will retry next cycle */ }
-
-  return rows.length;
-}
-
-// ── Phase 2: Consolidate close memories ──────────────────────────────────────
-
-async function _consolidateMemories() {
-  // Get distinct users who had messages embedded recently
-  let userRows;
-  try {
-    [userRows] = await db.execute(
-      `SELECT DISTINCT discord_user_id, user_name
-       FROM maya_memory
-       WHERE embedded = 1
-         AND created_at > DATE_SUB(NOW(), INTERVAL 2 HOUR)
-       LIMIT 20`
-    );
-  } catch { return 0; }
-
-  let consolidated = 0;
-
-  for (const u of userRows) {
-    try {
-      consolidated += await _consolidateForUser(u.discord_user_id, u.user_name);
-    } catch (e) {
-      console.error(`[dream] consolidate error for ${u.discord_user_id}:`, e.message);
-    }
-  }
-
-  return consolidated;
-}
-
-async function _consolidateForUser(userId, userName) {
-  // Get recent non-dream memories for this user
-  // We use a centroid approach: embed a summary query,
-  // find close memories, summarise with LLM
-  const summaryQuery = `What has ${userName} talked about recently?`;
-  let queryVec;
-  try {
-    queryVec = await embed(summaryQuery);
-  } catch { return 0; }
-
-  const filter  = buildFilter({ userId, contextType: 'server', isDM: false });
-  // Only non-dream memories so we don't re-consolidate
-  filter.must.push({ key: 'is_dream', match: { value: false } });
-
-  let candidates;
-  try {
-    candidates = await searchMemories(queryVec, filter, 20, CONSOLIDATE_THRESH);
-  } catch { return 0; }
-
-  // Filter to user messages only (not Maya's replies) for consolidation
-  const userMsgs = candidates.filter(c => c.sender === 'user' && c.message.length > 10);
-  if (userMsgs.length < MIN_CLUSTER_SIZE) return 0;
-
-  // Generate a dream summary using LLM
-  const memBlock = userMsgs
-    .slice(0, 10)
-    .map(m => `- ${m.message}`)
+  // Build the transcript
+  const transcript = msgs
+    .map(m => `${m.sender === 'maya' ? 'Maya' : m.user_name}: ${m.message}`)
     .join('\n');
 
-  let summary;
-  try {
-    const result = await getMayaReply({
-      prefName:        userName,
-      context:         '',
-      message:         `Summarise what you know about ${userName} from these messages in 2-3 sentences. Be factual, no fluff:\n${memBlock}`,
-      entropy:         0.3,
-      zone:            'Restful',
-      zoneLine:        '',
-      contextLine:     '',
-      knownFacts:      [],
-      relationship:    null,
-      frequentFriends: [],
-      forceVerbal:     true,
-      systemOverride:  'You are a memory consolidation system. Produce a concise factual summary of what a user has shared. No opinions, no character voice. Just facts.',
-    });
-    summary = result.text;
-  } catch { return 0; }
+  const participantIds = _parseJson(sess.participant_ids, []);
+  const guildId        = sess.guild_id;
 
-  if (!summary || summary.length < 10) return 0;
+  console.log(`[dream] session ${sessionId}: ${msgs.length} msgs, ${participantIds.length} participants`);
 
-  // Embed the dream summary
-  let dreamVec;
+  // ── Extract structured facts via LLM ────────────────────────────────────
+  let extracted;
   try {
-    dreamVec = await embed(`${userName} memory summary: ${summary}`);
-  } catch { return 0; }
+    extracted = await _extractFacts(transcript, msgs, guildId);
+  } catch (e) {
+    console.error(`[dream] fact extraction failed for session ${sessionId}:`, e.message);
+    return;
+  }
 
-  // Upsert as a dream point with higher weight
-  const dreamId = `dream_${userId}_${Date.now()}`;
+  // ── Write to Qdrant with memory_type namespacing ────────────────────────
+  const points = [];
+
+  // User facts — one per user per fact
+  for (const [userId, facts] of Object.entries(extracted.user_facts || {})) {
+    const userName = msgs.find(m => m.discord_user_id === userId)?.user_name || userId;
+    for (const fact of facts) {
+      const text = `${userName}: ${fact.text}`;
+      try {
+        const vec = await embed(text);
+        points.push({
+          id:      `uf_${sessionId}_${userId}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`,
+          vector:  vec,
+          payload: {
+            memory_type:     'user_fact',
+            discord_user_id: userId,
+            user_name:       userName,
+            guild_id:        guildId || null,
+            is_private:      !guildId,
+            fact_text:       fact.text,
+            category:        fact.category || 'general',
+            conflict_score:  fact.conflict_score ?? 0.3,
+            message:         text,
+            weight:          2.0,
+            created_at:      new Date().toISOString(),
+          },
+        });
+      } catch { /* non-fatal */ }
+    }
+  }
+
+  // Conversation memory — what happened in this session
+  if (extracted.conversation_summary) {
+    try {
+      const vec = await embed(extracted.conversation_summary);
+      points.push({
+        id:      `conv_${sessionId}_${Date.now()}`,
+        vector:  vec,
+        payload: {
+          memory_type:     'conversation',
+          discord_user_id: participantIds[0] || 'unknown',
+          guild_id:        guildId || null,
+          is_private:      !guildId,
+          participants:    participantIds,
+          message:         extracted.conversation_summary,
+          topics:          extracted.topics || [],
+          mood:            extracted.mood || 'neutral',
+          weight:          1.5,
+          created_at:      new Date().toISOString(),
+        },
+      });
+    } catch { /* non-fatal */ }
+  }
+
+  // Maya self-traits extracted from her own replies
+  for (const trait of extracted.maya_traits || []) {
+    try {
+      const vec = await embed(`Maya: ${trait}`);
+      points.push({
+        id:      `ms_${sessionId}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`,
+        vector:  vec,
+        payload: {
+          memory_type:     'maya_self',
+          discord_user_id: 'maya',
+          guild_id:        null,
+          is_private:      false,
+          message:         `Maya: ${trait}`,
+          fact_text:       trait,
+          weight:          1.8,
+          created_at:      new Date().toISOString(),
+        },
+      });
+    } catch { /* non-fatal */ }
+  }
+
+  // Upsert all points
+  if (points.length > 0) {
+    try {
+      await upsertBatch(points);
+      console.log(`[dream] session ${sessionId}: upserted ${points.length} LTM points`);
+    } catch (e) {
+      console.error(`[dream] upsertBatch failed for session ${sessionId}:`, e.message);
+    }
+  }
+}
+
+// ── LLM fact extraction ───────────────────────────────────────────────────────
+
+async function _extractFacts(transcript, msgs, guildId) {
+  const participants = [...new Set(
+    msgs.filter(m => m.sender === 'user').map(m => `${m.user_name} (id:${m.discord_user_id})`)
+  )].join(', ');
+
+  const prompt = `You are a memory extraction system for an AI called Maya.
+Analyse this conversation and extract structured facts. Return ONLY valid JSON.
+
+Participants: ${participants}
+
+Conversation:
+${transcript.slice(0, 3000)}
+
+Extract and return this exact JSON structure:
+{
+  "user_facts": {
+    "<discord_user_id>": [
+      {
+        "text": "<name> <fact about them in third person>",
+        "category": "preference|identity|relationship|belief|objective",
+        "conflict_score": <0.0 to 1.0, 0=certain 1=contested>
+      }
+    ]
+  },
+  "conversation_summary": "<1-2 sentences: what happened in this conversation, who was involved, main topics>",
+  "topics": ["<topic1>", "<topic2>"],
+  "mood": "<overall mood: positive|negative|neutral|chaotic|deep>",
+  "maya_traits": ["<thing Maya expressed about herself, third person: Maya finds X interesting>"]
+}
+
+Rules:
+- Only include facts clearly stated, not inferred
+- User facts must use the user's discord_user_id as the key
+- Rewrite all first-person ("I love pizza") to third-person ("Danish loves pizza")
+- If nothing clear was stated for a field, use null or []
+- conflict_score 0.0 = stated as definite fact, 0.5 = opinion/preference, 1.0 = contradicts known info
+- Return ONLY the JSON object, no markdown, no explanation`;
+
+  const { data, status } = await axios.post(
+    config.llm.endpoint,
+    {
+      model:       config.llm.model,
+      messages:    [{ role: 'user', content: prompt }],
+      temperature: 0.1,   // low temperature for factual extraction
+      max_tokens:  1000,
+    },
+    {
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${config.llm.apiKey}`,
+        'HTTP-Referer':  'https://chatmasala.fun',
+        'X-Title':       'MayaDiscordBot',
+      },
+      timeout:        30_000,
+      validateStatus: () => true,
+    }
+  );
+
+  if (status !== 200) throw new Error(`LLM HTTP ${status}`);
+
+  const raw = data?.choices?.[0]?.message?.content?.trim();
+  if (!raw) throw new Error('Empty LLM response');
+
+  // Strip any markdown fences if present
+  const clean = raw.replace(/^```(?:json)?\n?/i, '').replace(/\n?```$/i, '').trim();
+
   try {
-    await upsertMemory(dreamId, dreamVec, {
-      mysql_id:        null,
-      discord_user_id: userId,
-      user_name:       userName,
-      guild_id:        null,
-      context_type:    'server',
-      is_private:      false,
-      sender:          'system',
-      message:         `[Dream summary] ${summary}`,
-      entropy:         0.4,
-      weight:          2.0,    // surfaces higher in recall
-      is_dream:        true,
-      created_at:      new Date().toISOString(),
-    });
-    console.log(`[dream] created dream for ${userName}: ${summary.slice(0, 80)}`);
-    return 1;
-  } catch { return 0; }
+    return JSON.parse(clean);
+  } catch {
+    console.error('[dream] JSON parse failed:', clean.slice(0, 200));
+    throw new Error('Invalid JSON from LLM');
+  }
+}
+
+// ── Raw message embed pass (time/volume triggered) ────────────────────────────
+
+async function _runEmbedPass(trigger) {
+  if (_running) return;
+  _running = true;
+  const start = Date.now();
+  console.log(`[dream] embed pass started (trigger=${trigger})`);
+
+  try {
+    const [rows] = await db.execute(
+      `SELECT id, discord_user_id, user_name, guild_id, channel_id,
+              context_type, is_private, sender, message, entropy
+       FROM maya_memory
+       WHERE embedded=0
+       ORDER BY created_at ASC LIMIT ?`,
+      [BATCH_SIZE]
+    ).catch(() => [[]]);
+
+    if (!rows?.length) { _running = false; return; }
+
+    const texts   = rows.map(r => `${r.sender === 'maya' ? 'Maya' : r.user_name}: ${r.message}`);
+    const vectors = await embedBatch(texts).catch(() => null);
+    if (!vectors) { _running = false; return; }
+
+    const points = rows.map((r, i) => ({
+      id:      `raw_${r.id}`,
+      vector:  vectors[i],
+      payload: {
+        memory_type:     'raw_message',
+        mysql_id:        r.id,
+        discord_user_id: r.discord_user_id,
+        user_name:       r.user_name || '',
+        guild_id:        r.guild_id  || null,
+        context_type:    r.context_type || 'server',
+        is_private:      !!(r.is_private),
+        sender:          r.sender,
+        message:         r.message,
+        entropy:         parseFloat(r.entropy) || 0.4,
+        weight:          0.8,   // raw messages have lower weight than processed facts
+        created_at:      new Date().toISOString(),
+      },
+    }));
+
+    await upsertBatch(points).catch(e => console.error('[dream] upsertBatch:', e.message));
+
+    const ids = rows.map(r => r.id);
+    await db.execute(
+      `UPDATE maya_memory SET embedded=1 WHERE id IN (${ids.map(() => '?').join(',')})`,
+      ids
+    ).catch(() => {});
+
+    console.log(`[dream] embed pass: ${rows.length} msgs in ${Date.now()-start}ms`);
+  } catch (e) {
+    console.error('[dream] embed pass error:', e.message);
+  } finally {
+    _running = false;
+  }
+}
+
+function _parseJson(str, fallback) {
+  if (!str) return fallback;
+  try { return JSON.parse(str); } catch { return fallback; }
 }

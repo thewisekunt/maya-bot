@@ -91,6 +91,10 @@ export async function ensureCollection() {
       field_name: 'guild_id',
       field_schema: 'keyword',
     });
+    await q.put(`/collections/${COLLECTION}/index`, {
+      field_name: 'memory_type',
+      field_schema: 'keyword',
+    });
     return true;
   }
 

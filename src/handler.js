@@ -3,7 +3,9 @@
  * context → user → aliases → trust → vision → salience → LLM → persist → facts
  */
 
-import { buildContext } from './memory.js';
+import { buildContext, saveMessage } from './memory.js';
+import { openSession, recordSessionMessage, getSessionParticipants } from './stm.js';
+import { isSocialQuery, buildSocialContext } from './social.js';
 import { isImageRequest, extractImagePrompt, generateImage } from './imagegen.js';
 import { estimateEntropy, getEntropyZone, getKnownNames, getConfirmedFacts,
          getMayaSelfTraits, extractAndStoreFact, extractMayaTrait,
@@ -164,7 +166,7 @@ export async function handleMessage({
   // Hybrid memory context: SQL recent + Qdrant semantic
   let context = '';
   try {
-    context = await buildContext(userId, prefName, contextType, guildId, message);
+    context = await buildContext(userId, prefName, contextType, guildId, message, channelId);
   } catch (e) {
     console.error('[handler] buildContext error:', e.message);
   }
@@ -196,6 +198,13 @@ export async function handleMessage({
     finalMessage = `${message}\n[Note: image/file attached but I cannot view it]`;
   } else if (hasMedia && !visionWorked && message === '[media]') {
     finalMessage = `[User sent an image I cannot view]`;
+  }
+
+  // Social context — inject when asked about people/network
+  let socialContext = '';
+  if (isSocialQuery(message)) {
+    socialContext = await buildSocialContext(guildId, userId, isDM).catch(() => '');
+    if (socialContext) context = socialContext + '\n\n' + context;
   }
 
   const forceVerbal = isMention || isDM || isReply;
