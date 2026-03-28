@@ -7,7 +7,7 @@ import { startDreamLoop } from './dream.js';
 import { startSTM, openSession, recordSessionMessage } from './stm.js';
 import { generateImage } from './imagegen.js';
 import { ensureCollection } from './vector.js';
-import { triggerLurk, checkLurk } from './lurk.js';
+import { decide, observeMessage, onMention, onMayaReply, onMayaReact, getModeLabel } from './presence.js';
 
 const client = new Client({
   intents: [
@@ -51,17 +51,16 @@ client.on(Events.MessageCreate, async (msg) => {
   const isMention  = msg.mentions.has(client.user);
   const hasKeyword = /\bmaya\b/i.test(content);
 
-  // ── Lurk check ───────────────────────────────────────────────────────────
-  // Do this BEFORE the trigger gate so lurking messages pass through
-  // even without a mention/keyword
-  const { isLurking, lurkDepth } = isDM ? { isLurking: false, lurkDepth: 0 }
-                                        : checkLurk(channelId);
+  // ── Observe: update channel state regardless of response ───────────────
+  if (!isDM) observeMessage(channelId, msg.author.id);
 
   // ── Gate: should we even process this message? ───────────────────────────
-  const shouldProcess = isMention || isDM || hasKeyword || isLurking;
+  // In server: only process if mention, keyword, or DM
+  // Presence engine handles everything else
+  const shouldProcess = isMention || isDM || hasKeyword;
 
-  // For media-only messages in server: only if mentioned or lurking
-  if (!content && hasMedia && !isMention && !isDM && !isLurking) return;
+  // For media-only messages in server: only if mentioned
+  if (!content && hasMedia && !isMention && !isDM) return;
 
   if (!shouldProcess) return;
 
@@ -105,15 +104,13 @@ client.on(Events.MessageCreate, async (msg) => {
       isMention,
       isReply,
       hasMedia,
-      isLurking,
-      lurkDepth,
     });
 
     // ── If Maya was just mentioned, open/reset lurk window ─────────────────
     // Do this AFTER processing so the lurk window starts fresh for follow-ups
     if (isMention && !isDM) {
+      onMention(channelId, msg.author.id);
       openSession(channelId, msg.guild?.id || null, msg.author.id).catch(() => {});
-      triggerLurk(channelId, msg.author.id);
     }
 
     // Record exchange into session STM buffer
@@ -134,6 +131,7 @@ client.on(Events.MessageCreate, async (msg) => {
     if (result === null) return;
 
     if (result.type === 'react') {
+      onMayaReact(channelId);
       await msg.react(result.emoji).catch(() => {
         console.warn(`[bot] react failed: ${result.emoji}`);
       });
@@ -153,12 +151,7 @@ client.on(Events.MessageCreate, async (msg) => {
       }
 
     } else {
-      // Maya replied verbally — refresh lurk so she stays attentive
-      if (isLurking && !isMention) {
-        const { refreshLurk } = await import('./lurk.js');
-        refreshLurk(channelId);
-      }
-
+      onMayaReply(channelId, msg.author.id);
       const replyText = result.text;
       if (replyText.length <= 2000) {
         await msg.reply(replyText);

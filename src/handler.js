@@ -13,7 +13,7 @@ import { estimateEntropy, getEntropyZone, getKnownNames, getConfirmedFacts,
          upsertUser, detectNameSet, getFrequentInteractors } from './persona.js';
 import { getMayaReply } from './llm.js';
 import { buildContextLine } from './context.js';
-import { checkSalience } from './salience.js';
+import { decide } from './presence.js';
 import { extractMediaContext } from './vision.js';
 import { debugLog } from './logger.js';
 import db from './db.js';
@@ -23,8 +23,6 @@ export async function handleMessage({
   message, guildId, msg,
   isMention, isReply,
   hasMedia   = false,
-  isLurking  = false,
-  lurkDepth  = 0,
 }) {
   // ── 1. Context ────────────────────────────────────────────────────────────
   const isDM        = !msg.guild;
@@ -89,8 +87,9 @@ export async function handleMessage({
   }
 
   // ── 6. Known names in guild (for lurk friend-awareness) ──────────────────
+  // Load known names for intent detection in presence engine
   let knownNames = [];
-  if (isLurking && guildId) {
+  if (!isDM && guildId) {
     knownNames = await getKnownNames(guildId).catch(() => []);
   }
 
@@ -126,39 +125,34 @@ export async function handleMessage({
     return { type: 'image', prompt: imagePrompt };
   }
 
-  // ── 9. SALIENCE GATE ──────────────────────────────────────────────────────
-  const salienceEntropy = (isMention || isDM || (hasMedia && visionWorked))
-    ? Math.max(entropy, 0.6)
-    : entropy;
-
-  const salience = checkSalience({
-    text:          richMessageText,
+  // ── 9. PRESENCE DECISION ─────────────────────────────────────────────────
+  const decision = decide({
+    channelId,
+    userId,
+    text:       richMessageText,
     isMention,
     isDM,
     isReply,
     hasMedia,
-    isLurking,
-    lurkDepth,
     trustLevel,
-    entropy:       salienceEntropy,
+    entropy,
     knownNames,
   });
 
-  console.log(`[salience] user=${prefName} action=${salience.action} reason="${salience.reason}" trust=${trustLevel} media=${hasMedia}`);
+  console.log(`[presence] user=${prefName} action=${decision.action} reason="${decision.reason}" mode=${isDM?'DM':'server'} trust=${trustLevel}`);
 
   // ── IGNORE ────────────────────────────────────────────────────────────────
-  if (salience.action === 'ignore') {
-    _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate, entropy, message, null);
+  if (decision.action === 'ignore') {
     debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: '[IGNORED]' });
     return null;
   }
 
   // ── REACT ─────────────────────────────────────────────────────────────────
-  if (salience.action === 'react') {
+  if (decision.action === 'react') {
     _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate, entropy,
-      message, `*reacted with ${salience.emoji}*`);
-    debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: `REACT:${salience.emoji}` });
-    return { type: 'react', emoji: salience.emoji };
+      message, `*reacted with ${decision.emoji}*`);
+    debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: `REACT:${decision.emoji}` });
+    return { type: 'react', emoji: decision.emoji };
   }
 
   // ── REPLY — fetch memory + known facts + call LLM ────────────────────────
