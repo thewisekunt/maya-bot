@@ -1,7 +1,7 @@
 {
   "name": "maya-discord-bot",
   "version": "2.0.0",
-  "description": "Maya — witty Hinglish Discord bestie powered by OpenRouter LLM",
+  "description": "Maya \u2014 witty Hinglish Discord bestie powered by OpenRouter LLM",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -12,7 +12,8 @@
     "discord.js": "^14.16.3",
     "axios": "^1.7.7",
     "mysql2": "^3.11.3",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "node-nlp": "^4.27.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.7"
