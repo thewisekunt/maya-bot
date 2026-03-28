@@ -4,6 +4,8 @@ import { config } from './config.js';
 import { handleMessage } from './handler.js';
 import { acquireLock, releaseLock } from './lock.js';
 import { startDreamLoop } from './dream.js';
+import { trainNLP } from './nlp.js';
+import { replyDelay } from './llm.js';
 import { startSTM, openSession, recordSessionMessage } from './stm.js';
 import { generateImage } from './imagegen.js';
 import { ensureCollection } from './vector.js';
@@ -24,6 +26,7 @@ client.once(Events.ClientReady, async () => {
   client.user.setActivity('your messages 👀', { type: ActivityType.Watching });
   // Start vector memory systems
   await ensureCollection().catch(e => console.warn('[bot] Qdrant setup:', e.message));
+  await trainNLP().catch(e => console.warn('[bot] NLP training:', e.message));
   startDreamLoop();
   startSTM();
 });
@@ -88,9 +91,6 @@ client.on(Events.MessageCreate, async (msg) => {
     return;
   }
 
-  if (config.bot.typingIndicator) {
-    await msg.channel.sendTyping().catch(() => {});
-  }
 
   try {
     const result = await handleMessage({
@@ -129,6 +129,14 @@ client.on(Events.MessageCreate, async (msg) => {
     }
 
     if (result === null) return;
+
+    // Human-feel delay: reading + thinking + typing simulation
+    // Scales with incoming message length so longer messages get more time
+    if (result.type === 'reply') {
+      const delayMs = replyDelay(text.length);
+      await msg.channel.sendTyping().catch(() => {});
+      await new Promise(r => setTimeout(r, delayMs));
+    }
 
     if (result.type === 'react') {
       onMayaReact(channelId);

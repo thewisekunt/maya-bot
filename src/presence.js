@@ -20,6 +20,7 @@
  */
 
 import { classify } from './nlp.js';
+import db from './db.js';
 
 // ── Per-channel state ─────────────────────────────────────────────────────────
 const channels = new Map();
@@ -43,11 +44,35 @@ function getChannel(channelId) {
 }
 
 // ── Cooldowns ─────────────────────────────────────────────────────────────────
-const COOLDOWN_REPLY_MS  = 25_000;
-const COOLDOWN_REACT_MS  = 8_000;
-const ENGAGED_REPLY_MS   = 8_000;
+const COOLDOWN_REPLY_MS  = 28_000;   // 28s between replies (cross-instance)
+const COOLDOWN_REACT_MS  = 10_000;   // 10s between reacts
+const ENGAGED_REPLY_MS   = 10_000;   // shorter cooldown when engaged
 const MODE_OBSERVING_TTL = 5 * 60_000;
 const MODE_ENGAGED_TTL   = 3 * 60_000;
+
+// ── Cross-instance DB-backed cooldown ─────────────────────────────────────────
+// In-memory state is per-instance. With 2 Koyeb instances, each has its own
+// lastMayaReply. DB-backed state is shared — both instances see the same value.
+
+async function _setDBCooldown(channelId, key, ttlMs) {
+  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+  await db.execute(
+    `INSERT INTO maya_state (state_key, value) VALUES (?,?)
+     ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=NOW()`,
+    [`${key}_${channelId}`, expiresAt]
+  ).catch(() => {});
+}
+
+async function _checkDBCooldown(channelId, key) {
+  try {
+    const [[row]] = await db.execute(
+      `SELECT value FROM maya_state WHERE state_key=? LIMIT 1`,
+      [`${key}_${channelId}`]
+    );
+    if (!row) return false;  // no cooldown set
+    return Date.now() < new Date(row.value).getTime();  // true = still cooling
+  } catch { return false; }
+}
 
 // ── Public state updaters ─────────────────────────────────────────────────────
 
@@ -89,6 +114,8 @@ export function onMayaReply(channelId, toUserId) {
   ch.modeSetAt     = Date.now();
   ch.engagedUserId = toUserId;
   observeMessage(channelId, 'maya', true);
+  // Write to DB so the other Koyeb instance also knows Maya just replied
+  _setDBCooldown(channelId, 'reply', COOLDOWN_REPLY_MS);
   console.log(`[presence] ${channelId} → ENGAGED with ${toUserId}`);
 }
 
@@ -121,13 +148,21 @@ export async function decide({
   const wc  = text.trim().split(/\s+/).filter(Boolean).length;
 
   // ── 1. HARD STOPS ─────────────────────────────────────────────────────────
+  // Use DB-backed cooldown so both Koyeb instances share the same state.
+  // In-memory check first (fast) — DB check only if in-memory says ok.
   const replyCooldown = ch.mode === MODES.ENGAGED ? ENGAGED_REPLY_MS : COOLDOWN_REPLY_MS;
 
-  if (!isMention && !isReply && now - ch.lastMayaReply < replyCooldown) {
-    return _ignore(`cooldown: ${Math.round((replyCooldown - (now - ch.lastMayaReply))/1000)}s left`);
+  if (!isMention && !isReply) {
+    // Fast in-memory check
+    const inMemoryCooling = now - ch.lastMayaReply < replyCooldown;
+    // DB check (handles cross-instance case)
+    const dbCooling = inMemoryCooling ? true : await _checkDBCooldown(channelId, 'reply');
+    if (dbCooling) {
+      return _ignore('cooldown: reply too soon (cross-instance)');
+    }
   }
 
-  // No double-reply (Maya spoke last)
+  // No double-reply (Maya spoke last) — only in-memory, good enough
   if (!isMention && !isReply && ch.lastSpeakerId === 'maya') {
     return _ignore('no double-reply');
   }

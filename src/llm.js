@@ -127,9 +127,18 @@ export async function getMayaReply({
       });
 
       console.log(`[llm] status: ${status}`);
-      if (status === 429) { await sleep(2000); continue; }
+      if (status === 429) {
+        console.warn(`[llm] rate limited, waiting 3s...`);
+        await sleep(3000); continue;
+      }
+      if (status >= 500) {
+        // Server error — retry
+        console.error(`[llm] server error ${status}, retrying...`, JSON.stringify(data).slice(0,200));
+        await sleep(1000 * (attempt + 1)); continue;
+      }
       if (status !== 200) {
-        console.error(`[llm] HTTP ${status}:`, JSON.stringify(data).slice(0,300));
+        // Client error (4xx except 429) — log full error and break
+        console.error(`[llm] HTTP ${status}:`, JSON.stringify(data).slice(0,400));
         break;
       }
 
@@ -159,3 +168,21 @@ export async function getMayaReply({
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/**
+ * Simulate reading + thinking time before replying.
+ * Humans don't reply in 200ms — they read, think, then type.
+ * Base delay scales with message length (longer message = more reading time).
+ * Randomised so it doesn't feel mechanical.
+ */
+export function replyDelay(messageLength = 20) {
+  // Reading time: ~150ms per word (rough)
+  const wordCount   = Math.ceil(messageLength / 5);
+  const readingMs   = Math.min(wordCount * 150, 2000);   // cap at 2s
+  // Thinking time: 500ms–1500ms random
+  const thinkingMs  = 500 + Math.random() * 1000;
+  // Typing time: 300ms–800ms
+  const typingMs    = 300 + Math.random() * 500;
+
+  return Math.round(readingMs + thinkingMs + typingMs);
+}
