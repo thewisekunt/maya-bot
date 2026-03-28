@@ -2,10 +2,10 @@ import axios from 'axios';
 import { config } from './config.js';
 
 const FALLBACKS = [
-  "Ugh, my brain's lagging. Try again? 😅",
-  "Yaar thoda busy hoon, ek second! 🙈",
-  "Brb, my thoughts are buffering... 🔄",
-  "Arey, kuch toh hua — phir try kar! 😬",
+  "hmm give me a sec",
+  "ek second",
+  "wait",
+  "...",
 ];
 
 // Base system prompt — REACT instruction conditionally appended
@@ -94,9 +94,11 @@ export async function getMayaReply({
 
   const systemPrompt = systemOverride || parts.join('\n');
 
+  // Truncate context to prevent token overflow (context can grow large)
+  const contextTrunc = context ? context.slice(-3000) : '';
+
   const userPrompt =
-    `Entropy: ${entropy} | Zone: ${zone}\n${zoneLine}\n\n` +
-    (context ? `Recent conversation:\n${context}\n\n` : '') +
+    (contextTrunc ? `Recent conversation:\n${contextTrunc}\n\n` : '') +
     `${prefName}: ${message}\nMaya:`;
 
   const payload = {
@@ -113,7 +115,8 @@ export async function getMayaReply({
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (attempt > 0) await sleep(900 * attempt);
     try {
-      console.log(`[llm] attempt ${attempt + 1} — model: ${config.llm.model} forceVerbal: ${forceVerbal}`);
+      const payloadSize = JSON.stringify(payload).length;
+      console.log(`[llm] attempt ${attempt + 1} model=${config.llm.model} forceVerbal=${forceVerbal} payloadBytes=${payloadSize}`);
 
       const { data, status } = await axios.post(config.llm.endpoint, payload, {
         headers: {
@@ -144,7 +147,10 @@ export async function getMayaReply({
 
       const raw = data?.choices?.[0]?.message?.content?.trim();
       console.log(`[llm] raw: ${raw?.slice(0, 120)}`);
-      if (!raw) break;
+      if (!raw) {
+        console.warn('[llm] empty response body, retrying...');
+        continue;  // retry instead of breaking
+      }
 
       // Parse REACT only when NOT forceVerbal
       if (!forceVerbal) {

@@ -1,22 +1,17 @@
 /**
  * presence.js — Maya's Conversational Presence Engine
  *
- * The core question is not "should I respond to this message?"
- * It's "does this conversation need me right now?"
- *
- * Three modes per channel (auto-managed):
+ * Three modes per channel:
  *   PASSIVE   — default. Only responds when directly addressed.
- *   OBSERVING — post-mention. Watching, rarely speaks.
- *   ENGAGED   — active back-and-forth. More responsive.
+ *   OBSERVING — post-mention. Watching, selectively engages.
+ *   ENGAGED   — active back-and-forth. Responds freely in conversation.
  *
- * Decision flow:
- *   1. Hard stops (cooldown, double-reply guard)
- *   2. NLP intent classification (node-nlp, local, no API)
- *   3. Conversation state (velocity, speakers)
- *   4. Silence score vs Expression score — weighted by NLP confidence
- *   5. Mode threshold gate
- *
- * Returns: { action: 'ignore'|'react'|'reply', reason, score }
+ * Key fixes over previous version:
+ *   - onMention never downgrades ENGAGED → OBSERVING
+ *   - Intent detection uses prior message context (was the previous
+ *     message directed at Maya? Was there a back-and-forth?)
+ *   - Engaged continuation: if Maya just replied, next message from
+ *     same user is treated as continuation regardless of content
  */
 
 import { classify } from './nlp.js';
@@ -29,37 +24,38 @@ const MODES = { PASSIVE: 0, OBSERVING: 1, ENGAGED: 2 };
 function getChannel(channelId) {
   if (!channels.has(channelId)) {
     channels.set(channelId, {
-      mode:           MODES.PASSIVE,
-      modeSetAt:      0,
-      lastMayaReply:  0,
-      lastMayaReact:  0,
-      recentMessages: [],    // timestamps for velocity
-      recentSpeakers: [],    // last 6 speaker IDs
-      lastSpeakerId:  null,
-      engagedUserId:  null,
-      mentionCount:   0,
+      mode:              MODES.PASSIVE,
+      modeSetAt:         0,
+      lastMayaReply:     0,
+      lastMayaReplyTo:   null,    // userId Maya last replied to
+      lastMayaReact:     0,
+      recentMessages:    [],      // timestamps for velocity
+      recentSpeakers:    [],      // last 6 speaker IDs
+      lastSpeakerId:     null,
+      engagedUserId:     null,
+      mentionCount:      0,
+      // Conversation history (last 6 intent signals)
+      // Each: { userId, intent, wasForMaya, ts }
+      intentHistory:     [],
     });
   }
   return channels.get(channelId);
 }
 
 // ── Cooldowns ─────────────────────────────────────────────────────────────────
-const COOLDOWN_REPLY_MS  = 28_000;   // 28s between replies (cross-instance)
-const COOLDOWN_REACT_MS  = 10_000;   // 10s between reacts
-const ENGAGED_REPLY_MS   = 10_000;   // shorter cooldown when engaged
+const COOLDOWN_REPLY_MS  = 22_000;   // 22s between replies when not engaged
+const COOLDOWN_REACT_MS  = 10_000;
+const ENGAGED_REPLY_MS   = 7_000;    // 7s between replies when engaged
 const MODE_OBSERVING_TTL = 5 * 60_000;
-const MODE_ENGAGED_TTL   = 3 * 60_000;
+const MODE_ENGAGED_TTL   = 5 * 60_000;   // extended: 5 min engaged (was 3)
 
-// ── Cross-instance DB-backed cooldown ─────────────────────────────────────────
-// In-memory state is per-instance. With 2 Koyeb instances, each has its own
-// lastMayaReply. DB-backed state is shared — both instances see the same value.
-
+// ── DB-backed cross-instance cooldown ─────────────────────────────────────────
 async function _setDBCooldown(channelId, key, ttlMs) {
-  const expiresAt = new Date(Date.now() + ttlMs).toISOString();
+  const expires = new Date(Date.now() + ttlMs).toISOString();
   await db.execute(
     `INSERT INTO maya_state (state_key, value) VALUES (?,?)
      ON DUPLICATE KEY UPDATE value=VALUES(value), updated_at=NOW()`,
-    [`${key}_${channelId}`, expiresAt]
+    [`${key}_${channelId}`, expires]
   ).catch(() => {});
 }
 
@@ -69,8 +65,8 @@ async function _checkDBCooldown(channelId, key) {
       `SELECT value FROM maya_state WHERE state_key=? LIMIT 1`,
       [`${key}_${channelId}`]
     );
-    if (!row) return false;  // no cooldown set
-    return Date.now() < new Date(row.value).getTime();  // true = still cooling
+    if (!row) return false;
+    return Date.now() < new Date(row.value).getTime();
   } catch { return false; }
 }
 
@@ -88,19 +84,30 @@ export function observeMessage(channelId, userId, isMayaReply = false) {
     ch.lastSpeakerId  = userId;
   }
 
-  // Auto-decay modes over time
+  // Auto-decay
   if (ch.mode === MODES.OBSERVING && now - ch.modeSetAt > MODE_OBSERVING_TTL) {
     ch.mode = MODES.PASSIVE;
-    console.log(`[presence] ${channelId} → PASSIVE (observing expired)`);
+    console.log(`[presence] ${channelId} → PASSIVE (observing TTL expired)`);
   }
   if (ch.mode === MODES.ENGAGED && now - ch.modeSetAt > MODE_ENGAGED_TTL) {
     ch.mode = MODES.OBSERVING;
-    console.log(`[presence] ${channelId} → OBSERVING (engaged expired)`);
+    console.log(`[presence] ${channelId} → OBSERVING (engaged TTL expired)`);
   }
 }
 
 export function onMention(channelId, byUserId) {
   const ch = getChannel(channelId);
+
+  // CRITICAL FIX: never downgrade ENGAGED → OBSERVING on mention.
+  // If Maya is already in an active conversation, a new mention should
+  // extend the engaged window, not reset it downward.
+  if (ch.mode === MODES.ENGAGED) {
+    ch.modeSetAt = Date.now();   // just refresh the timer
+    ch.engagedUserId = byUserId; // update who she's engaging with
+    console.log(`[presence] ${channelId} ENGAGED refreshed (mention by ${byUserId})`);
+    return;
+  }
+
   ch.mode      = MODES.OBSERVING;
   ch.modeSetAt = Date.now();
   ch.mentionCount++;
@@ -109,13 +116,15 @@ export function onMention(channelId, byUserId) {
 
 export function onMayaReply(channelId, toUserId) {
   const ch = getChannel(channelId);
-  ch.lastMayaReply = Date.now();
-  ch.mode          = MODES.ENGAGED;
-  ch.modeSetAt     = Date.now();
-  ch.engagedUserId = toUserId;
+  ch.lastMayaReply   = Date.now();
+  ch.lastMayaReplyTo = toUserId;
+  ch.mode            = MODES.ENGAGED;
+  ch.modeSetAt       = Date.now();
+  ch.engagedUserId   = toUserId;
   observeMessage(channelId, 'maya', true);
-  // Write to DB so the other Koyeb instance also knows Maya just replied
-  _setDBCooldown(channelId, 'reply', COOLDOWN_REPLY_MS);
+  // Use ENGAGED cooldown (shorter) when in active conversation
+  // so the other instance also respects the shorter window
+  _setDBCooldown(channelId, 'reply', ENGAGED_REPLY_MS);
   console.log(`[presence] ${channelId} → ENGAGED with ${toUserId}`);
 }
 
@@ -123,11 +132,17 @@ export function onMayaReact(channelId) {
   getChannel(channelId).lastMayaReact = Date.now();
 }
 
-// ── Main decision function (async — calls NLP classifier) ─────────────────────
+// ── Record intent into channel history ────────────────────────────────────────
+// Called after intent is determined, so future messages have context
+function _recordIntent(ch, userId, intent, wasForMaya) {
+  ch.intentHistory = [
+    ...ch.intentHistory.slice(-5),
+    { userId, intent, wasForMaya, ts: Date.now() },
+  ];
+}
 
-/**
- * @returns {Promise<{ action: 'ignore'|'react'|'reply', reason: string, score: number }>}
- */
+// ── Main decision (async — calls NLP) ────────────────────────────────────────
+
 export async function decide({
   channelId,
   userId,
@@ -140,7 +155,6 @@ export async function decide({
   entropy    = 0.4,
   knownNames = [],
 }) {
-  // DMs always get a reply
   if (isDM) return _reply('DM', 10);
 
   const ch  = getChannel(channelId);
@@ -148,77 +162,105 @@ export async function decide({
   const wc  = text.trim().split(/\s+/).filter(Boolean).length;
 
   // ── 1. HARD STOPS ─────────────────────────────────────────────────────────
-  // Use DB-backed cooldown so both Koyeb instances share the same state.
-  // In-memory check first (fast) — DB check only if in-memory says ok.
   const replyCooldown = ch.mode === MODES.ENGAGED ? ENGAGED_REPLY_MS : COOLDOWN_REPLY_MS;
 
   if (!isMention && !isReply) {
-    // Fast in-memory check
-    const inMemoryCooling = now - ch.lastMayaReply < replyCooldown;
-    // DB check (handles cross-instance case)
-    const dbCooling = inMemoryCooling ? true : await _checkDBCooldown(channelId, 'reply');
-    if (dbCooling) {
-      return _ignore('cooldown: reply too soon (cross-instance)');
-    }
+    const inMemory = now - ch.lastMayaReply < replyCooldown;
+    const inDB     = inMemory ? true : await _checkDBCooldown(channelId, 'reply');
+    if (inDB) return _ignore('cooldown');
   }
 
-  // No double-reply (Maya spoke last) — only in-memory, good enough
   if (!isMention && !isReply && ch.lastSpeakerId === 'maya') {
     return _ignore('no double-reply');
   }
 
   const recentlyReacted = now - ch.lastMayaReact < COOLDOWN_REACT_MS;
 
-  // ── 2. NLP INTENT CLASSIFICATION ─────────────────────────────────────────
-  // Hard rules first for obvious cases (fast, no classifier overhead)
+  // ── 2. ENGAGED CONTINUATION ────────────────────────────────────────────────
+  // If Maya just replied to this user and they're speaking again,
+  // treat it as continuation — engage without requiring explicit intent
+  const isEngagedContinuation =
+    ch.mode === MODES.ENGAGED &&
+    ch.engagedUserId === userId &&
+    now - ch.lastMayaReply < MODE_ENGAGED_TTL;
+
+  // ── 3. INTENT DETECTION ───────────────────────────────────────────────────
   let intent, intentScore, sentiment, sentimentScore;
 
-  const hardIntent = _hardRules(text, isMention, isReply, ch, userId, knownNames);
-  if (hardIntent) {
-    intent      = hardIntent;
-    intentScore = 1.0;   // hard rules are always confident
-    sentiment   = 'neutral';
-    sentimentScore = 0;
+  const hard = _hardRules(text, isMention, isReply, ch, userId);
+  if (hard) {
+    intent = hard; intentScore = 1.0; sentiment = 'neutral'; sentimentScore = 0;
   } else {
-    // NLP classifier for everything nuanced
-    const nlp  = await classify(text);
+    const nlp   = await classify(text);
     intent      = nlp.intent;
     intentScore = nlp.score;
     sentiment   = nlp.sentiment;
     sentimentScore = nlp.sentimentScore;
   }
 
-  // ── 3. CONVERSATION STATE ─────────────────────────────────────────────────
+  // ── Context correction using intent history ─────────────────────────────
+  // If the last 2 messages in this channel were NOT directed at Maya,
+  // and this message doesn't mention Maya, downweight question_to_maya
+  if (intent === 'question_to_maya' && !isMention && !isReply) {
+    const recent = ch.intentHistory.slice(-3);
+    const nonMayaCount = recent.filter(h => !h.wasForMaya).length;
+    if (nonMayaCount >= 2) {
+      // Conversation has been between humans, not with Maya
+      // This question is probably for the group, not Maya
+      intent = 'question_to_group';
+      intentScore *= 0.6;
+      console.log(`[presence] intent corrected question_to_maya→question_to_group (${nonMayaCount} non-maya recent msgs)`);
+    }
+  }
+
+  // Record this intent for future context
+  const wasForMaya = isMention || isReply ||
+    intent === 'question_to_maya' ||
+    intent === 'emotional';
+  _recordIntent(ch, userId, intent, wasForMaya);
+
+  // ── 4. CONVERSATION STATE ─────────────────────────────────────────────────
   const velocity       = ch.recentMessages.filter(t => now - t < 60_000).length;
   const isHotConvo     = velocity >= 8;
   const isDeadConvo    = velocity <= 1;
   const uniqueSpeakers = new Set(ch.recentSpeakers.slice(-6)).size;
   const isGroupConvo   = uniqueSpeakers >= 3 && !isMention;
 
-  // ── 4. SILENCE vs EXPRESSION SCORE ───────────────────────────────────────
-  // NLP confidence multiplies the intent's base score contribution
-  // So a question_to_maya with 0.9 confidence adds more than one with 0.5
-
+  // ── 5. SILENCE vs EXPRESSION SCORE ───────────────────────────────────────
   let expressScore = 0;
   let silenceScore = 0;
 
-  // Direct address signals (hard rules — full weight)
+  const conf = intentScore;
+
+  // Direct address
   if (isMention)  expressScore += 8;
   if (isReply)    expressScore += 7;
 
-  // NLP-weighted intent signals
-  const conf = intentScore;  // 0–1 confidence multiplier
+  // Engaged continuation bonus — she's in active convo with this person
+  if (isEngagedContinuation) expressScore += 4;
+
+  // NLP-weighted intents
   switch (intent) {
-    case 'question_to_maya':  expressScore += 6 * conf;  break;
-    case 'emotional':         expressScore += 5 * conf;  break;
-    case 'engaged_reply':     expressScore += 3 * conf;  break;
-    case 'question_to_group': expressScore += 2 * conf;  break;
-    case 'directed_at_other': silenceScore += 5 * conf;  break;
-    case 'random_mention':    silenceScore += 3 * conf;  break;
-    case 'group_chatter':     silenceScore += 4 * conf;  break;
+    case 'question_to_maya':  expressScore += 6 * conf;   break;
+    case 'emotional':         expressScore += 5 * conf;   break;
+    case 'engaged_reply':     expressScore += 3 * conf;   break;
+    case 'question_to_group': expressScore += 1.5 * conf; break;
+    case 'directed_at_other':
+      // In engaged mode with this user, short messages aren't "directed at other"
+      // Only penalise if it's a longer, clearly-redirected message
+      if (isEngagedContinuation && wc < 6) {
+        // Override: treat as engaged_reply instead
+        intent = 'engaged_reply';
+        expressScore += 3 * conf;
+      } else {
+        silenceScore += 5 * conf;
+      }
+      break;
+    case 'random_mention':    silenceScore += 3 * conf;   break;
+    case 'group_chatter':     silenceScore += 3 * conf;   break;
   }
 
-  // Sentiment bonus — negative sentiment = someone might need support
+  // Sentiment: negative = someone might need support
   if (sentiment === 'negative' && sentimentScore < -0.3) expressScore += 1.5;
 
   // Context signals
@@ -227,67 +269,56 @@ export async function decide({
   if (hasMedia && ch.mode >= MODES.OBSERVING)    expressScore += 0.5;
   if (entropy > 0.6)                             expressScore += 0.5;
 
-  // Known name mentioned (soft signal — she notices)
-  if (intent !== 'directed_at_other' && knownNames.length > 0) {
+  // Known name mentioned
+  if (knownNames.length > 0) {
     const ltext = text.toLowerCase();
     const hit   = knownNames.find(n => n.length >= 3 && ltext.includes(n.toLowerCase()));
-    if (hit) expressScore += 1.5;
+    if (hit && intent !== 'directed_at_other') expressScore += 1.5;
   }
 
-  // Conversation state penalties
+  // Silence penalties
   if (isHotConvo)                              silenceScore += 5;
   if (isGroupConvo)                            silenceScore += 3;
   if (ch.mode === MODES.PASSIVE && !isMention) silenceScore += 4;
   if (wc < 3 && entropy < 0.3)                silenceScore += 1.5;
   if (recentlyReacted)                         silenceScore += 2;
 
-  const netScore = expressScore - silenceScore;
+  const netScore  = expressScore - silenceScore;
   const modeLabel = ['PASSIVE','OBSERVING','ENGAGED'][ch.mode];
 
-  // ── 5. MODE THRESHOLD GATE ────────────────────────────────────────────────
+  // ── 6. MODE THRESHOLD ────────────────────────────────────────────────────
   const threshold = ch.mode === MODES.PASSIVE   ? 7
                   : ch.mode === MODES.OBSERVING  ? 4
-                  :                               2;
+                  :                               2;   // ENGAGED
 
   const reason = `score=${netScore.toFixed(1)} intent=${intent}(${conf.toFixed(2)}) mode=${modeLabel} sent=${sentiment}`;
 
-  if (netScore < threshold) {
-    return _ignore(`${reason} → below threshold ${threshold}`);
-  }
+  if (netScore < threshold) return _ignore(`${reason} → below ${threshold}`);
 
-  // ── 6. RESPONSE TYPE ─────────────────────────────────────────────────────
+  // ── 7. RESPONSE TYPE ─────────────────────────────────────────────────────
   const forceReply = netScore >= 6
                   || isMention
                   || isReply
+                  || isEngagedContinuation
                   || intent === 'question_to_maya'
                   || (intent === 'emotional' && intentScore > 0.6);
 
   if (forceReply) return _reply(reason, netScore);
-
   if (!recentlyReacted) return _react(_pickEmoji(entropy, intent, sentiment), reason);
-
-  return _ignore(`${reason} → react on cooldown`);
+  return _ignore(`${reason} → react cooldown`);
 }
 
-// ── Hard rules (fast path before NLP) ────────────────────────────────────────
-// Only for cases where we're 100% certain from structure alone
+// ── Hard rules (fast path) ────────────────────────────────────────────────────
 
-function _hardRules(text, isMention, isReply, ch, userId, knownNames) {
-  // Direct mention + question mark = definitely question_to_maya
-  if ((isMention || isReply) && /\?/.test(text)) return 'question_to_maya';
-
-  // Long direct mention (any substantive message addressed to Maya)
-  if (isMention && text.trim().split(/\s+/).length >= 4) return 'question_to_maya';
-
-  // Pure emoji / ack words — always group chatter
+function _hardRules(text, isMention, isReply, ch, userId) {
+  if ((isMention || isReply) && /\?/.test(text))           return 'question_to_maya';
+  if (isMention && text.trim().split(/\s+/).length >= 4)   return 'question_to_maya';
   if (/^[😂💀👀🔥😭🙏👍👎❤️🤣😍🫶✨]+$/u.test(text)) return 'group_chatter';
   if (/^(ok|okay|k|kk|lol|lmao|haha|same|mood|brb|gtg|gn|gm)\.?$/i.test(text)) return 'group_chatter';
-
-  // Engaged user continuing conversation — let NLP handle it for nuance
   return null;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Mode info ─────────────────────────────────────────────────────────────────
 
 export function getMode(channelId) {
   return channels.get(channelId)?.mode ?? MODES.PASSIVE;
@@ -296,6 +327,21 @@ export function getMode(channelId) {
 export function getModeLabel(channelId) {
   return ['PASSIVE','OBSERVING','ENGAGED'][getMode(channelId)];
 }
+
+/**
+ * Returns the userId Maya is currently ENGAGED with in a channel,
+ * or null if not engaged. Used by index.js to let continuation
+ * messages through the gate without requiring a mention.
+ */
+export function getEngagedUser(channelId) {
+  const ch = channels.get(channelId);
+  if (!ch || ch.mode !== MODES.ENGAGED) return null;
+  // Check TTL hasn't expired
+  if (Date.now() - ch.modeSetAt > MODE_ENGAGED_TTL) return null;
+  return ch.engagedUserId || null;
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function _reply(reason, score)  { return { action: 'reply',  reason, score }; }
 function _ignore(reason)        { return { action: 'ignore', reason, score: 0 }; }

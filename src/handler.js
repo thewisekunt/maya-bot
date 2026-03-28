@@ -126,7 +126,7 @@ export async function handleMessage({
   }
 
   // ── 9. PRESENCE DECISION ─────────────────────────────────────────────────
-  const decision = decide({
+  const decision = await decide({
     channelId,
     userId,
     text:       richMessageText,
@@ -139,16 +139,27 @@ export async function handleMessage({
     knownNames,
   });
 
-  console.log(`[presence] user=${prefName} action=${decision.action} reason="${decision.reason}" mode=${isDM?'DM':'server'} trust=${trustLevel}`);
+  // Safety: if decide() returned undefined (import error, crash), default safely
+  if (!decision || !decision.action) {
+    console.error('[presence] decide() returned invalid:', decision, '— defaulting to reply');
+    if (isDM || isMention) {
+      // Force reply for direct address
+    } else {
+      return null;  // ignore for everything else
+    }
+  }
+
+  const action = decision?.action || (isDM || isMention ? 'reply' : 'ignore');
+  console.log(`[presence] user=${prefName} action=${action} reason="${decision?.reason}" mode=${isDM?'DM':'server'} trust=${trustLevel}`);
 
   // ── IGNORE ────────────────────────────────────────────────────────────────
-  if (decision.action === 'ignore') {
+  if (action === 'ignore') {
     debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: '[IGNORED]' });
     return null;
   }
 
   // ── REACT ─────────────────────────────────────────────────────────────────
-  if (decision.action === 'react') {
+  if (action === 'react') {
     _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate, entropy,
       message, `*reacted with ${decision.emoji}*`);
     debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: `REACT:${decision.emoji}` });
