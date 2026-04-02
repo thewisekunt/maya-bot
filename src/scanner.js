@@ -15,7 +15,7 @@
  * Does NOT filter channels — caller does that.
  */
 
-import { getKnownNames } from './persona.js';
+import db from './db.js';
 import { config } from './config.js';
 
 // ── Alias cache ───────────────────────────────────────────────────────────────
@@ -37,13 +37,15 @@ export async function refreshAliases(guildId) {
   if (now - _aliasRefresh < ALIAS_TTL) return;  // still fresh
 
   try {
-    const dbAliases = await getKnownNames(guildId, 50);
+    // Only load aliases for Maya's bot identity (discord_user_id = 'maya_bot')
+    // NOT user aliases — those are for mapping human names to users
+    // Maya's own aliases: hardcoded + env BOT_ALIASES only
+    // DB lookup kept for future: custom server nicknames for the bot
     _aliases = [
       ...new Set([
         'maya',
         'delelumaya',
         ...STATIC_ALIASES,
-        ...dbAliases.map(a => a.toLowerCase()),
       ])
     ].filter(a => a.length >= 3);
     _aliasRefresh = now;

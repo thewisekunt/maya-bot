@@ -12,6 +12,8 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 5,
   queueLimit:      0,
+  timezone:        'Z',      // treat DB timestamps as UTC → correct JS Date objects
+  dateStrings:     false,    // return actual Date objects, not strings
 });
 
 // Test connection at startup

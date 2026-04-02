@@ -49,23 +49,82 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
   if (channelId) {
     const sessionMsgs = await getSessionContext(channelId, 12).catch(() => []);
     if (sessionMsgs.length > 0) {
-      parts.push('--- This conversation ---');
-      sessionMsgs.forEach(m => {
-        const who = m.sender === 'maya' ? 'Maya' : (m.user_name || prefName);
-        parts.push(`${who}: ${m.message}`);
-      });
+      if (contextType === 'dm') {
+        parts.push('--- Private DM (only this conversation) ---');
+        // DM STM only has DM messages — server convo shown separately below from SQL
+        sessionMsgs.forEach(m => {
+          const who   = m.sender === 'maya' ? 'Maya' : (m.user_name || prefName);
+          const ts    = m.created_at ? _relativeTime(new Date(m.created_at)) : '';
+          const tsTag = ts ? ` [${ts}]` : '';
+          const label = m.sender === 'maya' ? '[Maya replied]' : who;
+          parts.push(`${label}${tsTag}: ${m.message}`);
+        });
+        // Also pull recent server messages for this user so Maya has both contexts
+        try {
+          const [srvRows] = await db.execute(
+            `SELECT sender, user_name, message, created_at FROM maya_memory
+             WHERE discord_user_id=? AND context_type='server'
+             ORDER BY created_at DESC LIMIT 6`,
+            [userId]
+          );
+          if (srvRows.length > 0) {
+            parts.push('');
+            parts.push(`--- What ${prefName} said recently in the server ---`);
+            srvRows.reverse().forEach(r => {
+              const who   = r.sender === 'maya' ? '[Maya replied]' : (r.user_name || prefName);
+              const ts    = r.created_at ? _relativeTime(new Date(r.created_at)) : '';
+              const tsTag = ts ? ` [${ts}]` : '';
+              parts.push(`${who}${tsTag}: ${r.message}`);
+            });
+          }
+        } catch { /* non-fatal */ }
+      } else {
+        // Group chat — show speakers clearly, track unique speakers
+        const speakers = new Set(
+          sessionMsgs.filter(m => m.sender !== 'maya').map(m => m.user_name).filter(Boolean)
+        );
+        const speakerList = [...speakers].join(', ');
+        parts.push(`--- Group chat. People here: ${speakerList || 'unknown'}. Maya is one of them. ---`);
+        parts.push('--- NOT every message is to Maya. [Maya said] marks what Maya already replied. Only reply to the LAST message. ---');
+        parts.push('');
+
+        // Show ALL messages with speaker attribution — including Maya's replies
+        // Maya's replies labelled clearly so she knows what she already said
+        sessionMsgs.forEach(m => {
+          const who    = m.sender === 'maya' ? 'Maya' : (m.user_name || '?');
+          const isMaya = m.sender === 'maya';
+          const ts     = m.created_at ? _relativeTime(new Date(m.created_at)) : '';
+          const tsTag  = ts ? ` [${ts}]` : '';
+          // Maya's messages marked with [Maya said:] so LLM knows she already replied
+          const prefix = isMaya ? `  [Maya said]${tsTag}:` : `  ${who}${tsTag}:`;
+          parts.push(`${prefix} ${m.message}`);
+        });
+        parts.push('');
+        parts.push(`--- ${prefName} is now talking to Maya ---`);
+      }
       parts.push('');
     }
   }
 
   // ── Layer 2: SQL recent (fallback / bridge) ───────────────────────────────
   // Only use if no session context (e.g. bot restarted mid-conversation)
+  // Fetches channel-wide messages (all speakers) so Maya sees full conversation
   if (parts.length === 0) {
-    const recent = await _getRecentSQL(userId, contextType, guildId);
+    const recent = await _getRecentSQL(userId, contextType, guildId, channelId);
     if (recent.length > 0) {
+      if (contextType !== 'dm') {
+        const sqlSpeakers = new Set(recent.filter(r => r.sender !== 'maya').map(r => r.user_name).filter(Boolean));
+        parts.push(`--- Recent channel conversation (${[...sqlSpeakers].join(', ') || 'others'}) ---`);
+      }
       recent.forEach(r => {
-        const who = r.sender === 'maya' ? 'Maya' : prefName;
-        parts.push(`${who}: ${r.message}`);
+        const ts    = r.created_at ? _relativeTime(new Date(r.created_at)) : '';
+        const tsTag = ts ? ` [${ts}]` : '';
+        if (r.sender === 'maya') {
+          parts.push(`[Maya already replied]${tsTag}: ${r.message}`);
+        } else {
+          const who = r.user_name || prefName;
+          parts.push(`${who}${tsTag}: ${r.message}`);
+        }
       });
       parts.push('');
     }
@@ -143,41 +202,69 @@ export async function saveMessage({
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+function _relativeTime(date) {
+  if (!date || isNaN(date)) return '';
+  const mins = Math.round((Date.now() - date) / 60_000);
+  if (mins < 1)   return 'just now';
+  if (mins < 60)  return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24)   return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
 function _typeFilter(userId, memoryType, isDM, guildId) {
+  // For DMs: don't filter by is_private — allow recall of server memories too
+  // so Maya remembers what was said in the server when talking in DMs.
+  // Private (DM) messages are always stored with is_private=true but we
+  // can show server memories in DMs — they're not sensitive.
   const must = [
     { key: 'memory_type',     match: { value: memoryType } },
     { key: 'discord_user_id', match: { value: userId } },
   ];
-  if (isDM) {
-    must.push({ key: 'is_private', match: { value: true } });
-  } else if (guildId) {
+  if (!isDM && guildId) {
     must.push({ key: 'guild_id', match: { value: guildId } });
   }
   return { must };
 }
 
-async function _getRecentSQL(userId, contextType, guildId) {
+async function _getRecentSQL(userId, contextType, guildId, channelId = null) {
   const newSchema = await _hasNewSchema();
   try {
     let rows;
     if (newSchema) {
-      [rows] = contextType === 'dm'
-        ? await db.execute(
-            `SELECT sender, message FROM maya_memory
-             WHERE discord_user_id=? AND context_type='dm'
-             ORDER BY created_at DESC LIMIT ?`, [userId, SQL_LIMIT])
-        : guildId
-          ? await db.execute(
-              `SELECT sender, message FROM maya_memory
-               WHERE discord_user_id=? AND context_type='server' AND guild_id=?
-               ORDER BY created_at DESC LIMIT ?`, [userId, guildId, SQL_LIMIT])
-          : await db.execute(
-              `SELECT sender, message FROM maya_memory
-               WHERE discord_user_id=? AND context_type='server'
-               ORDER BY created_at DESC LIMIT ?`, [userId, SQL_LIMIT]);
+      if (contextType === 'dm') {
+        // DMs: fetch DM history only (server history shown separately below)
+        [rows] = await db.execute(
+          `SELECT sender, user_name, message, context_type, created_at FROM maya_memory
+           WHERE discord_user_id=? AND context_type='dm'
+           ORDER BY created_at DESC LIMIT ?`,
+          [userId, SQL_LIMIT]
+        );
+      } else if (channelId) {
+        // Server with channelId: fetch ALL recent messages in this channel
+        // regardless of who sent them — gives full conversation picture
+        [rows] = await db.execute(
+          `SELECT sender, user_name, message, context_type, created_at FROM maya_memory
+           WHERE channel_id=?
+           ORDER BY created_at DESC LIMIT ?`,
+          [channelId, SQL_LIMIT * 2]
+        );
+      } else if (guildId) {
+        [rows] = await db.execute(
+          `SELECT sender, user_name, message, context_type, created_at FROM maya_memory
+           WHERE discord_user_id=? AND context_type='server' AND guild_id=?
+           ORDER BY created_at DESC LIMIT ?`,
+          [userId, guildId, SQL_LIMIT]);
+      } else {
+        [rows] = await db.execute(
+          `SELECT sender, user_name, message, context_type, created_at FROM maya_memory
+           WHERE discord_user_id=? AND context_type='server'
+           ORDER BY created_at DESC LIMIT ?`,
+          [userId, SQL_LIMIT]);
+      }
     } else {
       [rows] = await db.execute(
-        `SELECT sender, message FROM maya_memory
+        `SELECT sender, user_name, message, created_at FROM maya_memory
          WHERE discord_user_id=? ORDER BY created_at DESC LIMIT ?`,
         [userId, SQL_LIMIT]);
     }

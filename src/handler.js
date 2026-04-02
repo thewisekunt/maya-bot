@@ -4,15 +4,20 @@
  */
 
 import { buildContext, saveMessage } from './memory.js';
+import { updateState } from './psyche.js';
+import { detectPfpRequest, detectSelfUpdate, describeAndStoreAvatar,
+         recallAvatar, updateName, updateAvatar, updateBio } from './selfupdate.js';
 import { openSession, recordSessionMessage, getSessionParticipants } from './stm.js';
 import { isSocialQuery, buildSocialContext } from './social.js';
 import { isImageRequest, extractImagePrompt, generateImage } from './imagegen.js';
 import { estimateEntropy, getEntropyZone, getKnownNames, getConfirmedFacts,
          getMayaSelfTraits, extractAndStoreFact, extractMayaTrait,
+         updateRelationshipSignals,
          getOrCreateRelationship, recordUserInteraction,
          upsertUser, detectNameSet, getFrequentInteractors } from './persona.js';
 import { getMayaReply } from './llm.js';
-import { buildContextLine } from './context.js';
+import { shouldDeliberate, deliberate, webSearch } from './think.js';
+import { buildContextLine, upsertGuild, upsertChannel } from './context.js';
 import { decide } from './presence.js';
 import { extractMediaContext } from './vision.js';
 import { debugLog } from './logger.js';
@@ -33,6 +38,10 @@ export async function handleMessage({
   const guildName   = msg.guild?.name    || null;
   const topic       = msg.channel?.topic || null;
   const contextLine = buildContextLine(contextType, channelName, guildName, topic);
+
+  // ── Update guild + channel whereabouts records ────────────────────────────
+  upsertGuild(msg.guild).catch(() => {});
+  upsertChannel(msg).catch(() => {});
 
   // ── 2. Preferred name ─────────────────────────────────────────────────────
   let prefName = displayName || username;
@@ -114,15 +123,104 @@ export async function handleMessage({
     }
   }
 
-  // ── 8. Entropy + zone ─────────────────────────────────────────────────────
+  // ── Third-party @mention resolution ─────────────────────────────────────────
+  // When someone asks "what do you think about @nier", resolve to name + known facts
+  let thirdPartyContext = '';
+  if (msg.mentions?.users?.size > 0) {
+    const others = [...msg.mentions.users.values()]
+      .filter(u => u.id !== msg.author.id && u.id !== msg.client?.user?.id);
+    if (others.length > 0) {
+      const tpFacts = [];
+      for (const other of others.slice(0, 2)) {
+        const otherName = msg.guild?.members?.cache?.get(other.id)?.displayName || other.username;
+        const facts = await getConfirmedFacts(other.id).catch(() => []);
+        if (facts.length > 0) {
+          tpFacts.push(`What Maya knows about ${otherName}: ${facts.slice(0, 3).join('; ')}`);
+        } else {
+          tpFacts.push(`${otherName} is in this server (no stored facts about them yet)`);
+        }
+      }
+      if (tpFacts.length) thirdPartyContext = tpFacts.join('\n');
+    }
+  }
+
+  // ── 8. Entropy + psyche state update ─────────────────────────────────────
   const entropy = estimateEntropy(richMessageText);
   const { zone, line: zoneLine } = getEntropyZone(entropy);
+
+  // Compute Maya's dynamic internal state from all available signals
+  // This runs before the salience decision so state informs both
+  // whether she responds AND how she responds
+  const { classify: classifyIntent } = await import('./nlp.js');
+  const nlpSignal = await classifyIntent(richMessageText).catch(() => ({
+    intent: 'group_chatter', score: 0.5, sentiment: 'neutral', sentimentScore: 0,
+  }));
+
+  // selfTraits fetched after salience — don't waste DB call if we're ignoring
+  const psycheState = await updateState({
+    // selfTraits passed empty here — fetched below if we actually reply
+
+    channelId,
+    entropy,
+    sentiment:     nlpSignal.sentiment,
+    sentimentScore: nlpSignal.sentimentScore,
+    intent:        nlpSignal.intent,
+    trustLevel,
+    velocity:      2,   // TODO: pull from presence channel state
+    selfTraits:    [],   // fetched after salience gate
+    sessionId:     null,
+  }).catch(() => ({ energy: 0.5, warmth: 0.6, seriousness: 0.4, monologue: '' }));
 
   // ── 8b. Image generation shortcut ────────────────────────────────────────
   // Check before salience — image requests always get handled if Maya is addressed
   if ((isMention || isDM) && isImageRequest(message)) {
     const imagePrompt = extractImagePrompt(message);
     return { type: 'image', prompt: imagePrompt };
+  }
+
+  // ── 8c. Self-update commands ─────────────────────────────────────────────
+  // Check before presence/LLM — these are direct commands to Maya
+  if (isMention || isDM) {
+    // Maya self-update: name / avatar / bio
+    const selfUpdate = detectSelfUpdate(message);
+    if (selfUpdate) {
+      if (selfUpdate.type === 'avatar') {
+        const r = await updateAvatar(msg.client, msg);
+        if (r.success) return { type: 'reply', text: 'done, updated my pfp! ✨' };
+        return { type: 'reply', text: `couldn't update pfp — ${r.reason}` };
+      }
+      if (selfUpdate.type === 'name' && selfUpdate.name) {
+        const r = await updateName(msg.client, msg, selfUpdate.name);
+        if (r.success) return { type: 'reply', text: `done, I'm now "${r.name}" ${r.scope === 'server' ? 'here' : 'everywhere'} 👀` };
+        return { type: 'reply', text: `couldn't change name — ${r.reason}` };
+      }
+      if (selfUpdate.type === 'bio') {
+        if (!selfUpdate.text) {
+          return { type: 'reply', text: 'tell me what to write in my bio — like "change your bio: always watching 👀"' };
+        }
+        const r = await updateBio(msg.client, selfUpdate.text);
+        if (r.success) return { type: 'reply', text: `bio updated ✓` };
+        return { type: 'reply', text: `couldn't update bio — ${r.reason}` };
+      }
+    }
+
+    // User pfp request
+    const pfpAction = detectPfpRequest(message);
+    if (pfpAction === 'recall') {
+      const stored = await recallAvatar(userId);
+      if (stored) return { type: 'reply', text: `haan, remember your pfp — ${stored}` };
+      return { type: 'reply', text: "I haven't looked at your pfp yet — send it and say check my pfp" };
+    }
+    if (pfpAction === 'describe') {
+      const avatarUrl = msg.author.displayAvatarURL({ size: 256, extension: 'png' });
+      await msg.channel.sendTyping().catch(() => {});
+      const desc = await describeAndStoreAvatar(userId, avatarUrl, prefName);
+      if (!desc) return { type: 'reply', text: "I tried but couldn't see your pfp clearly 😕" };
+      // Don't return raw vision text — inject it as context so LLM replies naturally
+      // Maya will comment on it in her own voice, not just dump the description
+      message = `${message} [Maya just saw ${prefName}'s pfp: ${desc}]`;
+      // Fall through to normal LLM reply path with enriched message
+    }
   }
 
   // ── 9. PRESENCE DECISION ─────────────────────────────────────────────────
@@ -160,18 +258,32 @@ export async function handleMessage({
 
   // ── REACT ─────────────────────────────────────────────────────────────────
   if (action === 'react') {
-    _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate, entropy,
-      message, `*reacted with ${decision.emoji}*`);
+    saveMessage({ userId, prefName, guildId, channelId, contextType,
+      isPrivate, sender: 'user', message, entropy }).catch(() => {});
+    saveMessage({ userId: 'maya', prefName: 'Maya', guildId, channelId, contextType,
+      isPrivate, sender: 'maya', message: `*reacted with ${decision.emoji}*`, entropy }).catch(() => {});
     debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: `REACT:${decision.emoji}` });
     return { type: 'react', emoji: decision.emoji };
   }
 
   // ── REPLY — fetch memory + known facts + call LLM ────────────────────────
 
+  // Fetch Maya's self-traits now (only if we're actually replying)
+  const selfTraits = await getMayaSelfTraits().catch(() => []);
+
   // Hybrid memory context: SQL recent + Qdrant semantic
   let context = '';
   try {
-    context = await buildContext(userId, prefName, contextType, guildId, message, channelId);
+    // Build semantic query from current message + recent session context
+    // More context = better vector match than single message alone
+    const { getSessionContext } = await import('./stm.js');
+    const sessionMsgs = await getSessionContext(channelId, 5).catch(() => []);
+    const semanticQuery = [
+      ...sessionMsgs.slice(-3).map(m => m.message),
+      message,
+    ].filter(Boolean).join(' ').slice(0, 500);
+
+    context = await buildContext(userId, prefName, contextType, guildId, semanticQuery, channelId);
   } catch (e) {
     console.error('[handler] buildContext error:', e.message);
   }
@@ -179,8 +291,9 @@ export async function handleMessage({
   // Facts about this user (attributed: "Danish loves pizza")
   const knownFacts = await getConfirmedFacts(userId).catch(() => []);
 
-  // Maya's own consistent traits ("Maya loves the rain")
-  const selfTraits = await getMayaSelfTraits().catch(() => []);
+  // Avatar description intentionally NOT injected into knownFacts every message
+  // — it causes Maya to bring up pfp repeatedly. Only inject when user asks about it.
+
 
   // Upsert user (non-fatal)
   db.execute(
@@ -214,18 +327,94 @@ export async function handleMessage({
 
   const forceVerbal = isMention || isDM || isReply;
 
+  // ── Deliberation gate ──────────────────────────────────────────────────────
+  let thoughtContext = '';
+  const deliberateTrigger = shouldDeliberate(richMessageText, psycheState, knownFacts);
+  if (deliberateTrigger) {
+    console.log(`[think] triggered: ${deliberateTrigger}`);
+
+    if (deliberateTrigger === 'search_requested') {
+      // User explicitly asked to search — extract query and search directly
+      // No need to spend a deliberation LLM call
+      const { extractSearchQuery } = await import('./think.js');
+      const q = extractSearchQuery(richMessageText);
+      if (q) {
+        const searchResult = await webSearch(q).catch(() => null);
+        if (searchResult) {
+          thoughtContext = `Search result for "${q}":\n${searchResult}`;
+          console.log(`[think] direct search: "${q}"`);
+        } else {
+          thoughtContext = 'Note to Maya: search returned no results, be honest about not knowing.';
+        }
+      }
+    } else {
+      // Factual/knowledge trigger — use deliberation LLM to decide what to do
+      const thought = await deliberate(richMessageText, context, knownFacts, deliberateTrigger).catch(() => null);
+      if (thought) {
+        console.log(`[think] confidence=${thought.confidence} search=${thought.shouldSearch} query="${thought.searchQuery}"`);
+        const tParts = [];
+        if (thought.know && thought.know !== 'nothing relevant') {
+          tParts.push(`What Maya already knows: ${thought.know}`);
+        }
+        if (thought.shouldSearch && thought.searchQuery) {
+          const searchResult = await webSearch(thought.searchQuery).catch(() => null);
+          if (searchResult) {
+            tParts.push(`Search result for "${thought.searchQuery}":\n${searchResult}`);
+            console.log('[think] search result injected');
+          } else {
+            tParts.push('Search returned no results.');
+          }
+        }
+        if (thought.confidence === 'low') {
+          tParts.push("Note to Maya: you don't have enough info to answer this confidently. Do NOT invent names, people, or facts. Deflect honestly.");
+        }
+        if (tParts.length > 0) thoughtContext = tParts.join('\n');
+      }
+    }
+  }
+
   const result = await getMayaReply({
-    prefName, context, message: finalMessage, entropy, zone, zoneLine,
+    prefName,
+    context: [context, thirdPartyContext, thoughtContext].filter(Boolean).join('\n\n'),
+    message: finalMessage, entropy, zone, zoneLine,
     contextLine, knownFacts, selfTraits, relationship: { trustLevel },
     frequentFriends: [], forceVerbal,
+    psycheState,
   });
 
   const savedReply = result.type === 'react'
     ? `*reacted with ${result.emoji}*`
     : result.text;
 
-  _saveMemory(userId, prefName, guildId, channelId, contextType, isPrivate,
-    entropy, message === '[media]' ? mediaContext : message, savedReply);
+  const savedMsg = message === '[media]' ? mediaContext : message;
+  saveMessage({ userId, prefName, guildId, channelId, contextType,
+    isPrivate, sender: 'user', message: savedMsg, entropy }).catch(() => {});
+  if (savedReply) saveMessage({ userId: 'maya', prefName: 'Maya', guildId, channelId,
+    contextType, isPrivate, sender: 'maya', message: savedReply, entropy }).catch(() => {});
+
+  // Update conversation quality signals for trust calculation
+  // Detect conflict: if user message has high entropy + negative sentiment
+  // or contains confrontational patterns
+  const isConflict = nlpSignal?.sentiment === 'negative' &&
+    (nlpSignal?.sentimentScore < -0.5) &&
+    entropy > 0.5;
+  const isHarmony  = nlpSignal?.sentiment === 'positive' &&
+    trustLevel >= 3;
+  const signalType = isConflict ? 'conflict' : isHarmony ? 'harmony' : 'neutral';
+  updateRelationshipSignals(userId, entropy, signalType).catch(() => {});
+  // Update attachment score from ongoing interaction quality
+  const { updateAttachment, checkInitiationReply } = await import('./initiate.js');
+  updateAttachment(userId, contextType, trustLevel, signalType, {
+    sentiment:      nlpSignal?.sentiment      || 'neutral',
+    sentimentScore: nlpSignal?.sentimentScore  || 0,
+  }).catch(() => {});
+  // Check if this message is a contextual reply to Maya's proactive initiation
+  // NLP context is now available — weight the reply properly
+  checkInitiationReply(userId, {
+    sentiment:      nlpSignal?.sentiment     || 'neutral',
+    sentimentScore: nlpSignal?.sentimentScore || 0,
+    intent:         nlpSignal?.intent         || 'group_chatter',
+  });
   debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: savedReply });
 
   // Extract facts from user message (fire and forget)
@@ -240,31 +429,3 @@ export async function handleMessage({
 }
 
 // ── Memory save ───────────────────────────────────────────────────────────────
-function _saveMemory(userId, prefName, guildId, channelId, contextType,
-                     isPrivate, entropy, userMsg, mayaReply) {
-  const saveNew = () => db.execute(
-    `INSERT INTO maya_memory
-       (discord_user_id, user_name, guild_id, channel_id,
-        context_type, is_private, sender, message, entropy)
-     VALUES (?,?,?,?,?,?,?,?,?)`,
-    [userId, prefName, guildId||null, channelId,
-     contextType, isPrivate?1:0, 'user', userMsg, entropy]
-  ).then(() => mayaReply ? db.execute(
-    `INSERT INTO maya_memory
-       (discord_user_id, user_name, guild_id, channel_id,
-        context_type, is_private, sender, message, entropy)
-     VALUES (?,?,?,?,?,?,?,?,?)`,
-    [userId, prefName, guildId||null, channelId,
-     contextType, isPrivate?1:0, 'maya', mayaReply, entropy]
-  ) : Promise.resolve());
-
-  const saveOld = () => db.execute(
-    `INSERT INTO maya_memory (discord_user_id, user_name, guild_id, sender, message, entropy)
-     VALUES (?,?,?,'user',?,?)`, [userId, prefName, guildId||null, userMsg, entropy]
-  ).then(() => mayaReply ? db.execute(
-    `INSERT INTO maya_memory (discord_user_id, user_name, guild_id, sender, message, entropy)
-     VALUES (?,?,?,'maya',?,?)`, [userId, prefName, guildId||null, mayaReply, entropy]
-  ) : Promise.resolve());
-
-  saveNew().catch(() => saveOld().catch(e => console.error('[handler] save:', e.message)));
-}

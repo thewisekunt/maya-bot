@@ -20,6 +20,8 @@
  */
 
 import db from './db.js';
+import { retrainFromDB } from './nlp.js';
+import { updateSlowDrift } from './psyche.js';
 import { embed, embedBatch } from './embedder.js';
 import { upsertMemory, upsertBatch, isConfigured } from './vector.js';
 import axios from 'axios';
@@ -40,7 +42,7 @@ export function startDreamLoop() {
     console.log('[dream] Qdrant not configured — dream loop disabled');
     return;
   }
-  _timer = setInterval(() => _runEmbedPass('timer'), DREAM_INTERVAL_MS);
+  _timer = setInterval(() => _dreamCycle(), DREAM_INTERVAL_MS);
   console.log(`[dream] loop started (interval=${DREAM_INTERVAL_MS/60000}min, threshold=${MSG_THRESHOLD})`);
 }
 
@@ -274,6 +276,33 @@ Rules:
   }
 }
 
+// ── Full dream cycle: embed + NLP retrain ────────────────────────────────────
+
+async function _dreamCycle() {
+  if (_running) return;
+  _running = true;
+  const start = Date.now();
+  console.log('[dream] cycle started (timer)');
+  try {
+    // Phase 1: embed pending messages
+    await _runEmbedPass('cycle');
+    // Phase 2: retrain NLP with accumulated examples
+    const newExamples = await retrainFromDB();
+    if (newExamples > 0) {
+      console.log(`[dream] NLP retrained with ${newExamples} new examples`);
+    }
+    // Phase 3: update Maya's slow personality drift from mood snapshots
+    await updateSlowDrift().catch(e => console.error('[dream] drift update:', e.message));
+    // Phase 4: memory decay — weaken memories not recalled recently
+    await _runMemoryDecay().catch(e => console.error('[dream] memory decay:', e.message));
+  } catch (e) {
+    console.error('[dream] cycle error:', e.message);
+  } finally {
+    _running = false;
+    console.log(`[dream] cycle done in ${Date.now() - start}ms`);
+  }
+}
+
 // ── Raw message embed pass (time/volume triggered) ────────────────────────────
 
 async function _runEmbedPass(trigger) {
@@ -336,4 +365,41 @@ async function _runEmbedPass(trigger) {
 function _parseJson(str, fallback) {
   if (!str) return fallback;
   try { return JSON.parse(str); } catch { return fallback; }
+}
+
+// ── Memory decay ─────────────────────────────────────────────────────────────
+// Memories that haven't been recalled recently fade in strength.
+// If strength drops below 0.1 after 30+ days without recall → discard.
+// Formula: strength *= e^(-λt)  where λ=0.05/day
+
+async function _runMemoryDecay() {
+  try {
+    // Decay maya_facts (user facts and self traits)
+    const [factResult] = await db.execute(
+      `UPDATE maya_facts
+       SET memory_strength = GREATEST(
+         memory_strength * EXP(-0.05 * DATEDIFF(NOW(), COALESCE(last_recalled, updated_at))),
+         0.05
+       )
+       WHERE last_recalled < DATE_SUB(NOW(), INTERVAL 3 DAY)
+          OR (last_recalled IS NULL AND updated_at < DATE_SUB(NOW(), INTERVAL 3 DAY))`
+    );
+
+    // Discard facts that have faded below threshold and haven't been recalled in 30 days
+    const [deleteResult] = await db.execute(
+      `DELETE FROM maya_facts
+       WHERE memory_strength < 0.10
+         AND (last_recalled < DATE_SUB(NOW(), INTERVAL 30 DAY)
+              OR (last_recalled IS NULL AND updated_at < DATE_SUB(NOW(), INTERVAL 30 DAY)))`
+    );
+
+    if (deleteResult.affectedRows > 0) {
+      console.log(`[dream] memory decay: removed ${deleteResult.affectedRows} faded memories`);
+    }
+    if (factResult.affectedRows > 0) {
+      console.log(`[dream] memory decay: weakened ${factResult.affectedRows} memories`);
+    }
+  } catch (e) {
+    console.error('[dream] memory decay error:', e.message);
+  }
 }

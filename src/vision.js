@@ -60,11 +60,33 @@ export async function extractMediaContext(msg) {
 
   // ── Stickers ──────────────────────────────────────────────────────────────
   for (const s of msg.stickers.values()) {
-    otherMedia.push(`[used sticker: "${s.name}"]`);
+    const meaning = _interpretSticker(s.name, s.description || '');
+    otherMedia.push(meaning);
   }
 
   // ── Embeds ────────────────────────────────────────────────────────────────
   for (const embed of msg.embeds) {
+    const url  = embed.url || embed.video?.url || '';
+    const isGif = url.includes('tenor.com') || url.includes('giphy.com')
+               || embed.type === 'gifv';
+
+    if (isGif) {
+      // GIFs have a static thumbnail/image — try to describe that visually
+      // rather than just extracting the name from the URL
+      const thumbUrl = embed.thumbnail?.url || embed.image?.url || null;
+      if (thumbUrl) {
+        // Queue the thumbnail for vision description
+        imageJobs.push({
+          url:    thumbUrl,
+          name:   'GIF thumbnail',
+          size:   0,
+          isGif:  true,
+          gifName: _extractGifName(embed),
+        });
+        continue;  // skip _summariseEmbed for this one — vision will handle it
+      }
+    }
+
     const s = _summariseEmbed(embed);
     if (s) embedSummaries.push(s);
   }
@@ -100,7 +122,8 @@ export async function extractMediaContext(msg) {
  *   described=true  → LLM actually saw and described the image
  *   described=false → fallback label only, LLM should not speculate
  */
-async function _describeImage({ url, name, size }) {
+async function _describeImage(j) {
+  const { url, name, size } = j;
   const fallback = { text: `[image attached: could not view]`, described: false };
 
   // Skip huge images
@@ -144,9 +167,11 @@ async function _describeImage({ url, name, size }) {
             },
             {
               type: 'text',
-              text: 'Describe this image in 1–2 sentences. Be factual and specific. '
-                  + 'If it\'s a meme, describe what is shown and the text/joke. '
-                  + 'Do not guess or assume anything not visible.',
+              text: j.isGif
+                ? `This is a frame from a GIF${j.gifName ? ' called "' + j.gifName + '"' : ''}. Describe the emotion or action in 1 sentence.`
+                : 'Describe this image in 1–2 sentences. Be factual and specific. '
+                + 'If it\'s a meme, describe what is shown and the text/joke. '
+                + 'Do not guess or assume anything not visible.',
             },
           ],
         }],
@@ -174,12 +199,98 @@ async function _describeImage({ url, name, size }) {
     if (!desc) return fallback;
 
     console.log(`[vision] described "${name}": ${desc.slice(0, 100)}`);
-    return { text: `[image: ${desc}]`, described: true };
+    const label = j.isGif ? `[GIF: ${desc}]` : `[image: ${desc}]`;
+    return { text: label, described: true };
 
   } catch (err) {
     console.warn(`[vision] LLM call failed for ${name}:`, err.message);
     return fallback;
   }
+}
+
+
+// ── Sticker interpretation ─────────────────────────────────────────────────────
+
+// Discord default sticker names → emotional meaning
+// Covers Wumpus pack, Pepe pack, and common custom names
+const STICKER_MEANINGS = {
+  // Wumpus / Discord default stickers
+  'wave':           '[waving hello]',
+  'woah':           '[surprised/shocked]',
+  'yes':            '[nodding yes / agreeing]',
+  'no':             '[shaking head no / disagreeing]',
+  'sad':            '[feeling sad]',
+  'angry':          '[annoyed/angry]',
+  'lol':            '[laughing]',
+  'cool':           '[being cool / thumbs up]',
+  'heart':          '[sending love/affection]',
+  'sleep':          '[sleepy / bored]',
+  'think':          '[thinking / hmm]',
+  'clap':           '[clapping / nice job]',
+  'fire':           '[fire / this is hot]',
+  'dead':           '[dead/overwhelmed (comically)]',
+  'skull':          '[dead/overwhelmed (comically)]',
+  'sob':            '[crying hard]',
+  'pog':            '[excited / impressive]',
+  'monkastare':     '[staring intensely]',
+  'pepehappy':      '[happy Pepe]',
+  'pepesad':        '[sad Pepe]',
+  'pepelaugh':      '[laughing Pepe]',
+  'pepeclap':       '[clapping Pepe]',
+  'pepeangry':      '[angry Pepe]',
+  'pepelove':       '[loving Pepe]',
+  'annoyed':        '[annoyed/done with this]',
+  'confused':       '[confused/what?]',
+  'shrug':          '[shrugging / idk]',
+  'ok':             '[ok / fine]',
+  'wow':            '[wow / amazed]',
+  'pain':           '[pain / suffering]',
+  'gg':             '[good game / well played]',
+  'goodnight':      '[goodnight / sleeping]',
+  'goodmorning':    '[good morning]',
+  'hype':           '[hyped / excited]',
+  'rip':            '[RIP / rest in peace]',
+};
+
+function _interpretSticker(name, description) {
+  const key = name.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  // Exact match
+  if (STICKER_MEANINGS[key]) {
+    return `[sticker: ${name} — ${STICKER_MEANINGS[key].replace(/[\[\]]/g, '')}]`;
+  }
+
+  // Partial match — find first key that appears in name
+  for (const [k, meaning] of Object.entries(STICKER_MEANINGS)) {
+    if (key.includes(k) || k.includes(key)) {
+      return `[sticker: ${name} — ${meaning.replace(/[\[\]]/g, '')}]`;
+    }
+  }
+
+  // Unknown sticker — use description if available, else just name
+  if (description && description.length > 2) {
+    return `[sticker: "${name}" (${description})]`;
+  }
+  return `[sticker: "${name}"]`;
+}
+
+
+// ── GIF name extractor (for prompt context) ────────────────────────────────────
+function _extractGifName(embed) {
+  const url = embed.url || embed.video?.url || '';
+  if (embed.title) {
+    return embed.title.replace(/gif|tenor|giphy/gi, '').trim();
+  }
+  const slugMatch = url.match(/\/view\/([^/?#]+)/) || url.match(/\/gifs\/([^/?#]+)/);
+  if (slugMatch) {
+    return slugMatch[1]
+      .replace(/-gif-\d+$/, '')
+      .replace(/-\w{8,}$/, '')
+      .replace(/-/g, ' ')
+      .replace(/\d+$/, '')
+      .trim();
+  }
+  return '';
 }
 
 // ── Embed summariser ──────────────────────────────────────────────────────────
@@ -188,18 +299,52 @@ function _summariseEmbed(embed) {
   const parts   = [];
   const url     = embed.url || embed.video?.url || '';
   const prov    = (embed.provider?.name || '').toLowerCase();
+  const isGif   = url.includes('tenor.com') || url.includes('giphy.com')
+               || embed.type === 'gifv' || (embed.title || '').toLowerCase().includes('gif');
 
   let platform = 'link';
-  if (prov.includes('youtube') || url.includes('youtu'))       platform = 'YouTube video';
+  if (prov.includes('youtube') || url.includes('youtu'))        platform = 'YouTube video';
   else if (prov.includes('spotify') || url.includes('spotify')) platform = 'Spotify track';
   else if (url.includes('twitter.com') || url.includes('x.com')) platform = 'Tweet';
   else if (url.includes('instagram.com'))  platform = 'Instagram post';
   else if (url.includes('reddit.com'))     platform = 'Reddit post';
   else if (url.includes('github.com'))     platform = 'GitHub link';
-  else if (url.includes('tenor.com') || url.includes('giphy.com')) platform = 'GIF';
+  else if (isGif)                          platform = 'GIF';
   else if (embed.type === 'image')         platform = 'image link';
   else if (embed.type === 'video')         platform = 'video';
   else if (prov)                           platform = prov;
+
+  // ── GIF context extraction ─────────────────────────────────────────────────
+  // Tenor/Giphy embed titles are usually the GIF name and carry meaning
+  // Tenor URL slug: tenor.com/view/some-words-here-gif-12345
+  // Giphy URL slug: giphy.com/gifs/some-words-here-AbCd123
+  if (isGif) {
+    // Title is most reliable (Discord usually sets it)
+    const gifTitle = embed.title || embed.description || '';
+    if (gifTitle && gifTitle.length > 2) {
+      const clean = gifTitle.replace(/gif|tenor|giphy/gi, '').trim();
+      if (clean.length > 2) {
+        parts.push(`[GIF: ${clean}]`);
+        return parts.join('\n');
+      }
+    }
+    // Fall back to URL slug parsing
+    const slugMatch = url.match(/\/view\/([^/?#]+)/) || url.match(/\/gifs\/([^/?#]+)/);
+    if (slugMatch) {
+      const slug = slugMatch[1]
+        .replace(/-gif-\d+$/, '')          // strip trailing -gif-12345
+        .replace(/-\w{8,}$/, '')           // strip Giphy hash
+        .replace(/-/g, ' ')                // dashes to spaces
+        .replace(/\d+$/, '')              // strip trailing numbers
+        .trim();
+      if (slug.length > 2) {
+        parts.push(`[GIF: ${slug}]`);
+        return parts.join('\n');
+      }
+    }
+    parts.push('[GIF sent]');
+    return parts.join('\n');
+  }
 
   if (embed.title) {
     parts.push(`[${platform}: "${embed.title}"${url ? ` — ${url}` : ''}]`);
