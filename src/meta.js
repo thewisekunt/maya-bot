@@ -147,6 +147,7 @@ export async function runMeta(snapshot) {
     userBeliefs,
     selfBeliefs,
     trigger,
+    refContext = null,
   } = snapshot;
 
   // Build a compact state description for the meta prompt
@@ -170,7 +171,7 @@ Your job is to evaluate whether Maya's response is right for this moment.
 ${prefName} said: "${message}"
 Maya was about to say: "${primaryReply}"
 
-─── MAYA'S STATE ───
+${refContext ? `[Referenced thread: ${refContext}]\nConsider: user may be asking about this topic, not the current message.\n\n` : ''}─── MAYA'S STATE ───
 Entropy (emotional chaos): ${entropy.toFixed(1)}/10
 Emotions: ${emotionDesc}
 Internal state: ${monologue || 'unclear'}

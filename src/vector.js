@@ -56,14 +56,21 @@ export async function ensureCollection() {
   // Check if collection exists
   const check = await q.get(`/collections/${COLLECTION}`);
   if (check.status === 200) {
-    // Collection exists — but verify memory_type index exists
-    // (older collections may be missing it)
+    // Collection exists — verify ALL required indexes are present
     const schema = check.data?.result?.payload_schema || {};
-    if (!schema.memory_type) {
-      await q.put(`/collections/${COLLECTION}/index`, {
-        field_name: 'memory_type', field_schema: 'keyword',
-      }).catch(() => {});
-      console.log(`[vector] Collection "${COLLECTION}" ready ✓ (memory_type index added)`);
+    const required = [
+      { field_name: 'memory_type',     field_schema: 'keyword' },
+      { field_name: 'sender',          field_schema: 'keyword' },
+      { field_name: 'discord_user_id', field_schema: 'keyword' },
+      { field_name: 'guild_id',        field_schema: 'keyword' },
+      { field_name: 'is_private',      field_schema: 'bool'    },
+    ];
+    const missing = required.filter(f => !schema[f.field_name]);
+    if (missing.length > 0) {
+      for (const idx of missing) {
+        await q.put(`/collections/${COLLECTION}/index`, idx).catch(() => {});
+      }
+      console.log(`[vector] Collection "${COLLECTION}" ready ✓ (added indexes: ${missing.map(f => f.field_name).join(', ')})`);
     } else {
       console.log(`[vector] Collection "${COLLECTION}" ready ✓`);
     }
@@ -102,8 +109,10 @@ export async function ensureCollection() {
       field_schema: 'keyword',
     });
     await q.put(`/collections/${COLLECTION}/index`, {
-      field_name: 'memory_type',
-      field_schema: 'keyword',
+      field_name: 'memory_type', field_schema: 'keyword',
+    });
+    await q.put(`/collections/${COLLECTION}/index`, {
+      field_name: 'sender', field_schema: 'keyword',
     });
     return true;
   }

@@ -36,28 +36,42 @@ export async function getReferencedContext(msg, botId) {
     const ref = await msg.channel.messages.fetch(msg.reference.messageId);
     if (!ref) return null;
 
-    // Skip if it's just a reply to Maya's own message (normal flow)
-    if (ref.author.id === botId) return null;
+    const refIsMaya = ref.author.id === botId;
+    const who       = refIsMaya ? 'Maya' : (ref.member?.displayName || ref.author?.username || 'someone');
+    const content   = ref.content?.slice(0, 400) || '[media/embed]';
+    const ts        = _relativeTime(ref.createdAt);
 
-    const who     = ref.member?.displayName || ref.author?.username || 'someone';
-    const content = ref.content?.slice(0, 500) || '[media/embed]';
-    const ts      = _relativeTime(ref.createdAt);
+    // Build the chain — we want to understand the TOPIC being referenced
+    // not just the single message
+    const chain = [];
+    chain.push({ who, content, ts, isMaya: refIsMaya });
 
-    let ctx = `[Tagged context — ${who} said ${ts}: "${content}"`;
-
-    // If the referenced message ALSO has a reference (chain), fetch one more level
+    // Fetch one level deeper to get topic context
     if (ref.reference?.messageId) {
       try {
         const ref2 = await msg.channel.messages.fetch(ref.reference.messageId);
-        if (ref2 && ref2.content) {
-          const who2 = ref2.member?.displayName || ref2.author?.username || 'someone';
-          ctx += ` (replying to ${who2}: "${ref2.content.slice(0, 200)}")`;
+        if (ref2?.content) {
+          const who2   = ref2.author.id === botId ? 'Maya' : (ref2.member?.displayName || ref2.author?.username || 'someone');
+          const ts2    = _relativeTime(ref2.createdAt);
+          chain.unshift({ who: who2, content: ref2.content.slice(0, 300), ts: ts2, isMaya: ref2.author.id === botId });
         }
       } catch { /* non-fatal */ }
     }
 
-    ctx += ']';
-    return ctx;
+    // Format the chain clearly
+    const chainText = chain
+      .map(m => `${m.who} [${m.ts}]: "${m.content}"`)
+      .join(' → ');
+
+    // Determine likely intent of the tag
+    // If user is tagging Maya in a reply to someone else's message,
+    // they probably want Maya's opinion on that topic
+    const isTaggingForOpinion = !refIsMaya && msg.mentions?.has({ id: botId });
+    const intentHint = isTaggingForOpinion
+      ? 'Note: user is likely asking for Maya\'s view on the referenced topic, not just the current message.'
+      : '';
+
+    return `[Referenced thread — ${chainText}${intentHint ? ' ' + intentHint : ''}]`;
 
   } catch { return null; }
 }
