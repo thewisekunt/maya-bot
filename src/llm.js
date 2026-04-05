@@ -81,6 +81,9 @@ export async function getMayaReply({
   sentiment      = 'neutral',
   sentimentScore = 0,
   channelId      = null,
+  currentMoment  = null,  // synthesized prose paragraph from moment.js
+  momentum       = 0,     // conversation momentum score 0–10
+  lastExchangeQuality = 'none',
 }) {
   // ── Build system prompt ───────────────────────────────────────────────────
   // When forceVerbal: strip REACT instruction entirely so the model never
@@ -114,8 +117,9 @@ export async function getMayaReply({
       parts.push(`Your current state: ${toneParts.join(', ')}.`);
     }
 
-    // Tone hints from emotional architecture (what leaks through the mask)
-    if (toneHints && toneHints.length > 0) {
+    // Tone hints replaced by currentMoment paragraph in user prompt
+    // Keeping this as fallback for non-handler calls
+    if (!currentMoment && toneHints && toneHints.length > 0) {
       parts.push(`Emotional subtext (expressed subtly through tone, not stated directly): ${toneHints}`);
     }
 
@@ -172,23 +176,20 @@ export async function getMayaReply({
 
   // Internal monologue — Maya's current inner thought before replying
   // Injected as a bracketed note so LLM sees her perspective but doesn't quote it
-  // Internal monologue = what Maya actually feels, not necessarily what she'll say
-  // Internal monologue injected as a brief system-level framing line
-  // Kept very short and non-instructional so the model doesn't start reasoning aloud
-  const monologueNote = psycheState?.monologue
-    ? `(feeling: ${psycheState.monologue})\n`
-    : '';
+  // Current moment paragraph — synthesized prose the LLM inhabits, not parses
+  // Replaces scattered monologue + toneHints with one coherent emotional register
+  const momentNote = currentMoment
+    ? `${currentMoment}\n\n`
+    : (psycheState?.monologue ? `(feeling: ${psycheState.monologue})\n\n` : '');
 
-  // Format: show who is speaking clearly so Maya never confuses speakers
-  // Avoid pure completion format ("Maya:") which encourages chatbot patterns
-  // Referenced message context — what they tagged/replied to
+  // Emotional presence — who Maya is thinking about (separate from moment)
+  const emotionNote = emotionalCtx ? `${emotionalCtx}\n` : '';
+
+  // Referenced thread context
   const refNote = refContext ? `${refContext}\n\n` : '';
 
-  // Emotional presence — who Maya is thinking about right now
-  const emotionNote = emotionalCtx ? `${emotionalCtx}\n\n` : '';
-
   const userPrompt =
-    monologueNote +
+    momentNote +
     emotionNote +
     (contextTrunc ? `Recent conversation:\n${contextTrunc}\n\n` : '') +
     refNote +
@@ -310,9 +311,16 @@ export async function getMayaReply({
           ? await detectBeliefConflict(userId, sentiment, sentimentScore, trustLevel).catch(() => false)
           : false;
 
+        // Predicted landing check — does this reply honor current momentum?
+        const { predictLanding: predictL } = await import('./moment.js');
+        const landing     = predictL(cleaned, momentum, lastExchangeQuality);
+        const breaksMomentum = landing.breaks && momentum >= 5;
+
         const { activate, trigger, weight } = shouldActivateMeta({
           entropy, emotions, trustLevel, attachmentScore,
-          sentiment, sentimentScore, beliefConflict, primaryReply: cleaned,
+          sentiment, sentimentScore, beliefConflict,
+          primaryReply: cleaned,
+          breaksMomentum,
         });
 
         if (activate) {
@@ -333,6 +341,7 @@ export async function getMayaReply({
             userBeliefs,
             selfBeliefs,
             trigger,
+            refContext,
           });
 
           // Log meta decision for learning

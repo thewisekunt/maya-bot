@@ -71,9 +71,12 @@ export function shouldActivateMeta({
   sentimentScore  = 0,
   beliefConflict  = false,
   primaryReply    = '',
+  breaksMomentum  = false,  // predicted landing breaks current momentum
 }) {
   // Fast path: clearly casual, skip meta
-  if (entropy < ENTROPY_THRESHOLD &&
+  // But NOT if predicted landing breaks momentum — that always needs checking
+  if (!breaksMomentum &&
+      entropy < ENTROPY_THRESHOLD &&
       (emotions.irritation || 0) < IRRITATION_THRESHOLD &&
       sentiment !== 'negative' &&
       !beliefConflict) {
@@ -115,6 +118,12 @@ export function shouldActivateMeta({
   if (primaryReply.trim().split(' ').length <= 3 && entropy > 3) {
     weight  = Math.max(weight, 0.5);
     trigger = trigger || 'possibly_dismissive';
+  }
+
+  // Response breaks current conversation momentum — check it
+  if (breaksMomentum) {
+    weight  = Math.max(weight, 0.75);
+    trigger = trigger || 'breaks_momentum';
   }
 
   // Stochastic element: at medium weight, 40% chance to skip (prevents mechanicalness)
@@ -182,12 +191,17 @@ Meta trigger: ${trigger}
 ─── BELIEFS ───
 ${beliefCtx}
 
-─── EVALUATION TASK ───
+${trigger === 'breaks_momentum' ? `─── MOMENTUM WARNING ───
+The conversation had real energy. This response risks breaking it.
+Ask: does this reply honor what just happened, or reset to zero?
+
+` : ''}─── EVALUATION TASK ───
 Consider:
 1. Does the response match her emotional state authentically?
 2. Is she being too harsh, too soft, or performative?
 3. Given her attachment/trust, could this cause regret or distance?
-4. Is there a more real response — not better, just more her?
+4. Does the response honor the current energy of the conversation?
+5. Is there a more real response — not better, just more her?
 
 Return ONLY valid JSON:
 {

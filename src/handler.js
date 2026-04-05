@@ -17,6 +17,7 @@ import { estimateEntropy, estimateEntropyFast, getEntropyZone, getKnownNames, ge
          upsertUser, detectNameSet, getFrequentInteractors } from './persona.js';
 import { getMayaReply } from './llm.js';
 import { shouldDeliberate, deliberate, webSearch } from './think.js';
+import { getMomentum, updateMomentum, synthesizeMoment, predictLanding, isReactionMessage, getMomentumZone } from './moment.js';
 import { getReferencedContext, getScopedFacts, getUserGenderAndRoles, syncMemberRoles, getEmotionalContext, clearEmotionFor, inferGenderFromText } from './context_enricher.js';
 import { saveNotification, markReplied } from './inbox.js';
 import { resolveEntities, buildEntityContext, isAddressedToOther, indexMember } from './entity.js';
@@ -176,6 +177,23 @@ export async function handleMessage({
   ).catch(() => [[{ avg_entropy: 0.4 }]]);
   const avgEntropy = parseFloat(relRow?.avg_entropy || 0.4);
 
+  // ── Momentum update ─────────────────────────────────────────────────────
+  // Update before psyche so synthesizer has current momentum
+  const msgTimestamp   = msg?.createdTimestamp || Date.now();
+  const lastMayaReplyTs = msg?.channel?._mayaLastReplyTs || 0;
+  const responseTime   = msgTimestamp - lastMayaReplyTs;
+  const isReactive     = isReactionMessage(richMessageText);
+
+  updateMomentum(channelId, {
+    userEntropy:    0.5,  // will be updated with real entropy below
+    responseTime,
+    sentiment:      nlpSignal.sentiment,
+    sentimentScore: nlpSignal.sentimentScore,
+    isReactionMsg:  isReactive,
+    reciprocal:     !['directed_at_other', 'group_chatter'].includes(nlpSignal.intent),
+  });
+  const momentum = getMomentum(channelId);
+
   // Full entropy computation with all five signal sources
   const entropy = estimateEntropy({
     text:          richMessageText,
@@ -204,6 +222,25 @@ export async function handleMessage({
     selfTraits:    [],
     sessionId:     null,
   }).catch(() => ({ energy: 0.5, warmth: 0.6, seriousness: 0.4, monologue: '' }));
+
+  // ── Current moment synthesis ─────────────────────────────────────────────
+  // Replaces scattered monologue + toneHints with a single coherent paragraph
+  // that the LLM can inhabit rather than parse
+  const { zone: mZone } = getMomentumZone(momentum);
+  const lastExchangeQuality = isReactive ? 'high' : momentum > 5 ? 'mid' : 'low';
+
+  const currentMoment = synthesizeMoment({
+    hormones:            psycheState?.hormones || {},
+    emotions:            psycheState?.emotions || {},
+    entropy:             psycheState?.entropy  || 0,
+    momentum,
+    trustLevel,
+    attachmentScore:     psycheState?.attachment || 0.3,
+    prefName,
+    lastExchangeQuality,
+    emotionalPresence:   null,  // filled by emotionalCtx below
+    maskFailing:         psycheState?.maskFailing || false,
+  });
 
   // ── 8b. Image generation shortcut ────────────────────────────────────────
   // Check before salience — image requests always get handled if Maya is addressed
@@ -456,6 +493,10 @@ export async function handleMessage({
     attachmentScore: psycheState?.attachment || 0.3,
     sentiment:       nlpSignal?.sentiment    || 'neutral',
     sentimentScore:  nlpSignal?.sentimentScore || 0,
+    currentMoment,
+    momentum,
+    lastExchangeQuality,
+    refContext,
   });
 
   // Meta layer may have suppressed the response
@@ -500,6 +541,11 @@ export async function handleMessage({
     intent:         nlpSignal?.intent         || 'group_chatter',
   });
   debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: savedReply });
+
+  // Update momentum with reply quality and store last reply timestamp
+  if (result?.type === 'reply' && channelId && msg?.channel) {
+    msg.channel._mayaLastReplyTs = Date.now();
+  }
 
   // Mark notification as replied if we had one
   // (notifId passed from index.js via msg metadata — non-fatal if missing)
