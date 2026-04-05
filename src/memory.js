@@ -21,8 +21,8 @@ import { notifyNewMessage } from './dream.js';
 import { getSessionContext } from './stm.js';
 
 const SQL_LIMIT  = 5;
-const VEC_LIMIT  = 5;
-const THRESHOLD  = 0.68;
+const VEC_LIMIT  = 6;  // user facts
+const THRESHOLD  = 0.30;  // raw Discord messages score low — casual text similarity is ~0.35-0.55
 
 // Schema cache
 let _newSchema = null;
@@ -132,22 +132,79 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
 
   // ── Semantic layers (only if Qdrant configured and have a query) ──────────
   if (isConfigured() && currentMessage) {
+    console.log(`[memory] vector search — userId=${userId} guildId=${guildId} isDM=${isDM} query="${currentMessage?.slice(0,40)}"`);
     let queryVec;
-    try { queryVec = await embed(currentMessage); } catch { return parts.join('\n'); }
+    try {
+      queryVec = await embed(currentMessage);
+    } catch (e) {
+      console.error('[memory] embed failed, skipping vector recall:', e.message);
+      return parts.join('\n');
+    }
 
-    const userFilter = _typeFilter(userId, 'user_fact', isDM, guildId);
-    const convFilter = _typeFilter(userId, 'conversation', isDM, guildId);
-    const selfFilter = { must: [{ key: 'memory_type', match: { value: 'maya_self' } }] };
+    // Use FLAT filters only — no nested should inside must
+    // Qdrant version compatibility: nested should inside must is unreliable
+    // Strategy: run separate searches for each type, merge results in JS
+
+    // User facts: this specific user's messages (scoped to guild if available)
+    // Exclude sender='maya' — her own messages aren't facts ABOUT the user
+    const userMust = [
+      { key: 'memory_type', match: { value: 'raw_message' } },
+      { key: 'discord_user_id', match: { value: String(userId) } },
+      { key: 'sender', match: { value: 'user' } },  // exclude Maya's replies
+    ];
+    if (guildId) userMust.push({ key: 'guild_id', match: { value: String(guildId) } });
+    const userRawFilter = { must: userMust };
+
+    // Conversation: all guild messages for semantic recall
+    // If no guildId (shouldn't happen in server but guard anyway), fall back to user-scoped
+    let activeConvFilter;
+    if (isDM) {
+      activeConvFilter = { must: [
+        { key: 'memory_type',     match: { value: 'raw_message' } },
+        { key: 'discord_user_id', match: { value: String(userId) } },
+        { key: 'sender', match: { value: 'user' } },
+      ]};
+    } else if (guildId) {
+      activeConvFilter = { must: [
+        { key: 'memory_type', match: { value: 'raw_message' } },
+        { key: 'guild_id',    match: { value: String(guildId) } },
+      ]};
+    } else {
+      // No guild — search all raw messages for this user
+      activeConvFilter = { must: [
+        { key: 'memory_type',     match: { value: 'raw_message' } },
+        { key: 'discord_user_id', match: { value: String(userId) } },
+      ]};
+    }
+
+    const selfFilter = { must: [
+      { key: 'memory_type', match: { value: 'maya_self' } },
+    ]};
 
     const [userFacts, convMems, selfTraitsVec] = await Promise.all([
-      searchMemories(queryVec, userFilter, VEC_LIMIT, THRESHOLD).catch(() => []),
-      searchMemories(queryVec, convFilter, 3,         THRESHOLD).catch(() => []),
-      searchMemories(queryVec, selfFilter, 3,         THRESHOLD).catch(() => []),
+      searchMemories(queryVec, userRawFilter, VEC_LIMIT, THRESHOLD)
+        .catch(e => { console.error('[memory] userFacts search:', e.message); return []; }),
+      searchMemories(queryVec, activeConvFilter, 6, THRESHOLD)
+        .catch(e => { console.error('[memory] conv search:', e.message); return []; }),
+      searchMemories(queryVec, selfFilter, 3, THRESHOLD)
+        .catch(e => { console.error('[memory] self search:', e.message); return []; }),
     ]);
 
+    // Deduplicate conv results that already appear in userFacts
+    const userFactIds = new Set(userFacts.map(f => f.payload?.mysql_id));
+    const dedupedConv = convMems.filter(m => !userFactIds.has(m.payload?.mysql_id));
+
+    console.log(`[memory] vector recall: userFacts=${userFacts.length} conv=${dedupedConv.length} self=${selfTraitsVec.length} threshold=${THRESHOLD}`);
+
+    // Swap convMems reference for deduped version
+    const convMemsFinal = dedupedConv;
+
     if (userFacts.length > 0) {
-      parts.push(`--- What Maya knows about ${prefName} ---`);
-      userFacts.forEach(f => parts.push(`• ${f.payload?.fact_text || f.message}`));
+      parts.push(`--- What Maya knows about ${prefName} (from memory) ---`);
+      userFacts.forEach(f => {
+        const text = f.payload?.fact_text || f.message;
+        if (text) parts.push(`• ${text}`);
+      });
       parts.push('');
     }
 
@@ -157,9 +214,22 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
       parts.push('');
     }
 
-    if (convMems.length > 0) {
-      parts.push('--- Past relevant context ---');
-      convMems.forEach(c => parts.push(c.message));
+    if (convMemsFinal.length > 0) {
+      parts.push('--- Semantically relevant past context ---');
+      convMemsFinal.forEach(mem => {
+        const ts = mem.payload?.created_at
+          ? _relativeTime(new Date(mem.payload.created_at))
+          : '';
+        const tsTag = ts ? ` [${ts}]` : '';
+        // Raw messages already include speaker prefix ("Mario: hello")
+        // Dream summaries are standalone sentences
+        const isDreamOrSummary = mem.payload?.memory_type === 'conversation';
+        if (isDreamOrSummary) {
+          parts.push(`• ${mem.message}${tsTag}`);
+        } else {
+          parts.push(`  ${mem.message}${tsTag}  (score: ${mem.score.toFixed(2)})`);
+        }
+      });
       parts.push('');
     }
   }
@@ -213,18 +283,53 @@ function _relativeTime(date) {
 }
 
 function _typeFilter(userId, memoryType, isDM, guildId) {
-  // For DMs: don't filter by is_private — allow recall of server memories too
-  // so Maya remembers what was said in the server when talking in DMs.
-  // Private (DM) messages are always stored with is_private=true but we
-  // can show server memories in DMs — they're not sensitive.
-  const must = [
-    { key: 'memory_type',     match: { value: memoryType } },
-    { key: 'discord_user_id', match: { value: userId } },
-  ];
-  if (!isDM && guildId) {
-    must.push({ key: 'guild_id', match: { value: guildId } });
+  // All 7988 points use memory_type='raw_message'.
+  // Dream summaries use 'conversation' or 'user_fact' (far fewer).
+  // We always include raw_message in the search.
+
+  if (memoryType === 'user_fact') {
+    // User facts: must be about this specific user
+    // Include both processed facts AND raw messages from this user
+    const must = [
+      { should: [
+          { key: 'memory_type', match: { value: 'user_fact' } },
+          { key: 'memory_type', match: { value: 'raw_message' } },
+      ]},
+      { should: [
+          { key: 'discord_user_id', match: { value: userId } },
+          { key: 'discord_user_id', match: { value: 'maya' } },
+      ]},
+    ];
+    if (!isDM && guildId) {
+      must.push({ key: 'guild_id', match: { value: guildId } });
+    }
+    return { must };
   }
-  return { must };
+
+  if (memoryType === 'conversation') {
+    // Conversational recall: all messages in this guild (not user-specific)
+    // This is what gives semantic depth — any message from any user
+    const must = [
+      { should: [
+          { key: 'memory_type', match: { value: 'conversation' } },
+          { key: 'memory_type', match: { value: 'raw_message' } },
+      ]},
+    ];
+    if (!isDM && guildId) {
+      // Server: scope to guild so we don't leak other servers
+      must.push({ key: 'guild_id', match: { value: guildId } });
+    } else if (isDM) {
+      // DM: scope to messages involving this user (their msgs + Maya's replies to them)
+      must.push({ should: [
+        { key: 'discord_user_id', match: { value: userId } },
+        { key: 'discord_user_id', match: { value: 'maya' } },
+      ]});
+    }
+    return { must };
+  }
+
+  // maya_self or other: simple type filter
+  return { must: [{ key: 'memory_type', match: { value: memoryType } }] };
 }
 
 async function _getRecentSQL(userId, contextType, guildId, channelId = null) {

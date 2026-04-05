@@ -56,7 +56,17 @@ export async function ensureCollection() {
   // Check if collection exists
   const check = await q.get(`/collections/${COLLECTION}`);
   if (check.status === 200) {
-    console.log(`[vector] Collection "${COLLECTION}" ready ✓`);
+    // Collection exists — but verify memory_type index exists
+    // (older collections may be missing it)
+    const schema = check.data?.result?.payload_schema || {};
+    if (!schema.memory_type) {
+      await q.put(`/collections/${COLLECTION}/index`, {
+        field_name: 'memory_type', field_schema: 'keyword',
+      }).catch(() => {});
+      console.log(`[vector] Collection "${COLLECTION}" ready ✓ (memory_type index added)`);
+    } else {
+      console.log(`[vector] Collection "${COLLECTION}" ready ✓`);
+    }
     return true;
   }
 
@@ -164,18 +174,24 @@ export async function searchMemories(queryVector, filter = {}, limit = 8, scoreT
   const res = await q.post(`/collections/${COLLECTION}/points/search`, body);
 
   if (res.status !== 200) {
-    throw new Error(`searchMemories HTTP ${res.status}: ${JSON.stringify(res.data).slice(0,200)}`);
+    const msg = `searchMemories HTTP ${res.status}: ${JSON.stringify(res.data).slice(0,200)}`;
+    console.error('[vector]', msg);
+    throw new Error(msg);
   }
 
-  return (res.data?.result || []).map(r => ({
-    message:  r.payload.message,
-    sender:   r.payload.sender,
-    userName: r.payload.user_name,
-    isDream:  r.payload.is_dream || false,
-    weight:   r.payload.weight   || 1.0,
-    score:    r.score,
-    payload:  r.payload,
-  }));
+  return (res.data?.result || [])
+    .map(r => ({
+      message:  r.payload.message,
+      sender:   r.payload.sender,
+      userName: r.payload.user_name,
+      isDream:  r.payload.is_dream || false,
+      weight:   r.payload.weight   || 1.0,
+      score:    r.score,
+      // Effective score: similarity × weight — consolidated memories rank higher
+      effectiveScore: r.score * (r.payload.weight || 1.0),
+      payload:  r.payload,
+    }))
+    .sort((a, b) => b.effectiveScore - a.effectiveScore);  // re-rank by weighted score
 }
 
 /**

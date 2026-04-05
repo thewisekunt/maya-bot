@@ -381,6 +381,10 @@ export async function extractAndStoreFact(userId, message) {
   // Too short, pure emoji/reaction, or starts with typical non-fact patterns
   if (wordCount < 4) return;
   if (/^(lol|lmao|haha|ok|okay|k|yep|nope|same|fr|bruh|bro|gg|rip|omg|wtf|damn|nice|cool)/i.test(cleaned)) return;
+  // Skip second-person questions/statements — these are about Maya, not the user
+  if (/^(are you|r u|r you|you are|ur a|you're|is this|is that|what are you)/i.test(cleaned)) return;
+  // Skip if message has no first-person markers — unlikely to contain self-referential facts
+  if (!/(i |i'm|i am|my |me |mine)/i.test(cleaned) && wordCount < 8) return;
 
   // ── Get user's name ───────────────────────────────────────────────────────────
   let userName = 'the user';
@@ -417,12 +421,15 @@ export async function extractAndStoreFact(userId, message) {
 Message: "${cleaned}"
 
 Rules:
-- Only extract facts the speaker states about THEMSELVES (not about others)
-- Rewrite as third-person: "I have a business" → "${userName} has a business"
+- Only extract facts the speaker states about THEMSELVES using "I" or "my"
+- SKIP anything said in second-person ("you are...", "you have...", "are you...") — those are about someone else
+- SKIP questions entirely
+- SKIP statements about Maya/the bot ("are you an AI", "you are a bot")
+- Rewrite first-person to third-person: "I have a business" → "${userName} has a business"
 - Include negations: "I am not a student" → "${userName} is not a student"
 - Categories: occupation | preference | identity | location | relationship
-- Only extract CLEAR, SPECIFIC facts. Skip vague statements.
-- If no facts, return empty array.
+- Only extract CLEAR, SPECIFIC facts about ${userName}. Skip vague or ambiguous statements.
+- If no facts about ${userName}, return empty array.
 
 Respond with ONLY valid JSON, no explanation:
 [{"fact": "...", "category": "..."}]
@@ -704,18 +711,137 @@ export async function getFrequentInteractors(userId, guildId, limit = 3) {
 // ── Entropy helpers ───────────────────────────────────────────────────────────
 
 export function getEntropyZone(entropy) {
-  if (entropy < 0.3) return { zone: 'Restful', line: 'low energy' };
-  if (entropy > 0.7) return { zone: 'Chaos',   line: 'high energy' };
+  // entropy is 0–1 (normalised message entropy)
+  // ch.entropy in psyche is 0–10 (accumulated channel entropy)
+  // This function handles the normalised 0–1 version
+  if (entropy < 0.3)  return { zone: 'Restful',    line: 'low energy' };
+  if (entropy < 0.5)  return { zone: 'Engaged',    line: 'curious and present' };
+  if (entropy < 0.7)  return { zone: 'Conflicted', line: 'something feels complex' };
+  if (entropy > 0.7)  return { zone: 'Chaos',      line: 'high energy' };
   return              { zone: 'Social',  line: 'normal energy' };
 }
 
-export function estimateEntropy(text) {
-  const len          = Math.min(text.length / 200, 1.0);
-  const exclamations = (text.match(/!/g)  || []).length;
-  const questions    = (text.match(/\?/g) || []).length;
-  const caps         = (text.match(/\b[A-Z]{2,}\b/g) || []).length;
-  const score = 0.1 + len * 0.3 + exclamations * 0.06 + questions * 0.04 + caps * 0.04;
-  return Math.min(parseFloat(score.toFixed(2)), 1.0);
+/**
+ * Compute entropy from real signals — not text features.
+ *
+ * Entropy = internal instability from conflicting/uncertain signals.
+ * Scale: 0–1 (normalised). Psyche's channel accumulator scales to 0–10.
+ *
+ * Five sources:
+ *   semantic_uncertainty  — how unclear/ambiguous the message is (NLP confidence)
+ *   emotional_conflict    — mixed signals from user vs their usual pattern
+ *   belief_conflict       — new event contradicts a stored belief
+ *   internal_conflict     — Maya's own hormones pulling opposite directions
+ *   novelty               — unseen pattern, no memory match
+ *
+ * @param {object} signals
+ *   text         {string}   — raw message
+ *   nlpScore     {number}   — NLP classifier confidence (0–1)
+ *   nlpIntent    {string}   — classified intent
+ *   sentiment    {string}   — positive|negative|neutral
+ *   sentimentScore {number} — -1 to +1
+ *   hormones     {object}   — { dopamine, cortisol, oxytocin, serotonin }
+ *   emotions     {object}   — { irritation, affection, curiosity, joy, fear }
+ *   beliefConflict {bool}   — detected contradiction with stored belief
+ *   avgEntropy   {number}   — user's historical entropy baseline (0–1)
+ *   recentMessages {number} — recent message count (novelty signal)
+ */
+export function estimateEntropy({
+  text             = '',
+  nlpScore         = 0.5,
+  nlpIntent        = 'group_chatter',
+  sentiment        = 'neutral',
+  sentimentScore   = 0,
+  hormones         = {},
+  emotions         = {},
+  beliefConflict   = false,
+  avgEntropy       = 0.4,
+  recentMessages   = 5,
+} = {}) {
+
+  // ── 1. Semantic uncertainty (0–1) ─────────────────────────────────────────
+  // Low NLP confidence = unclear message
+  // Very short messages ("ok.", "whatever") are ambiguous
+  // Mixed punctuation = emotional complexity
+  const nlpUncertainty  = 1 - Math.min(nlpScore, 1.0);
+  const wordCount       = text.trim().split(/\s+/).length;
+  const brevityAmbiguity = wordCount <= 2 ? 0.6 : wordCount <= 5 ? 0.3 : 0.0;
+  const mixedSignals    = /\?.*!|!.*\?/.test(text) ? 0.4 : 0.0;
+  const semanticUncertainty = Math.min(
+    (nlpUncertainty * 0.5 + brevityAmbiguity * 0.3 + mixedSignals * 0.2),
+    1.0
+  );
+
+  // ── 2. Emotional conflict (0–1) ────────────────────────────────────────────
+  // User's sentiment contradicts their historical baseline
+  // High irritation + high sentiment score = mixed signal
+  const baselineDeviation = Math.abs(sentimentScore - (avgEntropy * 0.5 - 0.25));
+  const sentimentExtremity = Math.abs(sentimentScore);
+  const intentConflict = (
+    (nlpIntent === 'directed_at_other' && sentiment === 'negative') ||
+    (nlpIntent === 'emotional' && sentiment === 'neutral') ||
+    (nlpIntent === 'question_to_maya' && sentiment === 'negative')
+  ) ? 0.5 : 0.0;
+  const emotionalConflict = Math.min(
+    baselineDeviation * 0.4 + sentimentExtremity * 0.3 + intentConflict * 0.3,
+    1.0
+  );
+
+  // ── 3. Belief conflict (0–1) ───────────────────────────────────────────────
+  // Binary signal from belief system + magnitude from sentiment extremity
+  const beliefConflictScore = beliefConflict
+    ? Math.min(0.5 + sentimentExtremity * 0.5, 1.0)
+    : 0.0;
+
+  // ── 4. Internal state conflict (0–1) ──────────────────────────────────────
+  // Maya's own hormones pulling opposite directions
+  // High oxytocin (bonding) + high cortisol (threat) = classic conflict
+  const d  = hormones.dopamine  || 0.5;
+  const co = hormones.cortisol  || 0.2;
+  const ox = hormones.oxytocin  || 0.5;
+  const ir = emotions.irritation || 0;
+  const af = emotions.affection  || 0;
+
+  const hormoneConflict  = Math.max(0, co - (1 - ox)) * 1.5;  // cortisol vs oxytocin
+  const emotionConflict  = Math.min(ir + af, 1.0) > 0.9       // irritation AND affection
+    ? (ir + af - 0.9) * 5 : 0;
+  const dopamineVsCortisol = co > 0.6 && d < 0.4 ? 0.5 : 0;  // stressed but not engaged
+  const internalConflict = Math.min(
+    hormoneConflict * 0.5 + emotionConflict * 0.3 + dopamineVsCortisol * 0.2,
+    1.0
+  );
+
+  // ── 5. Novelty (0–1) ──────────────────────────────────────────────────────
+  // Unseen pattern: unusual intents, or channel suddenly quiet then busy
+  const unusualIntent = ['random_mention', 'group_chatter', 'directed_at_other'].includes(nlpIntent)
+    ? 0.2 : 0.0;
+  const channelNovelty = recentMessages <= 1 ? 0.4   // sudden message after silence
+                        : recentMessages >= 15 ? 0.3  // unusually busy
+                        : 0.0;
+  const novelty = Math.min(unusualIntent + channelNovelty, 1.0);
+
+  // ── Weighted sum → normalised entropy (0–1) ───────────────────────────────
+  const raw =
+    (semanticUncertainty  * 0.25) +
+    (emotionalConflict    * 0.25) +
+    (beliefConflictScore  * 0.20) +
+    (internalConflict     * 0.15) +
+    (novelty              * 0.15);
+
+  return parseFloat(Math.min(raw, 1.0).toFixed(3));
+}
+
+/**
+ * Legacy single-arg version for callers that only have text.
+ * Falls back to text-feature estimation when signals aren't available.
+ * Gradually migrate callers to the full estimateEntropy({...}) form.
+ */
+export function estimateEntropyFast(text = '') {
+  const len = Math.min(text.length / 200, 1.0);
+  const q   = (text.match(/\?/g) || []).length;
+  const e   = (text.match(/!/g)  || []).length;
+  const caps = (text.match(/\b[A-Z]{2,}\b/g) || []).length;
+  return parseFloat(Math.min(0.1 + len * 0.3 + q * 0.04 + e * 0.06 + caps * 0.04, 1.0).toFixed(2));
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────────

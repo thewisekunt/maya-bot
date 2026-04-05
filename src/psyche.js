@@ -122,6 +122,14 @@ function _getChannel(channelId) {
 // ── Main update ───────────────────────────────────────────────────────────────
 
 /**
+ * Get the current raw channel state (hormones, emotions, entropy).
+ * Used by handler.js to feed internal conflict signals into entropy computation.
+ */
+export function getChannelState(channelId) {
+  return _channels.get(channelId) || null;
+}
+
+/**
  * Process a message through the full emotional architecture.
  * Returns composite state + monologue + tone injection.
  *
@@ -157,7 +165,7 @@ export async function updateState(signals) {
   _updateEmotions(ch, traits);
 
   // ── LAYER 4: Entropy accumulation/decay ───────────────────────────────────
-  _updateEntropy(ch, sentiment, sentimentScore, intent);
+  _updateEntropy(ch, sentiment, sentimentScore, intent, entropy);
 
   // ── LAYER 5: Mask strength ────────────────────────────────────────────────
   const maskStrength = _computeMask(ch.entropy);
@@ -277,21 +285,62 @@ function _updateEmotions(ch, traits) {
 
 // ── Layer 4: Entropy ──────────────────────────────────────────────────────────
 
-function _updateEntropy(ch, sentiment, sentimentScore, intent) {
+/**
+ * Update channel entropy accumulator (0–10 scale) from the normalised
+ * per-message entropy signal plus internal state conflicts.
+ *
+ * The per-message entropy (0–1) from estimateEntropy is the INPUT signal.
+ * ch.entropy is the RUNNING ACCUMULATOR that persists across messages —
+ * it represents how much unresolved tension has built up in this session.
+ *
+ * Entropy zones (ch.entropy):
+ *   0–3   Restful   — confident, fast replies
+ *   4–6   Engaged   — curious, deeper responses (best zone)
+ *   7–8   Conflict  — hesitation, meta layer active
+ *   9–10  Breakdown — suppression possible, mask fails
+ */
+function _updateEntropy(ch, sentiment, sentimentScore, intent, messageEntropy = 0.4) {
   let delta = 0;
 
-  // Conflict signals raise entropy
-  if (sentiment === 'negative' && sentimentScore < -0.4) delta += 1.2;
-  if (ch.emotions.irritation > 0.6 && ch.emotions.affection > 0.5) {
-    delta += 0.8;  // conflict between irritation and affection = inner tension
+  // ── Input from per-message entropy signal ─────────────────────────────────
+  // High entropy messages push the accumulator up
+  // Low entropy messages contribute to decay
+  if (messageEntropy > 0.6) {
+    delta += (messageEntropy - 0.5) * 2.5;  // 0.6→0.25, 0.8→0.75, 1.0→1.25
   }
-  if (intent === 'directed_at_other' && ch.hormones.cortisol > 0.5) delta += 0.4;
 
-  // Natural decay every message
-  delta -= ENTROPY_DECAY;
+  // ── Emotional conflict (internal state) ────────────────────────────────────
+  // These are the strongest entropy sources — internal contradictions
+  const ir = ch.emotions.irritation || 0;
+  const af = ch.emotions.affection  || 0;
+  const ox = ch.hormones.oxytocin   || 0.5;
+  const co = ch.hormones.cortisol   || 0.2;
 
-  // Very positive interaction actively reduces entropy (settles her)
-  if (sentiment === 'positive' && sentimentScore > 0.5) delta -= 0.3;
+  if (ir > 0.6 && af > 0.5) {
+    delta += 0.9;  // irritated but still caring = high inner conflict
+  }
+  if (co > 0.6 && ox > 0.6) {
+    delta += 0.6;  // bonded but threatened = classic conflict
+  }
+
+  // ── Sentiment-driven accumulation ─────────────────────────────────────────
+  if (sentiment === 'negative' && sentimentScore < -0.5) {
+    delta += 1.0;  // sharp negativity
+  } else if (sentiment === 'negative' && sentimentScore < -0.3) {
+    delta += 0.4;  // mild negativity
+  }
+
+  // ── Resolution signals (reduce entropy) ───────────────────────────────────
+  // Clear positive interaction settles Maya — she knows what's happening
+  if (sentiment === 'positive' && sentimentScore > 0.5) delta -= 0.5;
+  if (sentiment === 'positive' && sentimentScore > 0.3) delta -= 0.2;
+
+  // Intent clarity reduces entropy — if she knows what they want
+  if (intent === 'question_to_maya' && sentiment !== 'negative') delta -= 0.15;
+  if (intent === 'engaged_reply')                                  delta -= 0.10;
+
+  // ── Natural decay per message ─────────────────────────────────────────────
+  delta -= ENTROPY_DECAY;  // 0.08 per message toward baseline
 
   ch.entropy = clamp(ch.entropy + delta, 0, ENTROPY_MAX);
   ch.entropy = round(ch.entropy);

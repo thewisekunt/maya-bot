@@ -1,3 +1,4 @@
+import { runLearningCycle } from './learn.js';
 /**
  * dream.js — Session-based memory consolidation
  *
@@ -282,19 +283,66 @@ async function _dreamCycle() {
   if (_running) return;
   _running = true;
   const start = Date.now();
-  console.log('[dream] cycle started (timer)');
+
   try {
-    // Phase 1: embed pending messages
-    await _runEmbedPass('cycle');
-    // Phase 2: retrain NLP with accumulated examples
-    const newExamples = await retrainFromDB();
-    if (newExamples > 0) {
-      console.log(`[dream] NLP retrained with ${newExamples} new examples`);
+    // Quick check: is there actually work to do?
+    const [[pendingEmbed]] = await db.execute(
+      `SELECT COUNT(*) as n FROM maya_memory WHERE embedded=0`
+    ).catch(() => [[{ n: 0 }]]);
+    const [[pendingNLP]] = await db.execute(
+      `SELECT COUNT(*) as n FROM maya_nlp_training WHERE used_in_train=0`
+    ).catch(() => [[{ n: 0 }]]);
+    const [[pendingDecisions]] = await db.execute(
+      `SELECT COUNT(*) as n FROM maya_decision_log WHERE resolved_at IS NOT NULL AND reward IS NOT NULL`
+    ).catch(() => [[{ n: 0 }]]);
+
+    const hasWork = pendingEmbed.n > 0 || pendingNLP.n > 0 || pendingDecisions.n > 0;
+
+    if (!hasWork) {
+      // Nothing to do — skip heavy phases, just log
+      console.log('[dream] cycle skipped — no pending work');
+      _running = false;
+      return;
     }
-    // Phase 3: update Maya's slow personality drift from mood snapshots
+
+    console.log(`[dream] cycle started — embed=${pendingEmbed.n} nlp=${pendingNLP.n} decisions=${pendingDecisions.n}`);
+
+    // Phase 1: embed pending messages (only if there are any)
+    if (pendingEmbed.n > 0) {
+      await _runEmbedPass('cycle');
+    }
+
+    // Phase 2: retrain NLP (only if new examples accumulated)
+    if (pendingNLP.n >= 5) {
+      const newExamples = await retrainFromDB();
+      if (newExamples > 0) {
+        console.log(`[dream] NLP retrained with ${newExamples} new examples`);
+      }
+    }
+
+    // Phase 3: personality drift (lightweight, always run if anything ran)
     await updateSlowDrift().catch(e => console.error('[dream] drift update:', e.message));
-    // Phase 4: memory decay — weaken memories not recalled recently
-    await _runMemoryDecay().catch(e => console.error('[dream] memory decay:', e.message));
+
+    // Phase 4: learning cycle (only if enough decisions logged)
+    if (pendingDecisions.n >= 3) {
+      const updates = await runLearningCycle().catch(e => { console.error('[dream] learning cycle:', e.message); return 0; });
+      if (updates > 0) console.log(`[dream] learning: ${updates} weight updates`);
+    }
+
+    // Phase 5: memory decay (run once per day max — check last run)
+    const [[lastDecay]] = await db.execute(
+      `SELECT value FROM maya_state WHERE state_key='last_memory_decay'`
+    ).catch(() => [[null]]);
+    const lastDecayTime = lastDecay ? new Date(lastDecay.value) : new Date(0);
+    const hoursSinceDecay = (Date.now() - lastDecayTime.getTime()) / 3600000;
+    if (hoursSinceDecay >= 24) {
+      await _runMemoryDecay().catch(e => console.error('[dream] memory decay:', e.message));
+      await db.execute(
+        `INSERT INTO maya_state (state_key, value) VALUES ('last_memory_decay', NOW())
+         ON DUPLICATE KEY UPDATE value=NOW()`
+      ).catch(() => {});
+    }
+
   } catch (e) {
     console.error('[dream] cycle error:', e.message);
   } finally {

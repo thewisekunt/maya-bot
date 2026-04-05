@@ -35,6 +35,7 @@ import { w as learnedWeight, logDecision, resolveDecision, updatePatternMemory, 
  */
 
 import db from './db.js';
+import { isSleeping } from './sleep.js';
 import { saveMessage } from './memory.js';
 import axios from 'axios';
 import { config } from './config.js';
@@ -42,14 +43,42 @@ import { config } from './config.js';
 // ── Constants ─────────────────────────────────────────────────────────────────
 const TICK_BASE_MS      = 45_000;   // base tick interval
 const TICK_JITTER_MS    = 30_000;   // ±30s randomisation (never mechanical)
-const PRESSURE_THRESHOLD = 0.35;    // pressure must exceed risk + this
-const GLOBAL_COOLDOWN_MS = 4 * 60_000;  // 4 min between any initiation
+const PRESSURE_THRESHOLD = 0.55;    // pressure must exceed risk + this
+const GLOBAL_COOLDOWN_MS = 15 * 60_000;  // 15 min between any initiation
 const MAX_IGNORE_STREAK  = 3;        // after this many ignores, stop trying
 const CHANNEL_QUIET_SECS = 300;      // channel quiet for 5min = low activity
 
 let _client      = null;
 let _timer       = null;
 let _lastSent    = 0;
+
+// Per-session unreachable cache: userId → timestamp of failure
+// Prevents hammering a user/channel that can't be reached
+const _unreachable = new Map();
+const UNREACHABLE_COOLDOWN_MS = 30 * 60_000;  // 30 min before retrying
+
+function _markUnreachable(userId, channelId) {
+  _unreachable.set(userId, Date.now());
+  // Penalise attachment (can't reach them) + set cooldown via last_initiated
+  db.execute(
+    `UPDATE maya_user_relationships
+     SET last_initiated = NOW(),
+         attachment_score = GREATEST(COALESCE(attachment_score, 0.3) - 0.05, 0.05)
+     WHERE discord_user_id = ?`,
+    [userId]
+  ).catch(() => {});
+  console.log(`[initiate] marked ${userId} unreachable for 30min, attachment -0.05`);
+}
+
+function _isUnreachable(userId) {
+  const t = _unreachable.get(userId);
+  if (!t) return false;
+  if (Date.now() - t > UNREACHABLE_COOLDOWN_MS) {
+    _unreachable.delete(userId);
+    return false;
+  }
+  return true;
+}
 
 // ── Startup ───────────────────────────────────────────────────────────────────
 
@@ -72,6 +101,7 @@ function _scheduleNextTick() {
 
 async function _tick() {
   if (!_client?.isReady()) return;
+  if (isSleeping()) return;  // no initiations during sleep
 
   // ── Global cooldown check ─────────────────────────────────────────────────
   if (Date.now() - _lastSent < GLOBAL_COOLDOWN_MS) return;
@@ -81,10 +111,29 @@ async function _tick() {
   if (!internalState) return;
 
   // ── Calculate internal pressure ──────────────────────────────────────────
-  const { pressure, topUser } = await _calculatePressure(internalState);
+  const { pressure, topUser, candidates } = await _calculatePressure(internalState);
+  internalState._candidates = candidates || [];
+
+  // ── Check unreachable cache — try next user if top is unreachable ────────
+  if (topUser && _isUnreachable(topUser.discord_user_id)) {
+    console.log(`[initiate] ${topUser.display_name} marked unreachable — trying next user`);
+    // Try the second-best candidate from the same pressure calculation
+    const altUser = internalState._candidates?.find(u =>
+      u.discord_user_id !== topUser.discord_user_id &&
+      !_isUnreachable(u.discord_user_id)
+    ) || null;
+    if (!altUser) {
+      console.log('[initiate] no reachable candidates — resting this tick');
+      return;
+    }
+    // Swap topUser to the next best
+    internalState._topUserOverride = altUser;
+  }
+  // Use override if set
+  const resolvedTopUser = internalState._topUserOverride || topUser;
 
   // ── Select best channel ───────────────────────────────────────────────────
-  const target = await _selectTarget(topUser);
+  const target = await _selectTarget(resolvedTopUser);
   if (!target) return;
 
   // ── Calculate social risk for this channel ────────────────────────────────
@@ -109,6 +158,7 @@ async function _tick() {
     console.log(`[initiate] pattern memory: "${patternKey}" avg_reward=${pastOutcome.avgReward.toFixed(2)} — skipping`);
     return;
   }
+
 
   // ── Generate message ──────────────────────────────────────────────────────
   const message = await _generateMessage(trigger, internalState, target);
@@ -227,7 +277,7 @@ async function _calculatePressure(state) {
     `topUser=${topUser?.display_name || 'none'}`
   );
 
-  return { pressure, topUser };
+  return { pressure, topUser, candidates: users };
 }
 
 // ── Calculate social risk ─────────────────────────────────────────────────────
@@ -464,7 +514,6 @@ async function _sendMessage(channelId, userId, text, isDM) {
 
       try {
         const svrChannel = await _client.channels.fetch(lastCh.channel_id);
-        // "where are you?" style fallback — softer than the original trigger message
         sentContent   = `<@${userId}> you went quiet`;
         sentChannelId = lastCh.channel_id;
         sentIsDM      = false;
@@ -472,10 +521,13 @@ async function _sendMessage(channelId, userId, text, isDM) {
         console.log(`[initiate] server fallback sent to channel ${lastCh.channel_id}`);
       } catch (e2) {
         console.error('[initiate] server fallback also failed:', e2.message);
+        _markUnreachable(userId, lastCh.channel_id);
         return false;
       }
     } else {
       console.error('[initiate] send failed:', e.message);
+      // Blacklist this user temporarily so we don't retry every tick
+      _markUnreachable(userId, channelId);
       return false;
     }
   }

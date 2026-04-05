@@ -10,13 +10,18 @@ import { detectPfpRequest, detectSelfUpdate, describeAndStoreAvatar,
 import { openSession, recordSessionMessage, getSessionParticipants } from './stm.js';
 import { isSocialQuery, buildSocialContext } from './social.js';
 import { isImageRequest, extractImagePrompt, generateImage } from './imagegen.js';
-import { estimateEntropy, getEntropyZone, getKnownNames, getConfirmedFacts,
+import { estimateEntropy, estimateEntropyFast, getEntropyZone, getKnownNames, getConfirmedFacts,
          getMayaSelfTraits, extractAndStoreFact, extractMayaTrait,
          updateRelationshipSignals,
          getOrCreateRelationship, recordUserInteraction,
          upsertUser, detectNameSet, getFrequentInteractors } from './persona.js';
 import { getMayaReply } from './llm.js';
 import { shouldDeliberate, deliberate, webSearch } from './think.js';
+import { getReferencedContext, getScopedFacts, getUserGenderAndRoles, syncMemberRoles, getEmotionalContext, clearEmotionFor, inferGenderFromText } from './context_enricher.js';
+import { saveNotification, markReplied } from './inbox.js';
+import { resolveEntities, buildEntityContext, isAddressedToOther, indexMember } from './entity.js';
+import { detectCommitment } from './commitments.js';
+import { logDecision, resolveDecision, computeReward } from './learn.js';
 import { buildContextLine, upsertGuild, upsertChannel } from './context.js';
 import { decide } from './presence.js';
 import { extractMediaContext } from './vision.js';
@@ -144,30 +149,59 @@ export async function handleMessage({
     }
   }
 
-  // ── 8. Entropy + psyche state update ─────────────────────────────────────
-  const entropy = estimateEntropy(richMessageText);
-  const { zone, line: zoneLine } = getEntropyZone(entropy);
+  // ── 8. NLP → Full entropy → Psyche state ────────────────────────────────
+  // Order matters: NLP first (provides confidence + intent for entropy),
+  // then full entropy with all signals, then psyche update
 
-  // Compute Maya's dynamic internal state from all available signals
-  // This runs before the salience decision so state informs both
-  // whether she responds AND how she responds
   const { classify: classifyIntent } = await import('./nlp.js');
   const nlpSignal = await classifyIntent(richMessageText).catch(() => ({
     intent: 'group_chatter', score: 0.5, sentiment: 'neutral', sentimentScore: 0,
   }));
 
-  // selfTraits fetched after salience — don't waste DB call if we're ignoring
-  const psycheState = await updateState({
-    // selfTraits passed empty here — fetched below if we actually reply
+  // Get current channel psyche state for internal conflict signals
+  // (hormones/emotions from previous messages in this channel)
+  const { getChannelState } = await import('./psyche.js');
+  const currentCh = getChannelState(channelId);
 
+  // Check belief conflict (async, non-fatal)
+  const { detectBeliefConflict: detectBC } = await import('./meta.js');
+  const beliefConflict = await detectBC(
+    userId, nlpSignal.sentiment, nlpSignal.sentimentScore, trustLevel
+  ).catch(() => false);
+
+  // Get user's historical entropy baseline from relationship data
+  const [[relRow]] = await db.execute(
+    `SELECT avg_entropy FROM maya_user_relationships WHERE discord_user_id=? LIMIT 1`,
+    [userId]
+  ).catch(() => [[{ avg_entropy: 0.4 }]]);
+  const avgEntropy = parseFloat(relRow?.avg_entropy || 0.4);
+
+  // Full entropy computation with all five signal sources
+  const entropy = estimateEntropy({
+    text:          richMessageText,
+    nlpScore:      nlpSignal.score        || 0.5,
+    nlpIntent:     nlpSignal.intent       || 'group_chatter',
+    sentiment:     nlpSignal.sentiment    || 'neutral',
+    sentimentScore: nlpSignal.sentimentScore || 0,
+    hormones:      currentCh?.hormones    || {},
+    emotions:      currentCh?.emotions    || {},
+    beliefConflict,
+    avgEntropy,
+    recentMessages: currentCh?.recentMessages?.length || 5,
+  });
+
+  const { zone, line: zoneLine } = getEntropyZone(entropy);
+
+  // Compute Maya's dynamic internal state from all available signals
+  const psycheState = await updateState({
     channelId,
     entropy,
     sentiment:     nlpSignal.sentiment,
     sentimentScore: nlpSignal.sentimentScore,
     intent:        nlpSignal.intent,
     trustLevel,
-    velocity:      2,   // TODO: pull from presence channel state
-    selfTraits:    [],   // fetched after salience gate
+    velocity:      2,
+    selfTraits:    [],
     sessionId:     null,
   }).catch(() => ({ energy: 0.5, warmth: 0.6, seriousness: 0.4, monologue: '' }));
 
@@ -223,6 +257,15 @@ export async function handleMessage({
     }
   }
 
+  // ── 8b. FAREWELL DETECTION ───────────────────────────────────────────────
+  // If user is signing off, let them have the last word
+  if (!isMention && !isDM && _isFarewell(richMessageText)) {
+    console.log(`[handler] farewell detected — not replying to ${prefName}`);
+    saveMessage({ userId, prefName, guildId, channelId, contextType,
+      isPrivate, sender: 'user', message: richMessageText, entropy }).catch(() => {});
+    return { type: 'ignore', reason: 'farewell' };
+  }
+
   // ── 9. PRESENCE DECISION ─────────────────────────────────────────────────
   const decision = await decide({
     channelId,
@@ -256,6 +299,10 @@ export async function handleMessage({
     return null;
   }
 
+  // ── META SUPPRESS (handled after LLM) ─────────────────────────────────────
+  // result.type === 'suppress' means inner voice blocked the reply
+  // treat as ignore — Maya chose silence
+
   // ── REACT ─────────────────────────────────────────────────────────────────
   if (action === 'react') {
     saveMessage({ userId, prefName, guildId, channelId, contextType,
@@ -288,11 +335,36 @@ export async function handleMessage({
     console.error('[handler] buildContext error:', e.message);
   }
 
-  // Facts about this user (attributed: "Danish loves pizza")
-  const knownFacts = await getConfirmedFacts(userId).catch(() => []);
+  // Facts about this user — scoped to current guild (cross-server privacy)
+  const knownFacts = await getScopedFacts(userId, guildId).catch(() => []);
 
   // Avatar description intentionally NOT injected into knownFacts every message
   // — it causes Maya to bring up pfp repeatedly. Only inject when user asks about it.
+
+  // ── Gender + roles (sync once per session, use in prompt) ───────────────
+  const { gender, roles } = await getUserGenderAndRoles(userId, guildId).catch(() => ({ gender: null, roles: [] }));
+  if (msg?.member && guildId) syncMemberRoles(msg.member, guildId).catch(() => {});
+  if (message) inferGenderFromText(userId, message).catch(() => {});
+
+  // ── Referenced message context (when @tagging an old message) ────────────
+  const refContext = msg ? await getReferencedContext(msg, null).catch(() => null) : null;
+
+  // ── Emotional presence context (who Maya is thinking about right now) ─────
+  const emotionalCtx = await getEmotionalContext(message, userId).catch(() => null);
+
+  // ── Clear emotion for this user now that Maya is talking to them ──────────
+  clearEmotionFor(userId).catch(() => {});
+
+  // ── Entity resolution: who else is mentioned in this message? ────────────
+  // Index this member so future entity resolution can find them
+  if (guildId) indexMember(guildId, userId, prefName, username).catch(() => {});
+
+  const mentionedEntities = guildId
+    ? await resolveEntities(richMessageText, guildId, userId, null).catch(() => [])
+    : [];
+  const entityContext = mentionedEntities.length > 0
+    ? await buildEntityContext(mentionedEntities, guildId).catch(() => null)
+    : null;
 
 
   // Upsert user (non-fatal)
@@ -375,12 +447,24 @@ export async function handleMessage({
 
   const result = await getMayaReply({
     prefName,
-    context: [context, thirdPartyContext, thoughtContext].filter(Boolean).join('\n\n'),
+    context: [context, thirdPartyContext, thoughtContext, entityContext, refContext, emotionalCtx].filter(Boolean).join('\n\n'),
     message: finalMessage, entropy, zone, zoneLine,
     contextLine, knownFacts, selfTraits, relationship: { trustLevel },
     frequentFriends: [], forceVerbal,
-    psycheState,
+    psycheState, gender, roles,
+    userId, guildId, channelId, trustLevel,
+    attachmentScore: psycheState?.attachment || 0.3,
+    sentiment:       nlpSignal?.sentiment    || 'neutral',
+    sentimentScore:  nlpSignal?.sentimentScore || 0,
   });
+
+  // Meta layer may have suppressed the response
+  if (result?.type === 'suppress') {
+    console.log(`[handler] meta suppressed reply for ${prefName}: ${result.reason}`);
+    saveMessage({ userId, prefName, guildId, channelId, contextType,
+      isPrivate, sender: 'user', message, entropy }).catch(() => {});
+    return { type: 'ignore', reason: `meta_suppress: ${result.reason}` };
+  }
 
   const savedReply = result.type === 'react'
     ? `*reacted with ${result.emoji}*`
@@ -417,6 +501,26 @@ export async function handleMessage({
   });
   debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: savedReply });
 
+  // Mark notification as replied if we had one
+  // (notifId passed from index.js via msg metadata — non-fatal if missing)
+  if (result?.type === 'reply' && msg?._notifId) {
+    markReplied(msg._notifId).catch(() => {});
+  }
+
+  // Detect commitments in Maya's reply (fire and forget)
+  if (result?.type === 'reply' && result?.text) {
+    detectCommitment(result.text, userId, channelId, guildId).catch(() => {});
+  }
+
+  // Log this reply decision for learning (fire and forget)
+  if (result?.type === 'reply' && psycheState) {
+    logDecision('presence', 'reply', {
+      intent: nlpSignal?.intent, trustLevel,
+      sentiment: nlpSignal?.sentiment,
+      isDM, channelId,
+    }, psycheState).catch(() => {});
+  }
+
   // Extract facts from user message (fire and forget)
   extractAndStoreFact(userId, message).catch(() => {});
 
@@ -429,3 +533,10 @@ export async function handleMessage({
 }
 
 // ── Memory save ───────────────────────────────────────────────────────────────
+
+// ── Farewell detection ────────────────────────────────────────────────────────
+function _isFarewell(text) {
+  if (!text) return false;
+  const t = text.toLowerCase().trim();
+  return /^(bye|bb|gn|gtg|ttyl|cya|good night|good bye|goodnight|good nite|ok bye|okay bye|chal bye|chalo bye|nikalta|nikalti|nikal raha|nikal rahi|sone ja raha|sone ja rahi|raat ko baat|baad mein|take care|tk|peace out|signing off|log off|log out|gotta go|gotta sleep|gotta run|ok gn|okay gn|byee|byeee|ok ok bye|theek hai bye|tata|toodles)\b/i.test(t);
+}
