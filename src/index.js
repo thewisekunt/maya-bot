@@ -13,7 +13,9 @@ import { trainNLP } from './nlp.js';
 import { replyDelay } from './llm.js';
 import { startSTM, openSession, recordSessionMessage } from './stm.js';
 import { generateImage } from './imagegen.js';
-import { scan, refreshAliases } from './scanner.js';
+import { refreshAliases } from './scanner.js';
+import { parseNotification, resolveReplyNotif } from './notification.js';
+import { observe, shouldTriggerObservation, resetPull, getObservationState } from './observation.js';
 import { checkSpam, notifyReplied } from './spamguard.js';
 import db from './db.js';
 import { evaluate } from './notif.js';
@@ -147,13 +149,59 @@ client.on('messageCreate', async (msg) => {
     return;
   }
 
-  // ── PATH 2: Scanner → Notification → Evaluate ────────────────────────────
-  const notif = scan(msg, client.user.id);
-  if (!notif) return;
+  // ── TWO-TIER ROUTING ─────────────────────────────────────────────────────
+  // Tier 1: Hard notifications (@mention, reply, DM, alias) → direct pipeline
+  // Tier 2: Everything else → observation buffer → inner voice triggered when ready
 
-  _batch(`notif:${channelId}:${msg.author.id}`, msg, (msgs) => {
-    _processNotification(msgs, notif, client).catch(e => console.error('[bot] notif error:', e.message));
-  });
+  let notif = parseNotification(msg, client.user.id);
+
+  // Complete reply check if needed (requires async fetch)
+  if (!notif && msg.reference?.messageId) {
+    const partial = { msg, channelId, guildId, userId: msg.author.id, isDM, content };
+    partial._checkReply = true;
+    notif = await resolveReplyNotif(partial, client.user.id).catch(() => null);
+  }
+
+  if (notif) {
+    // ── TIER 1: Hard notification ─────────────────────────────────────────
+    // Attach notification to msg so handler can access it
+    msg._notification = notif;
+    _batch(`notif:${channelId}:${msg.author.id}`, msg, (msgs) => {
+      _processNotification(msgs, notif, client).catch(e => console.error('[bot] notif error:', e.message));
+    });
+  } else {
+    // ── TIER 2: Passive observation ───────────────────────────────────────
+    // Add to channel observation buffer. Inner voice checks pull score.
+    const obsState = observe(channelId, {
+      userId:    msg.author.id,
+      username:  msg.member?.displayName || msg.author.username,
+      content,
+      entropy:   0.4,  // fast estimate — real entropy computed in handler
+      sentiment: 'neutral',
+      intent:    'group_chatter',
+      timestamp: msg.createdTimestamp,
+    });
+
+    // Check if accumulated observation should trigger inner voice
+    if (!isDM && shouldTriggerObservation(channelId)) {
+      resetPull(channelId);
+      // Synthesize a "virtual notification" from observation context
+      // This lets Maya engage from the observation buffer, not just hard pings
+      const obsNotif = {
+        msg, channelId, guildId,
+        userId:      msg.author.id,
+        isDM:        false,
+        type:        'observation',
+        triggerType: 'observation',
+        urgency:     obsState.pullScore,
+        content,
+      };
+      msg._notification = obsNotif;
+      _batch(`obs:${channelId}`, msg, (msgs) => {
+        _processNotification(msgs, obsNotif, client).catch(e => console.error('[bot] obs error:', e.message));
+      });
+    }
+  }
 });
 
 // ── PATH 1: Engaged ───────────────────────────────────────────────────────────
@@ -505,7 +553,7 @@ client.on('guildMemberAdd', async (member) => {
     const { config: cfg } = await import('./config.js');
 
     const { data, status } = await axiosImport.post(cfg.llm.endpoint, {
-      model:       'deepseek/deepseek-chat-v3-0324',
+      model:       config.llm.models.utility,
       messages:    [{
         role: 'user',
         content: `You are Maya, a real girl in a Discord server. ${name} just joined.
@@ -580,7 +628,7 @@ Rules:
 Output only the bio text, nothing else.`;
 
     const { data, status } = await axios.post(cfg.llm.endpoint, {
-      model:       'deepseek/deepseek-chat-v3-0324',
+      model:       config.llm.models.utility,
       messages:    [{ role: 'user', content: prompt }],
       temperature: 0.9,
       max_tokens:  40,

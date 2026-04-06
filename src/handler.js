@@ -25,7 +25,8 @@ import { resolveEntities, buildEntityContext, isAddressedToOther, indexMember } 
 import { detectCommitment } from './commitments.js';
 import { logDecision, resolveDecision, computeReward } from './learn.js';
 import { buildContextLine, upsertGuild, upsertChannel } from './context.js';
-import { decide } from './presence.js';
+import { runInnerVoice, evaluateReply, executeToolPlan } from './inner_voice.js';
+import { resolveIntent } from './intent_engine.js';
 import { extractMediaContext } from './vision.js';
 import { debugLog } from './logger.js';
 import db from './db.js';
@@ -305,40 +306,26 @@ export async function handleMessage({
   }
 
   // ── 9. PRESENCE DECISION ─────────────────────────────────────────────────
-  // Energy from psyche — dopamine drives engagement, cortisol suppresses it
-  const mayaEnergy = Math.max(0, Math.min(1,
-    (psycheState?.hormones?.dopamine  || 0.5) * 0.5 +
-    (psycheState?.hormones?.serotonin || 0.6) * 0.3 +
-    (1 - (psycheState?.hormones?.cortisol || 0.2)) * 0.2
-  ));
-
-  const decision = await decide({
-    channelId,
-    userId,
-    text:       richMessageText,
-    isMention,
-    isDM,
-    isReply,
-    hasMedia,
-    trustLevel,
-    entropy,
-    knownNames,
-    energy:   mayaEnergy,
-    momentum,
+  // ── Inner voice: situation understanding + tool planning ────────────────
+  const innerCognition = await runInnerVoice({
+    notification: msg?._notification || null,  // set by index.js if tier-1
+    message:      richMessageText,
+    userId, channelId, guildId,
+    nlpSignal, entropy, trustLevel,
+    attachmentScore: psycheState?.attachment || attachmentScore || 0.3,
+    isMention, isDM, isReply,
   });
 
-  // Safety: if decide() returned undefined (import error, crash), default safely
-  if (!decision || !decision.action) {
-    console.error('[presence] decide() returned invalid:', decision, '— defaulting to reply');
-    if (isDM || isMention) {
-      // Force reply for direct address
-    } else {
-      return null;  // ignore for everything else
-    }
-  }
+  // ── Intent engine: what should Maya do? ──────────────────────────────────
+  const { isSleeping } = await import('./sleep.js');
+  const decision = resolveIntent(innerCognition, {
+    isMention, isDM, isReply,
+    isSleeping: isSleeping(),
+  });
 
-  const action = decision?.action || (isDM || isMention ? 'reply' : 'ignore');
-  console.log(`[presence] user=${prefName} action=${action} reason="${decision?.reason}" mode=${isDM?'DM':'server'} trust=${trustLevel}`);
+  const action = decision.action;
+  console.log(`[intent] user=${prefName} action=${action} reason="${decision.reason}" ` +
+    `intent=${innerCognition.intentScore.toFixed(2)} zone=${innerCognition.obsState?.zone}`);
 
   // ── IGNORE ────────────────────────────────────────────────────────────────
   if (action === 'ignore') {
@@ -362,6 +349,15 @@ export async function handleMessage({
 
   // ── REPLY — fetch memory + known facts + call LLM ────────────────────────
 
+  // Execute tool plan from inner voice — augments context before LLM
+  const toolAdditions = innerCognition.toolPlan?.length
+    ? await executeToolPlan(innerCognition.toolPlan, {
+        userId, guildId, channelId,
+        message: richMessageText, msg,
+        botId: msg?.client?.user?.id || null,
+      }).catch(() => [])
+    : [];
+
   // Fetch Maya's self-traits now (only if we're actually replying)
   const selfTraits = await getMayaSelfTraits().catch(() => []);
 
@@ -378,6 +374,10 @@ export async function handleMessage({
     ].filter(Boolean).join(' ').slice(0, 500);
 
     context = await buildContext(userId, prefName, contextType, guildId, semanticQuery, channelId);
+    // Append tool-gathered context (deep memory, room read, etc.)
+    if (toolAdditions.length) {
+      context = [context, ...toolAdditions].filter(Boolean).join('\n\n');
+    }
   } catch (e) {
     console.error('[handler] buildContext error:', e.message);
   }
