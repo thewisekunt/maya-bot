@@ -22,7 +22,15 @@ import { getSessionContext } from './stm.js';
 
 const SQL_LIMIT  = 5;
 const VEC_LIMIT  = 6;  // user facts
-const THRESHOLD  = 0.30;  // raw Discord messages score low — casual text similarity is ~0.35-0.55
+// Thresholds per search type — raised from 0.30 which was catching noise
+// Cosine similarity on text-embedding-3-small:
+//   0.30–0.45: weak match (same topic area)
+//   0.45–0.60: moderate (semantically related)
+//   0.60–0.80: strong (same idea, different words)
+//   0.80+:     near-identical
+const THRESHOLD_FACT = 0.50;  // user facts — need real semantic match
+const THRESHOLD_CONV = 0.42;  // conversation — somewhat looser
+const THRESHOLD_SELF = 0.45;  // Maya self-traits
 
 // Schema cache
 let _newSchema = null;
@@ -145,12 +153,19 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
     // Qdrant version compatibility: nested should inside must is unreliable
     // Strategy: run separate searches for each type, merge results in JS
 
-    // User facts: this specific user's messages (scoped to guild if available)
+    // Search 1: Embedded user_facts (immediately embedded when stored)
+    // These are LLM-extracted, confidence-scored facts — highest quality signal
+    const userFactFilter = { must: [
+      { key: 'memory_type',     match: { value: 'user_fact' } },
+      { key: 'discord_user_id', match: { value: String(userId) } },
+    ]};
+
+    // Search 2: Raw user messages — semantic recall of what they've said
     // Exclude sender='maya' — her own messages aren't facts ABOUT the user
     const userMust = [
       { key: 'memory_type', match: { value: 'raw_message' } },
       { key: 'discord_user_id', match: { value: String(userId) } },
-      { key: 'sender', match: { value: 'user' } },  // exclude Maya's replies
+      { key: 'sender', match: { value: 'user' } },
     ];
     if (guildId) userMust.push({ key: 'guild_id', match: { value: String(guildId) } });
     const userRawFilter = { must: userMust };
@@ -181,22 +196,37 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
       { key: 'memory_type', match: { value: 'maya_self' } },
     ]};
 
-    const [userFacts, convMems, selfTraitsVec] = await Promise.all([
-      searchMemories(queryVec, userRawFilter, VEC_LIMIT, THRESHOLD)
-        .catch(e => { console.error('[memory] userFacts search:', e.message); return []; }),
-      searchMemories(queryVec, activeConvFilter, 6, THRESHOLD)
+    const [embeddedFacts, rawMessages, convMems, selfTraitsVec] = await Promise.all([
+      // Embedded user_facts — highest priority, strong threshold
+      searchMemories(queryVec, userFactFilter, 6, THRESHOLD_FACT)
+        .catch(e => { console.error('[memory] user_fact search:', e.message); return []; }),
+      // Raw user messages — moderate threshold
+      searchMemories(queryVec, userRawFilter, VEC_LIMIT, THRESHOLD_CONV)
+        .catch(e => { console.error('[memory] raw search:', e.message); return []; }),
+      // Conversation context — full guild scope
+      searchMemories(queryVec, activeConvFilter, 5, THRESHOLD_CONV)
         .catch(e => { console.error('[memory] conv search:', e.message); return []; }),
-      searchMemories(queryVec, selfFilter, 3, THRESHOLD)
+      // Maya self-traits
+      searchMemories(queryVec, selfFilter, 3, THRESHOLD_SELF)
         .catch(e => { console.error('[memory] self search:', e.message); return []; }),
     ]);
 
-    // Deduplicate conv results that already appear in userFacts
-    const userFactIds = new Set(userFacts.map(f => f.payload?.mysql_id));
-    const dedupedConv = convMems.filter(m => !userFactIds.has(m.payload?.mysql_id));
+    // Merge user signals — embedded facts first (higher quality), then raw messages
+    const embeddedIds  = new Set(embeddedFacts.map(f => f.payload?.mysql_id).filter(Boolean));
+    const embeddedMsgs = new Set(embeddedFacts.map(f => f.payload?.message?.slice(0,40)).filter(Boolean));
+    // Dedupe raw messages against embedded facts
+    const uniqueRaw = rawMessages.filter(r =>
+      !embeddedIds.has(r.payload?.mysql_id) &&
+      !embeddedMsgs.has(r.payload?.message?.slice(0,40))
+    );
+    const userFacts = [...embeddedFacts, ...uniqueRaw.slice(0, 3)];
 
-    console.log(`[memory] vector recall: userFacts=${userFacts.length} conv=${dedupedConv.length} self=${selfTraitsVec.length} threshold=${THRESHOLD}`);
+    // Deduplicate conv against user signals
+    const userMsgSet = new Set(userFacts.map(f => f.payload?.mysql_id));
+    const dedupedConv = convMems.filter(r => !userMsgSet.has(r.payload?.mysql_id));
 
-    // Swap convMems reference for deduped version
+    console.log(`[memory] vector recall: facts=${embeddedFacts.length} raw=${uniqueRaw.length} conv=${dedupedConv.length} self=${selfTraitsVec.length} thresholds=fact:${THRESHOLD_FACT}/conv:${THRESHOLD_CONV}`);
+
     const convMemsFinal = dedupedConv;
 
     if (userFacts.length > 0) {

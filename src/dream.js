@@ -334,6 +334,9 @@ async function _dreamCycle() {
       if (updates > 0) console.log(`[dream] learning: ${updates} weight updates`);
     }
 
+    // Phase 4d: stale fact decay (low-confidence + unrecalled facts weaken)
+    await _decayStateFacts().catch(e => console.error('[dream] fact decay:', e.message));
+
     // Phase 5: memory decay (run once per day max — check last run)
     const [[lastDecay]] = await db.execute(
       `SELECT value FROM maya_state WHERE state_key='last_memory_decay'`
@@ -635,4 +638,33 @@ async function _formSelfBeliefs() {
     // Store a self-belief acknowledging the contradiction
     await updateSelfBelief(`I have conflicting feelings about how I fit in — sometimes valued, sometimes invisible`, 0.40);
   }
+}
+
+// ── Fact staleness decay ──────────────────────────────────────────────────────
+
+async function _decayStaleFacts() {
+  // Decay memory_strength of facts that haven't been recalled recently
+  await db.execute(
+    `UPDATE maya_facts
+     SET memory_strength = GREATEST(0.05, memory_strength - 0.05)
+     WHERE last_recalled < DATE_SUB(NOW(), INTERVAL 3 DAY)
+       AND memory_strength > 0.1
+       AND conflict_score < 0.5`   // don't decay already-conflicted facts further
+  ).catch(() => {});
+
+  // Prune very low confidence facts that are old and never recalled
+  await db.execute(
+    `DELETE FROM maya_facts
+     WHERE memory_strength < 0.1
+       AND created_at < DATE_SUB(NOW(), INTERVAL 14 DAY)
+       AND (last_recalled IS NULL OR last_recalled < DATE_SUB(NOW(), INTERVAL 7 DAY))`
+  ).catch(() => {});
+
+  // High-conflict facts that haven't been recalled in 7 days — mark as stale
+  await db.execute(
+    `UPDATE maya_facts
+     SET conflict_score = LEAST(conflict_score + 0.1, 0.95)
+     WHERE conflict_score > 0.5
+       AND (last_recalled IS NULL OR last_recalled < DATE_SUB(NOW(), INTERVAL 7 DAY))`
+  ).catch(() => {});
 }

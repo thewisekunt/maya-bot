@@ -1,5 +1,7 @@
 import { config } from './config.js';
 import axios from 'axios';
+import { embed } from './embedder.js';
+import { upsertMemory } from './vector.js';
 /**
  * persona.js — User profiles, trust, aliases, and structured facts
  *
@@ -490,30 +492,123 @@ or
  * Store a single fact in maya_facts with conflict detection.
  * Shared by both regex fast-path and LLM extraction.
  */
-async function _storeFact(userId, userName, fact, category, score, sourceMessage) {
-  // Check for near-duplicate (same category, similar start)
+async function _storeFact(userId, userName, fact, category, initialScore, sourceMessage) {
+  // ── Step 1: Load existing facts for this user+category ───────────────────
   const [existing] = await db.execute(
-    `SELECT id, fact FROM maya_facts
+    `SELECT id, fact, conflict_score, memory_strength FROM maya_facts
      WHERE discord_user_id = ? AND category = ?
-     ORDER BY created_at DESC LIMIT 8`,
+     ORDER BY memory_strength DESC, updated_at DESC LIMIT 10`,
     [userId, category]
   );
 
+  // ── Step 2: Exact/near-dupe check ────────────────────────────────────────
   const isDupe = existing.some(r =>
-    r.fact.toLowerCase().slice(0, 35) === fact.toLowerCase().slice(0, 35)
+    r.fact.toLowerCase().slice(0, 40) === fact.toLowerCase().slice(0, 40)
   );
   if (isDupe) return;
 
-  // Conflicting fact? (same category, different content = higher conflict score)
-  const adjustedScore = existing.length > 0 ? Math.min(score + 0.05, 0.3) : score;
+  // ── Step 3: LLM conflict + confidence scoring ─────────────────────────────
+  // Only run if there are existing facts to compare against
+  let confidence = 0.7;   // default when no existing facts
+  let conflictScore = initialScore;
+  let conflictIds = [];   // IDs of facts this new one contradicts
 
-  await db.execute(
+  if (existing.length > 0) {
+    const existingList = existing.map(r => `- "${r.fact}"`).join('\n');
+    try {
+      const prompt = `You are analyzing facts about a person named ${userName}.
+
+New fact observed: "${fact}"
+
+Existing facts in category "${category}":
+${existingList}
+
+Answer:
+1. Does the new fact CONTRADICT any existing fact? (e.g. "has a charger" vs "can't find charger" — yes, "likes coffee" vs "prefers tea" — yes, "is a student" + "studies CS" — no)
+2. If contradiction: which existing fact index (0-based) does it contradict?
+3. Confidence in the new fact (0.0-1.0) based on how specific and clear it is.
+   - Temporary/situational facts ("can't find X right now") → 0.3-0.5
+   - Stated preferences/identity → 0.7-0.9
+   - Confirmed repeated patterns → 0.85-0.95
+
+Return ONLY valid JSON:
+{"contradicts": true/false, "contradicts_index": null/0/1/2..., "confidence": 0.0-1.0, "is_temporary": true/false}`;
+
+      const { data, status } = await axios.post(config.llm.endpoint, {
+        model: 'deepseek/deepseek-chat-v3-0324',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.0, max_tokens: 80,
+      }, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${config.llm.apiKey}`,
+          'HTTP-Referer': 'https://chatmasala.fun',
+        },
+        timeout: 6000, validateStatus: () => true,
+      });
+
+      if (status === 200) {
+        const raw = data?.choices?.[0]?.message?.content?.trim() || '{}';
+        const clean = raw.replace(/^```json\s*/i,'').replace(/```\s*$/i,'').trim();
+        const result = JSON.parse(clean);
+
+        confidence = Math.max(0.1, Math.min(0.99, result.confidence ?? 0.7));
+
+        // Temporary facts (situational) get lower memory strength and marked stale sooner
+        if (result.is_temporary) {
+          confidence = Math.min(confidence, 0.45);
+        }
+
+        // If contradicts an existing fact — raise conflict score, mark old fact
+        if (result.contradicts && result.contradicts_index !== null) {
+          const oldFact = existing[result.contradicts_index];
+          if (oldFact) {
+            conflictIds.push(oldFact.id);
+            conflictScore = Math.max(conflictScore, 0.4);  // mark new as uncertain
+            // Mark old fact as superseded — raise its conflict score
+            await db.execute(
+              `UPDATE maya_facts SET conflict_score = LEAST(conflict_score + 0.3, 0.9),
+               memory_strength = GREATEST(memory_strength - 0.3, 0.1)
+               WHERE id = ?`,
+              [oldFact.id]
+            ).catch(() => {});
+            console.log(`[facts] conflict: "${fact}" supersedes "${oldFact.fact}"`);
+          }
+        }
+      }
+    } catch { /* LLM scoring non-fatal — use defaults */ }
+  }
+
+  // ── Step 4: Store the fact ────────────────────────────────────────────────
+  const [res] = await db.execute(
     `INSERT INTO maya_facts
-       (discord_user_id, fact, category, conflict_score, source_message)
-     VALUES (?, ?, ?, ?, ?)`,
-    [userId, fact, category, adjustedScore, sourceMessage.slice(0, 500)]
+       (discord_user_id, fact, category, conflict_score, memory_strength, source_message)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [userId, fact, category, conflictScore, confidence, sourceMessage.slice(0, 500)]
   );
-  console.log(`[facts] stored for ${userName}: "${fact}" (${category})`);
+  const factId = res.insertId;
+  console.log(`[facts] stored for ${userName}: "${fact}" (${category}) conf=${confidence.toFixed(2)}`);
+
+  // ── Step 5: Embed immediately into Qdrant as user_fact ────────────────────
+  // Don't wait for sleep cycle — facts should be searchable right away
+  try {
+    const vec = await embed(fact);
+    if (vec) {
+      await upsertMemory(`fact_${userId}_${factId}`, vec, {
+        memory_type:     'user_fact',
+        discord_user_id: userId,
+        user_name:       userName,
+        mysql_id:        factId,
+        fact_text:       fact,
+        message:         fact,       // so searchMemories can return .payload.message
+        category,
+        confidence,
+        is_private:      false,
+        weight:          confidence * 2.5,
+        created_at:      new Date().toISOString(),
+      });
+    }
+  } catch { /* embed non-fatal */ }
 }
 
 /**
@@ -564,15 +659,19 @@ function _attributeFact(raw, name) {
 export async function getConfirmedFacts(userId, limit = 6) {
   try {
     const [rows] = await db.execute(
-      `SELECT id, fact, category, conflict_score, updated_at FROM maya_facts
-       WHERE discord_user_id = ? AND conflict_score < 0.4
+      `SELECT id, fact, category, conflict_score, memory_strength, updated_at
+       FROM maya_facts
+       WHERE discord_user_id = ?
          AND discord_user_id != 'maya'
+         AND conflict_score < 0.5          -- exclude high-conflict/stale facts
+         AND memory_strength > 0.15        -- exclude nearly-forgotten facts
        ORDER BY
-         -- Recency: facts updated in last 7 days first
+         -- Prioritise high-confidence facts
+         memory_strength DESC,
+         -- Then freshness
          CASE WHEN updated_at > DATE_SUB(NOW(), INTERVAL 7 DAY) THEN 0 ELSE 1 END ASC,
-         -- Then by certainty
+         -- Then low conflict
          conflict_score ASC,
-         -- Then most recent
          updated_at DESC
        LIMIT ?`,
       [userId, limit]
