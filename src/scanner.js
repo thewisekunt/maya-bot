@@ -115,3 +115,22 @@ export function scan(msg, botUserId) {
 }
 
 export function getAliases() { return [..._aliases]; }
+
+/**
+ * Get the most active channel for a guild that Maya has recently spoken in.
+ * Used by welcome handler to know where to post.
+ */
+export async function getMostActiveChannel(guildId) {
+  try {
+    const [[row]] = await db.execute(
+      `SELECT channel_id FROM maya_memory
+       WHERE guild_id=? AND sender='maya'
+         AND created_at > DATE_SUB(NOW(), INTERVAL 6 HOUR)
+       GROUP BY channel_id
+       ORDER BY COUNT(*) DESC
+       LIMIT 1`,
+      [guildId]
+    );
+    return row?.channel_id || null;
+  } catch { return null; }
+}

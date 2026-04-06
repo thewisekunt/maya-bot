@@ -18,6 +18,7 @@ import { estimateEntropy, estimateEntropyFast, getEntropyZone, getKnownNames, ge
 import { getMayaReply } from './llm.js';
 import { shouldDeliberate, deliberate, webSearch } from './think.js';
 import { getMomentum, updateMomentum, synthesizeMoment, predictLanding, isReactionMessage, getMomentumZone } from './moment.js';
+import { getEmojiHint } from './emoji.js';
 import { getReferencedContext, getScopedFacts, getUserGenderAndRoles, syncMemberRoles, getEmotionalContext, clearEmotionFor, inferGenderFromText } from './context_enricher.js';
 import { saveNotification, markReplied } from './inbox.js';
 import { resolveEntities, buildEntityContext, isAddressedToOther, indexMember } from './entity.js';
@@ -304,6 +305,13 @@ export async function handleMessage({
   }
 
   // ── 9. PRESENCE DECISION ─────────────────────────────────────────────────
+  // Energy from psyche — dopamine drives engagement, cortisol suppresses it
+  const mayaEnergy = Math.max(0, Math.min(1,
+    (psycheState?.hormones?.dopamine  || 0.5) * 0.5 +
+    (psycheState?.hormones?.serotonin || 0.6) * 0.3 +
+    (1 - (psycheState?.hormones?.cortisol || 0.2)) * 0.2
+  ));
+
   const decision = await decide({
     channelId,
     userId,
@@ -315,6 +323,8 @@ export async function handleMessage({
     trustLevel,
     entropy,
     knownNames,
+    energy:   mayaEnergy,
+    momentum,
   });
 
   // Safety: if decide() returned undefined (import error, crash), default safely
@@ -482,6 +492,16 @@ export async function handleMessage({
     }
   }
 
+  // Emoji hint — server emojis Maya can use if they fit the mood
+  const dominantMood = (psycheState?.emotions?.joy || 0) > 0.5 ? 'joyful'
+    : (psycheState?.emotions?.irritation || 0) > 0.5 ? 'irritated'
+    : (psycheState?.hormones?.dopamine || 0.5) > 0.65 ? 'energized'
+    : (psycheState?.hormones?.dopamine || 0.5) < 0.35 ? 'depleted'
+    : 'curious';
+  const emojiHint = guildId
+    ? await getEmojiHint(guildId, dominantMood, userId).catch(() => null)
+    : null;
+
   const result = await getMayaReply({
     prefName,
     context: [context, thirdPartyContext, thoughtContext, entityContext].filter(Boolean).join('\n\n'),  // refContext + emotionalCtx passed separately
@@ -497,6 +517,7 @@ export async function handleMessage({
     momentum,
     lastExchangeQuality,
     refContext,
+    emojiHint,
   });
 
   // Meta layer may have suppressed the response
@@ -520,11 +541,13 @@ export async function handleMessage({
   // Update conversation quality signals for trust calculation
   // Detect conflict: if user message has high entropy + negative sentiment
   // or contains confrontational patterns
-  const isConflict = nlpSignal?.sentiment === 'negative' &&
-    (nlpSignal?.sentimentScore < -0.5) &&
-    entropy > 0.5;
-  const isHarmony  = nlpSignal?.sentiment === 'positive' &&
-    trustLevel >= 3;
+  // Conflict: negative sentiment OR high entropy with irritation
+  // Lower threshold than before — conflict should register more readily
+  const isConflict = (nlpSignal?.sentiment === 'negative' && nlpSignal?.sentimentScore < -0.3) ||
+    (entropy > 0.6 && (psycheState?.emotions?.irritation || 0) > 0.5);
+
+  // Harmony: positive interaction — don't require high trust to register
+  const isHarmony  = nlpSignal?.sentiment === 'positive' && nlpSignal?.sentimentScore > 0.3;
   const signalType = isConflict ? 'conflict' : isHarmony ? 'harmony' : 'neutral';
   updateRelationshipSignals(userId, entropy, signalType).catch(() => {});
   // Update attachment score from ongoing interaction quality

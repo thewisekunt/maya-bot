@@ -135,8 +135,40 @@ export async function decide({
   trustLevel = 3,
   entropy    = 0.4,
   knownNames = [],
+  energy     = 0.5,   // Maya's current energy level 0–1 (from psyche dopamine+serotonin)
+  momentum   = 0,     // current conversation momentum 0–10
 }) {
   if (isDM) return _reply('DM', 10);
+
+  // ── ENERGY GATE (pipeline-level, not just tone) ────────────────────────────
+  // Low energy means Maya genuinely replies less — not just sounds tired.
+  // This makes energy a real behavioral state, not just a prompt adjective.
+  //
+  // Energy zones:
+  //   0.0–0.25: exhausted — only mentions/DMs get through
+  //   0.25–0.45: drained  — mentions, replies, high-trust users only
+  //   0.45–0.65: normal   — standard pipeline
+  //   0.65+:     energized — slightly more likely to reply
+  //
+  // Momentum overrides the gate partially — if conversation is hot,
+  // she'll push through even when drained (like a second wind)
+  const momentumOverride = momentum >= 6;  // hot convo pulls her back in
+
+  if (energy < 0.25 && !momentumOverride) {
+    // Exhausted: only respond if directly addressed
+    if (!isMention && !isReply && !isDM) {
+      return _ignore('exhausted — not mentioned');
+    }
+  } else if (energy < 0.45 && !momentumOverride) {
+    // Drained: only mentions, direct replies, or high-trust users
+    if (!isMention && !isReply && trustLevel < 4) {
+      // 20% chance to still reply — she might rally briefly
+      if (Math.random() > 0.20) return _ignore('drained — low priority');
+    }
+  } else if (energy >= 0.70) {
+    // Energized: small bonus applied downstream in scoring
+    // (no gate — just flows through with better scores)
+  }
 
   const ch  = getChannel(channelId);
   const now = Date.now();

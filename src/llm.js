@@ -84,6 +84,7 @@ export async function getMayaReply({
   currentMoment  = null,  // synthesized prose paragraph from moment.js
   momentum       = 0,     // conversation momentum score 0–10
   lastExchangeQuality = 'none',
+  emojiHint      = null,  // server emoji suggestions for this mood
 }) {
   // ── Build system prompt ───────────────────────────────────────────────────
   // When forceVerbal: strip REACT instruction entirely so the model never
@@ -175,6 +176,8 @@ export async function getMayaReply({
       safeKnownFacts.slice(0, 4).forEach(f => parts.push(`  • ${f}`));
     }
   }
+
+  if (emojiHint) parts.push(emojiHint);
 
   if (forceVerbal)
     parts.push(`Respond with actual words. No emoji-only responses.`);

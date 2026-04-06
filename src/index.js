@@ -19,6 +19,7 @@ import db from './db.js';
 import { evaluate } from './notif.js';
 import { saveNotification, markSeen, processMorningInbox, dismissOldNotifications } from './inbox.js';
 import { markMissing } from './context_enricher.js';
+import { observeEmojis, observeReactionEmoji, getEmojiHint } from './emoji.js';
 
 // Selfbot client — no intents/partials needed, user accounts receive all events
 const client = new Client({ checkUpdate: false });
@@ -125,6 +126,9 @@ client.on('messageCreate', async (msg) => {
   // Channel allowlist
   const allowed = config.discord.allowedChannels;
   if (allowed.length > 0 && msg.guild && !allowed.includes(channelId)) return;
+
+  // ── Observe custom emojis (fire-and-forget, every message) ──────────────
+  if (guildId && content) observeEmojis(msg, guildId, msg.author.id).catch(() => {});
 
   // ── Always observe ────────────────────────────────────────────────────────
   if (!isDM) {
@@ -467,7 +471,72 @@ client.on('messageReactionAdd', async (reaction, user) => {
     await reaction.message.react(emoji).catch(() => {});
     _recentMirrors.set(channelId, Date.now());
     console.log(`[react] mirrored ${emoji} in ${channelId} (count=${count})`);
+    // Observe custom emojis from reactions too
+    observeReactionEmoji(reaction, user.id, reaction.message.guild?.id).catch(() => {});
   } catch { /* non-fatal */ }
+});
+
+// ── Member join welcome ──────────────────────────────────────────────────────
+// When someone joins while Maya is active, she can welcome them naturally
+// Only fires if Maya is not sleeping and has an active channel in this guild
+
+client.on('guildMemberAdd', async (member) => {
+  try {
+    if (isSleeping()) return;
+
+    const guildId = member.guild.id;
+    const userId  = member.id;
+    const name    = member.displayName || member.user?.username || 'someone';
+
+    // Find the most active channel Maya has been in for this guild
+    const { getMostActiveChannel } = await import('./scanner.js');
+    const channelId = await getMostActiveChannel(guildId).catch(() => null);
+    if (!channelId) return;
+
+    // Small natural delay — she doesn't want to sound like a bot
+    const delay = 3000 + Math.random() * 5000;
+    await new Promise(r => setTimeout(r, delay));
+
+    const channel = await client.channels.fetch(channelId).catch(() => null);
+    if (!channel) return;
+
+    // Generate a welcome via LLM — casual, not bot-like
+    const { default: axiosImport } = await import('axios');
+    const { config: cfg } = await import('./config.js');
+
+    const { data, status } = await axiosImport.post(cfg.llm.endpoint, {
+      model:       'deepseek/deepseek-chat-v3-0324',
+      messages:    [{
+        role: 'user',
+        content: `You are Maya, a real girl in a Discord server. ${name} just joined.
+Write a natural, casual welcome — 1 sentence max. Hinglish is fine.
+Don't be formal, don't say "welcome to the server", don't use exclamation marks excessively.
+Examples of good style: "oi ${name} finally", "oh hey ${name}", "new face 👀 hi ${name}"
+Output only the message, nothing else.`
+      }],
+      temperature: 0.9, max_tokens: 40,
+    }, {
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${cfg.llm.apiKey}` },
+      timeout: 8000, validateStatus: () => true,
+    });
+
+    if (status !== 200) return;
+    const msg = data?.choices?.[0]?.message?.content?.trim();
+    if (!msg) return;
+
+    await channel.send(msg).catch(() => {});
+
+    const { saveMessage } = await import('./memory.js');
+    saveMessage({
+      userId: 'maya', prefName: 'Maya', guildId, channelId,
+      contextType: 'server', isPrivate: false, sender: 'maya',
+      message: `[welcomed new member ${name}]: ${msg}`, entropy: 0.2,
+    }).catch(() => {});
+
+    console.log(`[welcome] greeted ${name} in ${channelId}`);
+  } catch (e) {
+    console.warn('[welcome] failed:', e.message);
+  }
 });
 
 client.on('error', err => console.error('[bot] Client error:', err));

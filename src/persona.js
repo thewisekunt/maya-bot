@@ -67,11 +67,17 @@ function calcTrust(dmCount, serverCount, daysSinceFirst, daysSinceLast,
                          : 0;
 
   // Harmony/conflict adjustment
-  // Conflicts reduce the score; positive interactions add a small bonus
-  const conflictPenalty = conflictCount * 8;
-  const harmonyBonus    = Math.min(harmonyCount * 2, 20);  // capped at +20
+  // Conflict is weighted HEAVIER than harmony — trust is hard to build, easy to lose.
+  // 1 conflict undoes ~3 harmony interactions.
+  const conflictPenalty = conflictCount * 12;          // was 8 — harder hit
+  const harmonyBonus    = Math.min(harmonyCount * 3, 30);  // was 2/20 — more reward for consistency
 
-  const score = weighted + recencyBonus + consistencyBonus - conflictPenalty + harmonyBonus;
+  // Ratio penalty: if conflict > 30% of all interactions, trust is suppressed
+  const totalInteractions = harmonyCount + conflictCount || 1;
+  const conflictRatio     = conflictCount / totalInteractions;
+  const ratioPenalty      = conflictRatio > 0.3 ? (conflictRatio - 0.3) * 60 : 0;
+
+  const score = weighted + recencyBonus + consistencyBonus - conflictPenalty - ratioPenalty + harmonyBonus;
 
   if (score >= 150) return 5;
   if (score >= 60)  return 4;
