@@ -1,3 +1,4 @@
+import { updateUserBelief, updateSelfBelief, detectIdentityConflict } from './meta.js';
 import { runLearningCycle } from './learn.js';
 /**
  * dream.js — Session-based memory consolidation
@@ -298,9 +299,13 @@ async function _dreamCycle() {
 
     const hasWork = pendingEmbed.n > 0 || pendingNLP.n > 0 || pendingDecisions.n > 0;
 
+    // Beliefs and self-belief formation run on every cycle regardless of other work
+    // They're based on time + interaction volume, not pending jobs
+    await _updateBeliefs().catch(e => console.error('[dream] belief update:', e.message));
+    await _formSelfBeliefs().catch(e => console.error('[dream] self-belief:', e.message));
+
     if (!hasWork) {
-      // Nothing to do — skip heavy phases, just log
-      console.log('[dream] cycle skipped — no pending work');
+      console.log('[dream] cycle skipped (embed/NLP/decisions) — beliefs still ran');
       _running = false;
       return;
     }
@@ -449,5 +454,185 @@ async function _runMemoryDecay() {
     }
   } catch (e) {
     console.error('[dream] memory decay error:', e.message);
+  }
+}
+
+// ── Belief updates from recent interactions ───────────────────────────────────
+
+async function _updateBeliefs() {
+  // Build user beliefs from real interaction patterns:
+  // - Message volume per user (high volume = she knows them)
+  // - Harmony vs conflict counts from relationship table
+  // - Trust level evolution
+  // - NLP training rewards (positive = liked her replies, 0 = didn't engage)
+
+  // Get users Maya has talked to recently with enough data to form a belief
+  const [users] = await db.execute(
+    `SELECT r.discord_user_id,
+            COALESCE(u.display_name, u.username, r.discord_user_id) as user_name,
+            r.trust_level, r.harmony_count, r.conflict_count,
+            r.total_messages, r.attachment_score,
+            r.avg_entropy,
+            r.last_interaction
+     FROM maya_user_relationships r
+     LEFT JOIN maya_users u ON u.discord_user_id = r.discord_user_id
+     WHERE r.total_messages >= 5
+       AND r.last_interaction > DATE_SUB(NOW(), INTERVAL 7 DAY)
+     ORDER BY r.total_messages DESC
+     LIMIT 30`
+  ).catch(() => [[]]);
+
+  for (const u of users || []) {
+    try {
+      const harmony   = parseInt(u.harmony_count)  || 0;
+      const conflict  = parseInt(u.conflict_count) || 0;
+      const trust     = parseInt(u.trust_level)    || 3;
+      const msgs      = parseInt(u.total_messages) || 0;
+      const totalInteractions = harmony + conflict || 1;
+
+      // Derive sentiment from relationship signals — much more accurate than entropy proxy
+      const harmonyRatio   = harmony / totalInteractions;
+      const isPositive     = harmonyRatio > 0.6 || trust >= 4;
+      const isNegative     = harmonyRatio < 0.3 || conflict > harmony * 1.5;
+      const sentimentScore = isPositive ? 0.5 : isNegative ? -0.5 : 0.1;
+      const sentiment      = isPositive ? 'positive' : isNegative ? 'negative' : 'neutral';
+
+      // Build a descriptive event summary for the belief
+      const eventText = `${u.user_name}: ${msgs} msgs, trust ${trust}/5, `
+        + `${harmony} harmony / ${conflict} conflict`;
+
+      await updateUserBelief(u.discord_user_id, eventText, sentiment, sentimentScore);
+      await new Promise(res => setTimeout(res, 80));
+    } catch { /* non-fatal per user */ }
+  }
+
+  // Also scan NLP training rewards — if a user's messages consistently got
+  // positive implicit reward (user continued talking), that's a signal
+  const [rewarded] = await db.execute(
+    `SELECT n.text, m.discord_user_id,
+            AVG(n.reward) as avg_reward, COUNT(*) as count
+     FROM maya_nlp_training n
+     JOIN maya_memory m ON m.message = n.text
+     WHERE n.reward IS NOT NULL
+       AND n.created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
+     GROUP BY m.discord_user_id
+     HAVING count >= 3
+     LIMIT 20`
+  ).catch(() => [[]]);
+
+  for (const r of rewarded || []) {
+    if (!r.discord_user_id) continue;
+    const avgReward = parseFloat(r.avg_reward || 0);
+    if (Math.abs(avgReward - 0.5) < 0.1) continue; // too neutral to matter
+    await updateUserBelief(
+      r.discord_user_id,
+      `conversation quality signal: avg_reward=${avgReward.toFixed(2)}`,
+      avgReward > 0.5 ? 'positive' : 'negative',
+      (avgReward - 0.5) * 2
+    );
+  }
+
+  if ((users || []).length > 0) {
+    console.log(`[dream] beliefs updated for ${users.length} users`);
+  }
+}
+
+async function _formSelfBeliefs() {
+  // Form self-beliefs from overall interaction patterns, even without meta log data
+
+  // Seed basic self-beliefs from message stats — who talks to Maya and how
+  const [[msgStats]] = await db.execute(
+    `SELECT
+       COUNT(DISTINCT discord_user_id) as unique_users,
+       COUNT(*) as total_msgs,
+       AVG(entropy) as avg_entropy,
+       SUM(CASE WHEN sender='maya' THEN 1 ELSE 0 END) as maya_msgs
+     FROM maya_memory
+     WHERE created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)`
+  ).catch(() => [[null]]);
+
+  if (msgStats && msgStats.total_msgs > 20) {
+    const responseRate = msgStats.maya_msgs / (msgStats.total_msgs || 1);
+    const avgEntropy   = parseFloat(msgStats.avg_entropy || 0);
+
+    if (responseRate > 0.4) {
+      await updateSelfBelief('I am fairly active in conversations — I respond a lot', 0.45);
+    } else {
+      await updateSelfBelief('I am selective about when I respond — I choose my moments', 0.40);
+    }
+
+    if (avgEntropy > 0.5) {
+      await updateSelfBelief('The conversations I have tend to be emotionally complex', 0.40);
+    } else {
+      await updateSelfBelief('Most of my conversations are casual and easy', 0.40);
+    }
+
+    // How many unique users vs total messages — depth vs breadth
+    const depthRatio = msgStats.total_msgs / (msgStats.unique_users || 1);
+    if (depthRatio > 50) {
+      await updateSelfBelief('I connect deeply with a few people rather than spreading thin', 0.50);
+    } else if (msgStats.unique_users > 10) {
+      await updateSelfBelief('I interact with a lot of different people', 0.45);
+    }
+  }
+
+  // Harmony vs conflict across all relationships
+  const [[relStats]] = await db.execute(
+    `SELECT AVG(harmony_count) as avg_harmony, AVG(conflict_count) as avg_conflict,
+            AVG(trust_level) as avg_trust, COUNT(*) as user_count
+     FROM maya_user_relationships
+     WHERE total_messages >= 5`
+  ).catch(() => [[null]]);
+
+  if (relStats && relStats.user_count > 2) {
+    const h = parseFloat(relStats.avg_harmony || 0);
+    const c = parseFloat(relStats.avg_conflict || 0);
+    if (h > c * 1.5) {
+      await updateSelfBelief('Most of my interactions are positive — people generally like talking to me', 0.50);
+    } else if (c > h) {
+      await updateSelfBelief('I tend to generate friction sometimes — not everyone vibes with me immediately', 0.40);
+    }
+    if (parseFloat(relStats.avg_trust || 0) >= 4) {
+      await updateSelfBelief('The people who stick around tend to become genuinely close', 0.55);
+    }
+  }
+
+  // Meta log analysis (runs if data exists, optional)
+  const [[metaStats]] = await db.execute(
+    `SELECT
+       COUNT(*) as total,
+       SUM(meta_decision='modify') as modified,
+       SUM(meta_decision='suppress') as suppressed,
+       AVG(entropy) as avg_entropy
+     FROM maya_inner_voice_log
+     WHERE created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)`
+  ).catch(() => [[{ total: 0, modified: 0, suppressed: 0, avg_entropy: 0 }]]);
+
+  const stats = metaStats;
+  if (!stats || stats.total < 5) return;
+
+  const modifyRate   = stats.modified   / stats.total;
+  const suppressRate = stats.suppressed / stats.total;
+
+  if (modifyRate > 0.4) {
+    await updateSelfBelief('I often say things I then reconsider — I can be impulsive', 0.45);
+  } else if (modifyRate < 0.1) {
+    await updateSelfBelief('I usually mean what I say the first time', 0.50);
+  }
+
+  if (suppressRate > 0.2) {
+    await updateSelfBelief('I sometimes hold back when things get too tense', 0.50);
+  }
+
+  if (stats.avg_entropy > 5) {
+    await updateSelfBelief('I get emotionally involved in conversations easily', 0.45);
+  }
+
+  // Check identity conflicts and log them
+  const conflict = await detectIdentityConflict();
+  if (conflict) {
+    console.log(`[dream] identity conflict detected: "${conflict.positive.statement}" vs "${conflict.negative.statement}"`);
+    // Store a self-belief acknowledging the contradiction
+    await updateSelfBelief(`I have conflicting feelings about how I fit in — sometimes valued, sometimes invisible`, 0.40);
   }
 }
