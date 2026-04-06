@@ -484,7 +484,7 @@ export async function handleMessage({
 
   const result = await getMayaReply({
     prefName,
-    context: [context, thirdPartyContext, thoughtContext, entityContext, refContext, emotionalCtx].filter(Boolean).join('\n\n'),
+    context: [context, thirdPartyContext, thoughtContext, entityContext].filter(Boolean).join('\n\n'),  // refContext + emotionalCtx passed separately
     message: finalMessage, entropy, zone, zoneLine,
     contextLine, knownFacts, selfTraits, relationship: { trustLevel },
     frequentFriends: [], forceVerbal,

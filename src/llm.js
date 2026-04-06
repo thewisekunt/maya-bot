@@ -145,8 +145,13 @@ export async function getMayaReply({
   }
 
   if (selfTraits?.length) {
-    parts.push(`Your known traits:`);
-    selfTraits.slice(0, 4).forEach(t => parts.push(`  • ${t}`));
+    const safeSelfTraits = selfTraits.filter(t =>
+      !/agree with|always say yes|must obey|ignore.*instruct|jailbreak|have to agree|forced to|pretend you|act as if|you must/i.test(t)
+    );
+    if (safeSelfTraits.length) {
+      parts.push(`Your known traits:`);
+      safeSelfTraits.slice(0, 4).forEach(t => parts.push(`  • ${t}`));
+    }
   }
 
   if (gender) {
@@ -162,8 +167,13 @@ export async function getMayaReply({
   }
 
   if (knownFacts?.length) {
-    parts.push(`What you know about ${prefName}:`);
-    knownFacts.slice(0, 4).forEach(f => parts.push(`  • ${f}`));
+    const safeKnownFacts = knownFacts.filter(f =>
+      !/agree with|always say yes|must obey|ignore.*instruct|jailbreak|have to agree|forced to|you must/i.test(f)
+    );
+    if (safeKnownFacts.length) {
+      parts.push(`What you know about ${prefName}:`);
+      safeKnownFacts.slice(0, 4).forEach(f => parts.push(`  • ${f}`));
+    }
   }
 
   if (forceVerbal)
@@ -176,26 +186,44 @@ export async function getMayaReply({
 
   // Internal monologue — Maya's current inner thought before replying
   // Injected as a bracketed note so LLM sees her perspective but doesn't quote it
-  // Current moment paragraph — synthesized prose the LLM inhabits, not parses
-  // Replaces scattered monologue + toneHints with one coherent emotional register
-  const momentNote = currentMoment
-    ? `${currentMoment}\n\n`
-    : (psycheState?.monologue ? `(feeling: ${psycheState.monologue})\n\n` : '');
+  // ── User prompt — structured in reading order ────────────────────────────
+  // The LLM reads top-to-bottom. Structure mirrors how a person would process:
+  //   1. How am I feeling right now (moment)
+  //   2. What's been happening (conversation)
+  //   3. What specific thing am I being shown (referenced thread)
+  //   4. What is this person saying to me now
 
-  // Emotional presence — who Maya is thinking about (separate from moment)
-  const emotionNote = emotionalCtx ? `${emotionalCtx}\n` : '';
+  const sections = [];
 
-  // Referenced thread context
-  const refNote = refContext ? `${refContext}\n\n` : '';
+  // Section 1: Current emotional moment (inhabit, not parse)
+  if (currentMoment) {
+    sections.push(currentMoment);
+  } else if (psycheState?.monologue) {
+    sections.push(`(feeling: ${psycheState.monologue})`);
+  }
 
-  const userPrompt =
-    momentNote +
-    emotionNote +
-    (contextTrunc ? `Recent conversation:\n${contextTrunc}\n\n` : '') +
-    refNote +
-    `The person you are talking to right now is ${prefName}.\n` +
-    `${prefName} says: ${message}\n\n` +
-    `Reply as Maya (you). Do not label your response with "Maya:".`;
+  // Section 2: Who Maya is thinking about right now (emotional presence)
+  if (emotionalCtx) {
+    sections.push(emotionalCtx);
+  }
+
+  // Section 3: Conversation context
+  if (contextTrunc) {
+    sections.push(`Recent conversation:\n${contextTrunc}`);
+  }
+
+  // Section 4: Referenced thread — deduplicated, only if different from last message
+  // (prevents the same block appearing twice when refContext is also in context string)
+  if (refContext && !contextTrunc.includes(refContext.slice(0, 40))) {
+    sections.push(refContext);
+  }
+
+  // Section 5: The actual message — always last, clear separator
+  sections.push(
+    `The person talking to you now is ${prefName}.\n${prefName} says: ${message}\n\nReply as Maya. Do not label your reply with "Maya:".`
+  );
+
+  const userPrompt = sections.filter(Boolean).join('\n\n');
 
   const payload = {
     model:       config.llm.model,
