@@ -84,6 +84,7 @@ export async function handleMessage({
 
   // ── 5. Trust — compute dynamically from interaction history ───────────────
   let trustLevel = 3;
+  let attachmentScore = 0.3;  // pulled from DB below
   try {
     // First upsert the relationship row
     const counterCol = contextType === 'dm' ? 'dm_count' : 'server_count';
@@ -97,8 +98,15 @@ export async function handleMessage({
          last_interaction = NOW()`,
       [userId]
     );
-    // Then recalculate trust from the updated stats
-    trustLevel = await getOrCreateRelationship(userId, contextType).then(r => r.trustLevel);
+    // Then recalculate trust + fetch attachment from the updated stats
+    const rel = await getOrCreateRelationship(userId, contextType);
+    trustLevel = rel.trustLevel;
+    // Pull attachment_score directly — not returned by getOrCreateRelationship
+    const [[relRow]] = await db.execute(
+      `SELECT attachment_score FROM maya_user_relationships WHERE discord_user_id=? LIMIT 1`,
+      [userId]
+    ).catch(() => [[{ attachment_score: 0.3 }]]);
+    attachmentScore = parseFloat(relRow?.attachment_score || 0.3);
   } catch (e) {
     console.error('[handler] trust update:', e.message);
   }
@@ -312,7 +320,7 @@ export async function handleMessage({
     message:      richMessageText,
     userId, channelId, guildId,
     nlpSignal, entropy, trustLevel,
-    attachmentScore: psycheState?.attachment || attachmentScore || 0.3,
+    attachmentScore: attachmentScore || psycheState?.attachment || 0.3,
     isMention, isDM, isReply,
   });
 

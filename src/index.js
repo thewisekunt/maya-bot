@@ -316,7 +316,7 @@ async function _processNotification(messages, triggerNotif, client) {
     const notif = { ...triggerNotif, msg };
     const evaluation = await evaluate(notif, client.user.id);
 
-    console.log(`[notif] action=${evaluation.action} reason="${evaluation.reason}" trigger=${triggerNotif.triggerWord}`);
+    console.log(`[notif] action=${evaluation.action} reason="${evaluation.reason}" trigger=${triggerNotif.triggerWord || triggerNotif.type || 'unknown'}`);
 
     if (evaluation.action === 'ignore') return;
 
