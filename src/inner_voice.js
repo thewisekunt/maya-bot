@@ -119,7 +119,7 @@ export async function runInnerVoice(input) {
 
   // ── 7. Persistent desires ─────────────────────────────────────────────────
   const desirePressure = await getDesirePressure(userId).catch(() => 0);
-  const desireCtx      = await getDesireContext(userId).catch(() => null);
+  const desireCtx      = await getDesireContext().catch(() => null);
   const activeDesires  = await getDesires({ targetId: userId }).catch(() => []);
 
   // ── 8. Identity core ──────────────────────────────────────────────────────

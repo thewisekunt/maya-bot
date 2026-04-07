@@ -26,7 +26,7 @@ import { detectCommitment } from './commitments.js';
 import { logDecision, resolveDecision, computeReward } from './learn.js';
 import { buildContextLine, upsertGuild, upsertChannel } from './context.js';
 import { runInnerVoice, evaluateReply, executeToolPlan } from './inner_voice.js';
-import { onGoodInteraction, onConflict } from './desires.js';
+import { onGoodInteraction, onConflict, onIgnored, getDominantDesire, updateDesiresFromOutcome, getDesireContext } from './desires.js';
 import { resolveIntent } from './intent_engine.js';
 import { extractMediaContext } from './vision.js';
 import { debugLog } from './logger.js';
