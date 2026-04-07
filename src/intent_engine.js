@@ -43,7 +43,17 @@ export function resolveIntent(inner, opts = {}) {
     obsState,
     energy,
     situation,
+    activeDesires = [],
+    desireModifier = 0,
   } = inner;
+
+  // Identity anchor check — some desires are blocked by who Maya IS
+  // e.g. if she has a strong "I don't grovel" self-belief, avoid can't force groveling
+  // This is kept simple: desire creates distance only adjusts thresholds, not overrides
+  const targetUserId = opts.userId || null;
+  const hasAvoidDesire  = activeDesires.some(d => d.desire_type === 'avoid'  && d.target_id === targetUserId);
+  const hasTalkDesire   = activeDesires.some(d => d.desire_type === 'talk_to' && d.target_id === targetUserId);
+  const hasResolveDesire = activeDesires.some(d => d.desire_type === 'resolve_conflict' && d.target_id === targetUserId);
 
   const { isMention = false, isDM = false, isReply = false, isSleeping = false } = opts;
 
@@ -71,9 +81,21 @@ export function resolveIntent(inner, opts = {}) {
     }
   }
 
+  // ── Avoid desire overrides low intent (but not hard pings) ──────────────
+  if (hasAvoidDesire && !isMention && !isDM && !isReply && intentScore < 0.70) {
+    return { action: 'ignore', reason: 'desire to avoid this user' };
+  }
+
   // ── Hard address — always respond ─────────────────────────────────────────
   if (contextForce >= 0.70 || isDM) {
-    return { action: 'reply', reason: 'directly addressed' };
+    // Resolve_conflict desire: even hard pings get a warmer response signal
+    const reason = hasResolveDesire ? 'directly addressed (wants to resolve)' : 'directly addressed';
+    return { action: 'reply', reason };
+  }
+
+  // ── Talk_to desire lowers the threshold for engagement ────────────────────
+  if (hasTalkDesire && intentScore >= 0.35) {
+    return { action: 'reply', reason: 'desire to connect with this user' };
   }
 
   // ── Below engagement threshold — silence ──────────────────────────────────
@@ -107,6 +129,23 @@ export function resolveIntent(inner, opts = {}) {
       reason:  `moderate engagement (score=${intentScore.toFixed(2)})`,
       emoji:   _pickEmoji(psyche),
     };
+  }
+
+  // ── Identity influence ────────────────────────────────────────────────────
+  // High-confidence self-beliefs (anchors) shape behavior even at moderate intent
+  const identity = inner.identityCore || [];
+  const isPlayfulIdentity = identity.some(b => /playful|fun|joke|humor/i.test(b.statement));
+  const isSelectiveIdentity = identity.some(b => /selective|few people|choose/i.test(b.statement));
+
+  // Desire-modulated action — if strong avoid desire, react instead of reply
+  const avoidDesire = (inner.activeDesires || []).find(d => d.type === 'avoid');
+  if (avoidDesire && avoidDesire.intensity > 0.6 && !situation?.isDirect) {
+    return { action: 'react', reason: 'avoid desire active', emoji: '👀' };
+  }
+
+  // Selective identity + mid intent = more likely to react than reply
+  if (isSelectiveIdentity && intentScore < 0.65 && !situation?.isDirect) {
+    return { action: 'react', reason: 'selective identity — not compelled', emoji: '👀' };
   }
 
   // ── High intent — full reply ───────────────────────────────────────────────

@@ -31,6 +31,8 @@
 import { getChannelState } from './psyche.js';
 import { getMomentum }      from './moment.js';
 import { getObservationState, ZONES } from './observation.js';
+import { getDesires, getDesirePressure, getDesireContext, fulfillDesire, onGoodInteraction, onConflict } from './desires.js';
+import { getIdentityCore } from './meta.js';
 import { detectBeliefConflict, getBeliefs } from './meta.js';
 import { config } from './config.js';
 import axios from 'axios';
@@ -115,14 +117,33 @@ export async function runInnerVoice(input) {
     ? await detectBeliefConflict(userId, nlpSignal.sentiment, nlpSignal.sentimentScore, trustLevel).catch(() => false)
     : false;
 
-  // ── 7. Tool planning ──────────────────────────────────────────────────────
-  const toolPlan = _planTools({ situation, obsState, psyche, message, nlpSignal, beliefConflict, trustLevel });
+  // ── 7. Persistent desires ─────────────────────────────────────────────────
+  const desirePressure = await getDesirePressure(userId).catch(() => 0);
+  const desireCtx      = await getDesireContext(userId).catch(() => null);
+  const activeDesires  = await getDesires({ targetId: userId }).catch(() => []);
 
-  // ── 8. Intent score ───────────────────────────────────────────────────────
+  // ── 8. Identity core ──────────────────────────────────────────────────────
+  // Self-beliefs that have become identity anchors — slow-changing, high-confidence
+  const identityCore = await getIdentityCore().catch(() => []);
+
+  // ── 9. Tool planning (LLM-assisted for complex situations) ────────────────
+  const toolPlan = await _planTools({
+    situation, obsState, psyche, message, nlpSignal,
+    beliefConflict, trustLevel, desirePressure, identityCore,
+  });
+
+  // ── 10. Intent score (now includes desire pressure) ───────────────────────
+  // desirePressure is -1 to +1: positive = drawn toward, negative = avoid
+  const desireComponent = desirePressure > 0
+    ? desirePressure * 0.20       // desire to engage adds to intent
+    : Math.max(-0.15, desirePressure * 0.15); // avoidance subtracts (capped)
+
   const intentScore = Math.max(0, Math.min(1,
-    internalPressure * 0.3 +
-    contextForce     * 0.5 +
-    (1 - socialRisk) * 0.2
+    internalPressure * 0.25 +
+    contextForce     * 0.45 +
+    (1 - socialRisk) * 0.15 +
+    desireComponent  +
+    0.15             // base participation score
   ));
 
   console.log(
@@ -130,6 +151,13 @@ export async function runInnerVoice(input) {
     `pressure=${internalPressure.toFixed(2)} risk=${socialRisk.toFixed(2)} ` +
     `zone=${obsState.zone} tools=[${toolPlan.map(t => t.tool).join(',')}]`
   );
+
+  // ── 11. Store inner voice decision to DB for pattern learning ───────────
+  _logInnerVoice({
+    userId, channelId,
+    situation, toolPlan, intentScore,
+    activeDesires, identityCore,
+  }).catch(() => {});
 
   return {
     situation,
@@ -143,6 +171,10 @@ export async function runInnerVoice(input) {
     obsState,
     energy,
     momentum,
+    desirePressure,
+    desireCtx,
+    activeDesires,
+    identityCore,
   };
 }
 
@@ -168,6 +200,8 @@ export async function evaluateReply(snapshot) {
     userBeliefs = [],
     selfBeliefs = [],
     refContext  = null,
+    desireCtx   = null,
+    identityCore = [],
   } = snapshot;
 
   const emotions  = psyche?.emotions  || {};
@@ -207,6 +241,9 @@ Maya's state:
 
 Beliefs:
 ${beliefCtx}
+
+${desireCtx ? `Active desires: ${desireCtx}` : ''}
+${identityCore.length ? `Identity anchors: ${identityCore.slice(0,2).map(b => b.statement).join('; ')}` : ''}
 
 Trigger: ${trigger || 'none'}
 
@@ -422,34 +459,85 @@ function _computeSocialRisk({ obsState, energy, chanEntropy, trustLevel }) {
   return Math.max(0, Math.min(1, risk));
 }
 
-function _planTools({ situation, obsState, psyche, message, nlpSignal, beliefConflict, trustLevel }) {
+async function _planTools({ situation, obsState, psyche, message, nlpSignal, beliefConflict, trustLevel, desirePressure, identityCore }) {
   const tools = [];
 
-  // Emotional message from someone she knows well — pull deeper memory
+  // ── Fast heuristic pass (free, synchronous) ────────────────────────────────
+  // These are high-confidence triggers — don't waste LLM on them
+
   if (situation.emotional && trustLevel >= 3) {
-    tools.push({ tool: 'deepMemoryRecall', reason: 'emotional context needs depth' });
+    tools.push({ tool: 'deepMemoryRecall', reason: 'emotional context' });
   }
-
-  // Belief conflict — she needs to know what she already believes
   if (beliefConflict) {
-    tools.push({ tool: 'checkRelationship', reason: 'belief conflict detected' });
+    tools.push({ tool: 'checkRelationship', reason: 'belief conflict' });
   }
-
-  // Chaos zone — read the room before jumping in
   if (obsState?.zone === ZONES.CHAOS && !situation.isDirect) {
-    tools.push({ tool: 'readRoom', reason: 'chaos zone — assess before engaging' });
+    tools.push({ tool: 'readRoom', reason: 'chaos zone' });
   }
-
-  // Message references something potentially unfamiliar
-  // Simple heuristic: proper nouns, version numbers, specific names
-  const hasUnfamiliar = /\b[A-Z][a-z]+\s[A-Z][a-z]+\b|\bv\d+\.\d+|\b202[4-9]\b/.test(message);
-  if (hasUnfamiliar && nlpSignal?.intent === 'question_to_maya') {
-    tools.push({ tool: 'webSearch', reason: 'unfamiliar reference in question' });
-  }
-
-  // Has a reply reference and context seems thin
   if (nlpSignal?.intent === 'question_to_maya' && situation.urgency > 0.7) {
-    tools.push({ tool: 'analyzeThread', reason: 'direct question, want full thread context' });
+    tools.push({ tool: 'analyzeThread', reason: 'direct question' });
+  }
+
+  // ── LLM-assisted tool reasoning for ambiguous situations ──────────────────
+  // Only run when: complex message + no tools yet + not obvious case
+  const isComplex = message.length > 80 || situation.emotional ||
+    (nlpSignal?.score || 0) < 0.6 ||  // NLP is uncertain
+    (desirePressure || 0) < -0.3;      // avoidance desire active
+
+  if (isComplex && tools.length === 0) {
+    try {
+      const identityCtx = identityCore.slice(0, 2).map(b => b.statement).join('; ');
+      const prompt = `Maya is a real person in a Discord server.
+
+She received: "${message.slice(0, 200)}"
+
+Her state:
+  Zone: ${obsState?.zone || 'evolving'}
+  Energy: ${(psyche?.hormones?.dopamine || 0.5).toFixed(2)}
+  Emotional: ${situation.emotional}
+  Trust with sender: ${trustLevel}/5
+  Identity: ${identityCtx || 'not yet formed'}
+
+Available tools she could use before responding:
+  deepMemoryRecall  — pull extended conversation history with this person
+  readProfile       — look at their avatar/bio for more context
+  analyzeThread     — fetch the full thread/reply chain
+  checkRelationship — review what she knows and believes about them
+  readRoom          — check what's been happening in the channel
+  webSearch         — look up something unfamiliar
+
+Which tools (if any) would actually help her respond better here?
+Return ONLY valid JSON array (can be empty):
+[{"tool": "toolName", "reason": "why"}, ...]`;
+
+      const { data, status } = await axios.post(config.llm.endpoint, {
+        model:       config.llm.models.meta,  // fast, cheap
+        messages:    [{ role: 'user', content: prompt }],
+        temperature: 0.1,
+        max_tokens:  80,
+      }, {
+        headers: {
+          'Content-Type':  'application/json',
+          'Authorization': `Bearer ${config.llm.apiKey}`,
+          'HTTP-Referer':  'https://chatmasala.fun',
+        },
+        timeout: 4000,  // tight timeout — tools are optional
+        validateStatus: () => true,
+      });
+
+      if (status === 200) {
+        const raw   = data?.choices?.[0]?.message?.content?.trim() || '[]';
+        const clean = raw.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+        const llmTools = JSON.parse(clean);
+        if (Array.isArray(llmTools)) {
+          for (const t of llmTools) {
+            if (t.tool && !tools.find(existing => existing.tool === t.tool)) {
+              tools.push({ tool: t.tool, reason: t.reason || 'llm-suggested' });
+            }
+          }
+        }
+      }
+    } catch { /* tool planning is non-fatal — proceed without */ }
   }
 
   return tools;
@@ -457,4 +545,29 @@ function _planTools({ situation, obsState, psyche, message, nlpSignal, beliefCon
 
 function _approve(reply, reason = '') {
   return { decision: 'approve', reason, finalReply: reply, metaChanged: false };
+}
+
+// ── Inner voice logging ───────────────────────────────────────────────────────
+
+async function _logInnerVoice({ userId, channelId, situation, toolPlan, intentScore, activeDesires, identityCore }) {
+  if (!userId) return;
+  try {
+    await db.execute(
+      `INSERT INTO maya_inner_voice_log
+         (user_id, channel_id, primary_reply, meta_decision, meta_reason,
+          entropy, trigger, situation_json, tool_plan_json, intent_score, desires_active)
+       VALUES (?, ?, '', 'pending', 'pre-generation',
+               ?, ?, ?, ?, ?, ?)`,
+      [
+        userId,
+        channelId || null,
+        situation.entropy || 0,
+        situation.zone || 'unknown',
+        JSON.stringify({ isDirect: situation.isDirect, urgency: situation.urgency, zone: situation.zone }),
+        JSON.stringify(toolPlan.map(t => t.tool)),
+        intentScore,
+        JSON.stringify(activeDesires.slice(0, 3).map(d => ({ type: d.type, intensity: d.intensity }))),
+      ]
+    );
+  } catch { /* non-fatal */ }
 }

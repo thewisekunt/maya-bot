@@ -26,6 +26,7 @@ import { detectCommitment } from './commitments.js';
 import { logDecision, resolveDecision, computeReward } from './learn.js';
 import { buildContextLine, upsertGuild, upsertChannel } from './context.js';
 import { runInnerVoice, evaluateReply, executeToolPlan } from './inner_voice.js';
+import { onGoodInteraction, onConflict } from './desires.js';
 import { resolveIntent } from './intent_engine.js';
 import { extractMediaContext } from './vision.js';
 import { debugLog } from './logger.js';
@@ -239,17 +240,19 @@ export async function handleMessage({
   const { zone: mZone } = getMomentumZone(momentum);
   const lastExchangeQuality = isReactive ? 'high' : momentum > 5 ? 'mid' : 'low';
 
+  const dominantDesire = await getDominantDesire().catch(() => null);
   const currentMoment = synthesizeMoment({
     hormones:            psycheState?.hormones || {},
     emotions:            psycheState?.emotions || {},
     entropy:             psycheState?.entropy  || 0,
     momentum,
     trustLevel,
-    attachmentScore:     psycheState?.attachment || 0.3,
+    attachmentScore:     psycheState?.attachment || attachmentScore || 0.3,
     prefName,
     lastExchangeQuality,
-    emotionalPresence:   null,  // filled by emotionalCtx below
+    emotionalPresence:   null,
     maskFailing:         psycheState?.maskFailing || false,
+    dominantDesire,
   });
 
   // ── 8b. Image generation shortcut ────────────────────────────────────────
@@ -526,6 +529,7 @@ export async function handleMessage({
     lastExchangeQuality,
     refContext,
     emojiHint,
+    desireCtx: innerCognition.desireCtx || null,
   });
 
   // Meta layer may have suppressed the response
@@ -558,11 +562,26 @@ export async function handleMessage({
   const isHarmony  = nlpSignal?.sentiment === 'positive' && nlpSignal?.sentimentScore > 0.3;
   const signalType = isConflict ? 'conflict' : isHarmony ? 'harmony' : 'neutral';
   updateRelationshipSignals(userId, entropy, signalType).catch(() => {});
+  // Update desires based on interaction quality
+  if (isHarmony) onGoodInteraction(userId, prefName).catch(() => {});
+  if (isConflict) onConflict(userId, prefName).catch(() => {});
   // Update attachment score from ongoing interaction quality
   const { updateAttachment, checkInitiationReply } = await import('./initiate.js');
   updateAttachment(userId, contextType, trustLevel, signalType, {
     sentiment:      nlpSignal?.sentiment      || 'neutral',
     sentimentScore: nlpSignal?.sentimentScore  || 0,
+  }).catch(() => {});
+
+  // Update persistent desires from this interaction outcome
+  updateDesiresFromOutcome({
+    userId, userName: prefName,
+    outcome:    result?.type === 'reply' ? 'positive' : 'neutral',
+    sentiment:  nlpSignal?.sentiment    || 'neutral',
+    isConflict,
+    isHarmony,
+    hormones:   psycheState?.hormones   || {},
+    emotions:   psycheState?.emotions   || {},
+    trustLevel,
   }).catch(() => {});
   // Check if this message is a contextual reply to Maya's proactive initiation
   // NLP context is now available — weight the reply properly
