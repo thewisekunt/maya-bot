@@ -350,12 +350,17 @@ export async function handleMessage({
 
   // ── REACT ─────────────────────────────────────────────────────────────────
   if (action === 'react') {
+    // Try server emoji first if decision flagged it
+    let reactEmoji = decision.emoji;
+    if (decision.useSvEmoji && guildId) {
+      reactEmoji = await getReactEmoji(guildId, psycheState, userId).catch(() => decision.emoji);
+    }
     saveMessage({ userId, prefName, guildId, channelId, contextType,
       isPrivate, sender: 'user', message, entropy }).catch(() => {});
     saveMessage({ userId: 'maya', prefName: 'Maya', guildId, channelId, contextType,
-      isPrivate, sender: 'maya', message: `*reacted with ${decision.emoji}*`, entropy }).catch(() => {});
-    debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: `REACT:${decision.emoji}` });
-    return { type: 'react', emoji: decision.emoji };
+      isPrivate, sender: 'maya', message: `*reacted ${reactEmoji} to: "${message.slice(0,80)}"*`, entropy }).catch(() => {});
+    debugLog({ userId, prefName, entropy, zone, message: richMessageText, reply: `REACT:${reactEmoji}` });
+    return { type: 'react', emoji: reactEmoji };
   }
 
   // ── REPLY — fetch memory + known facts + call LLM ────────────────────────

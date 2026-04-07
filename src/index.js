@@ -21,7 +21,7 @@ import db from './db.js';
 import { evaluate } from './notif.js';
 import { saveNotification, markSeen, processMorningInbox, dismissOldNotifications } from './inbox.js';
 import { markMissing } from './context_enricher.js';
-import { observeEmojis, observeReactionEmoji, getEmojiHint } from './emoji.js';
+import { observeEmojis, observeReactionEmoji, getEmojiHint, logReactionReceived } from './emoji.js';
 
 // Selfbot client — no intents/partials needed, user accounts receive all events
 const client = new Client({ checkUpdate: false });
@@ -498,6 +498,23 @@ client.on('messageReactionAdd', async (reaction, user) => {
 
     const channelId = reaction.message.channel.id;
     const isDM      = !reaction.message.guild;
+    const guildId   = reaction.message.guild?.id || null;
+
+    // ── Log reaction to Maya's own messages ───────────────────────────────
+    // This is a signal: approval, disapproval, emotional response, etc.
+    if (reaction.message.author?.id === client.user.id) {
+      logReactionReceived({
+        reactorUserId: user.id,
+        reactorName:   user.username,
+        emoji:         reaction.emoji.name,
+        emojiId:       reaction.emoji.id || null,  // null = unicode
+        guildId,
+        channelId,
+        messageId:     reaction.message.id,
+        messageContent: reaction.message.content,
+      }).catch(() => {});
+    }
+
     if (isDM) return;
 
     const { getMode } = await import('./presence.js');

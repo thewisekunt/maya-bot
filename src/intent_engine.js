@@ -118,6 +118,7 @@ export function resolveIntent(inner, opts = {}) {
       action:  'react',
       reason:  'chaos zone — react to stay present without disrupting',
       emoji:   _pickEmoji(psyche),
+      useSvEmoji: true,  // handler should try server emoji first
     };
   }
 
@@ -128,6 +129,7 @@ export function resolveIntent(inner, opts = {}) {
       action:  'react',
       reason:  `moderate engagement (score=${intentScore.toFixed(2)})`,
       emoji:   _pickEmoji(psyche),
+      useSvEmoji: true,
     };
   }
 

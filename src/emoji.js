@@ -54,7 +54,6 @@ export async function observeEmojis(msg, guildId, userId) {
            sv_seen_count = sv_seen_count + 1,
            sv_last_seen  = NOW(),
            tone          = COALESCE(tone, VALUES(tone)),
-           -- Gradually raise use_weight as emoji gets used more in this server
            sv_use_weight = LEAST(0.95, sv_use_weight + 0.01)`,
         [id, name, guildId, animated === 'a' ? 1 : 0, tone]
       );
@@ -171,6 +170,106 @@ export async function getEmojiForTone(guildId, tone = 'neutral', userId = null, 
  * Get a string of emoji suggestions to append to the system prompt.
  * Maya can optionally use these — they're offered, not forced.
  */
+/**
+ * Get a single emoji for Maya to react with.
+ * Tries server emojis first (matching mood/tone), falls back to unicode.
+ *
+ * @param {string} guildId
+ * @param {object} psyche  — emotions + hormones from psyche state
+ * @param {string} userId  — who she's reacting to (for preference boost)
+ * @returns {string} — either <:name:id> or unicode emoji
+ */
+export async function getReactEmoji(guildId, psyche, userId = null) {
+  if (!guildId) return _unicodeFromPsyche(psyche);
+
+  // Determine target tone from psyche
+  const e = psyche?.emotions || {};
+  const h = psyche?.hormones || {};
+  let tone = 'neutral';
+  if ((e.joy        || 0) > 0.5) tone = 'funny';
+  else if ((e.affection  || 0) > 0.5) tone = 'love';
+  else if ((e.irritation || 0) > 0.5) tone = 'chaotic';
+  else if ((h.dopamine   || 0.5) > 0.65) tone = 'hype';
+
+  // Try server emojis first
+  const svEmojis = await getEmojiForTone(guildId, tone, userId, 5);
+  if (svEmojis.length) {
+    // Weighted random pick — higher sv_use_weight = more likely
+    const pick = svEmojis[Math.floor(Math.random() * Math.min(3, svEmojis.length))];
+    return pick.formatted;
+  }
+
+  // Fall back to unicode
+  return _unicodeFromPsyche(psyche);
+}
+
+function _unicodeFromPsyche(psyche) {
+  const e = psyche?.emotions || {};
+  const h = psyche?.hormones || {};
+  if ((e.joy        || 0) > 0.6) return ['😂','💀','🔥'][Math.floor(Math.random()*3)];
+  if ((e.affection  || 0) > 0.6) return ['🫶','❤️','😭'][Math.floor(Math.random()*3)];
+  if ((e.irritation || 0) > 0.6) return ['💀','😑','🤦'][Math.floor(Math.random()*3)];
+  if ((e.curiosity  || 0) > 0.6) return ['👀','🤔','💭'][Math.floor(Math.random()*3)];
+  if ((h.dopamine   || 0.5) > 0.7) return ['🔥','💥','⚡'][Math.floor(Math.random()*3)];
+  return ['👀','💀','😌','🫡'][Math.floor(Math.random()*4)];
+}
+
+/**
+ * Log a reaction Maya received — this is a signal about how her message landed.
+ * Classify the signal type from the emoji.
+ */
+export async function logReactionReceived({ reactorUserId, reactorName, emoji, emojiId, guildId, channelId, messageId, messageContent }) {
+  const signal = _classifyReactionSignal(emoji);
+  try {
+    await db.execute(
+      `INSERT INTO maya_reaction_log
+         (reactor_user_id, reactor_name, emoji_id, emoji_name, guild_id, channel_id,
+          target_message_id, target_content, signal_type)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        reactorUserId, reactorName?.slice(0,100),
+        emojiId || null, emoji?.slice(0,100),
+        guildId || null, channelId || null,
+        messageId || null, messageContent?.slice(0,300),
+        signal,
+      ]
+    );
+    // Also update user's emoji preference
+    if (emojiId) {
+      await db.execute(
+        `INSERT INTO maya_user_emoji_pref (discord_user_id, emoji_id, guild_id, reaction_count, last_used)
+         VALUES (?, ?, ?, 1, NOW())
+         ON DUPLICATE KEY UPDATE reaction_count=reaction_count+1, last_used=NOW()`,
+        [reactorUserId, emojiId, guildId || '']
+      ).catch(() => {});
+    }
+    console.log(`[emoji] ${reactorName} reacted ${emoji} → signal=${signal}`);
+  } catch { /* non-fatal */ }
+}
+
+function _classifyReactionSignal(emoji) {
+  const name = (emoji || '').toLowerCase();
+  if (/😂|💀|🤣|😭|lmao|skull|dead/.test(name)) return 'funny';
+  if (/❤️|🫶|💕|😍|love|heart/.test(name)) return 'approval';
+  if (/🔥|💯|⚡|hype|fire|based/.test(name)) return 'hype';
+  if (/😒|💀|😑|no|💔|angry|rage/.test(name)) return 'disapproval';
+  if (/😢|😔|💙|sad|cry/.test(name)) return 'emotional';
+  if (/🤔|👀|think|eyes/.test(name)) return 'curious';
+  return 'neutral';
+}
+
+/**
+ * Update emoji description — called when Maya uses an emoji and it lands well/poorly.
+ * Over time Maya builds her own understanding of what each emoji means.
+ */
+export async function updateEmojiDescription(guildId, emojiId, description) {
+  if (!description || !emojiId) return;
+  await db.execute(
+    `UPDATE maya_server_emojis SET description=? WHERE emoji_id=? AND guild_id=?`,
+    [description.slice(0, 200), emojiId, guildId]
+  ).catch(() => {});
+}
+
 export async function getEmojiHint(guildId, mood, userId) {
   // Map mood/tone states to emoji tone categories
   const toneMap = {
@@ -209,7 +308,7 @@ async function _refreshCache(guildId) {
 
   try {
     const [rows] = await db.execute(
-      `SELECT emoji_id, emoji_name, animated, tone,
+      `SELECT emoji_id, emoji_name, animated, tone, description, vibe_tags,
               sv_use_weight, maya_affinity, sv_seen_count
        FROM maya_server_emojis
        WHERE guild_id=? AND sv_use_weight > 0.2
