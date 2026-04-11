@@ -412,7 +412,7 @@ export async function extractAndStoreFact(userId, message) {
     if (!m) continue;
     const raw  = m[0].trim();
     const fact = _attributeFact(raw, userName).slice(0, 200);
-    await _storeFact(userId, userName, fact, cat, score, cleaned).catch(() => {});
+    await _storeFact(userId, userName, fact, cat, score, cleaned, 0, 0.4).catch(() => {});
     regexFound = true;
     break;  // store first regex match, LLM will catch the rest
   }
@@ -447,7 +447,7 @@ or
     const { data, status } = await axios.post(
       config.llm.endpoint,
       {
-        model:       'deepseek/deepseek-chat-v3-0324',  // cheap + fast for structured output
+        model:       config.llm.models.facts,
         messages:    [{ role: 'user', content: prompt }],
         temperature: 0.0,
         max_tokens:  200,
@@ -479,7 +479,7 @@ or
       if (!category) continue;
       // Skip if this exact fact was already stored by regex
       const isDupe = regexFound && fact.toLowerCase().includes(userName.toLowerCase());
-      await _storeFact(userId, userName, fact.slice(0, 200), category, 0.05, cleaned).catch(() => {});
+      await _storeFact(userId, userName, fact.slice(0, 200), category, 0.05, cleaned, 0, 0.4).catch(() => {});
     }
 
   } catch (e) {
@@ -492,20 +492,54 @@ or
  * Store a single fact in maya_facts with conflict detection.
  * Shared by both regex fast-path and LLM extraction.
  */
-async function _storeFact(userId, userName, fact, category, initialScore, sourceMessage) {
+/**
+ * Compute fact importance using the lifecycle formula:
+ *   importance = confidence * 0.4 + emotional_weight * 0.3 + recency * 0.2 + reinforcement * 0.1
+ */
+function _computeImportance(confidence, emotionalWeight, reinforcementCount, daysSinceReinforced) {
+  const recency = Math.exp(-0.05 * daysSinceReinforced);
+  const reinforcementFactor = Math.min(1, Math.log(1 + reinforcementCount) / Math.log(10));
+  return Math.min(0.99, parseFloat(
+    (confidence * 0.4 + emotionalWeight * 0.3 + recency * 0.2 + reinforcementFactor * 0.1).toFixed(3)
+  ));
+}
+
+async function _storeFact(userId, userName, fact, category, initialScore, sourceMessage, sentimentScore = 0, entropy = 0.4) {
   // ── Step 1: Load existing facts for this user+category ───────────────────
   const [existing] = await db.execute(
-    `SELECT id, fact, conflict_score, memory_strength FROM maya_facts
+    `SELECT id, fact, conflict_score, memory_strength, reinforcement_count,
+            emotional_weight, importance, last_reinforced
+     FROM maya_facts
      WHERE discord_user_id = ? AND category = ?
-     ORDER BY memory_strength DESC, updated_at DESC LIMIT 10`,
+     ORDER BY importance DESC, memory_strength DESC, updated_at DESC LIMIT 10`,
     [userId, category]
   );
 
-  // ── Step 2: Exact/near-dupe check ────────────────────────────────────────
-  const isDupe = existing.some(r =>
+  // ── Step 2: Exact/near-dupe → REINFORCE, not create new ──────────────────
+  const dupeRow = existing.find(r =>
     r.fact.toLowerCase().slice(0, 40) === fact.toLowerCase().slice(0, 40)
   );
-  if (isDupe) return;
+  if (dupeRow) {
+    // Reinforce existing fact instead of creating duplicate
+    const newConf = Math.min(0.99, parseFloat(dupeRow.memory_strength || 0.5) + 0.08);
+    const newCount = (dupeRow.reinforcement_count || 1) + 1;
+    const emotBoost = Math.abs(sentimentScore) * 0.6 + entropy * 0.4;
+    const newEmotional = Math.max(parseFloat(dupeRow.emotional_weight || 0.3), emotBoost);
+    const newImportance = _computeImportance(newConf, newEmotional, newCount, 0);
+    await db.execute(
+      `UPDATE maya_facts SET
+         memory_strength     = ?,
+         reinforcement_count = ?,
+         emotional_weight    = ?,
+         importance          = ?,
+         last_reinforced     = NOW(),
+         conflict_score      = GREATEST(0, conflict_score - 0.05)
+       WHERE id = ?`,
+      [newConf, newCount, newEmotional, newImportance, dupeRow.id]
+    );
+    console.log(`[facts] reinforced for ${userName}: "${fact}" (strength ${newConf.toFixed(2)} count=${newCount})`);
+    return;
+  }
 
   // ── Step 3: LLM conflict + confidence scoring ─────────────────────────────
   // Only run if there are existing facts to compare against
@@ -535,7 +569,7 @@ Return ONLY valid JSON:
 {"contradicts": true/false, "contradicts_index": null/0/1/2..., "confidence": 0.0-1.0, "is_temporary": true/false}`;
 
       const { data, status } = await axios.post(config.llm.endpoint, {
-        model: 'deepseek/deepseek-chat-v3-0324',
+        model: config.llm.models.facts,
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.0, max_tokens: 80,
       }, {
@@ -579,15 +613,26 @@ Return ONLY valid JSON:
     } catch { /* LLM scoring non-fatal — use defaults */ }
   }
 
-  // ── Step 4: Store the fact ────────────────────────────────────────────────
+  // ── Step 4: Compute emotional weight and importance ─────────────────────
+  const emotionalWeight = Math.min(0.99,
+    Math.abs(sentimentScore) * 0.6 + entropy * 0.4
+  );
+  // Temporary facts decay faster
+  const decayRate = confidence < 0.5 ? 0.05 : 0.01;
+  const importance = _computeImportance(confidence, emotionalWeight, 1, 0);
+
+  // ── Step 5: Store the fact ────────────────────────────────────────────────
   const [res] = await db.execute(
     `INSERT INTO maya_facts
-       (discord_user_id, fact, category, conflict_score, memory_strength, source_message)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    [userId, fact, category, conflictScore, confidence, sourceMessage.slice(0, 500)]
+       (discord_user_id, fact, category, conflict_score, memory_strength,
+        emotional_weight, importance, decay_rate, last_reinforced,
+        reinforcement_count, source_message)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(), 1, ?)`,
+    [userId, fact, category, conflictScore, confidence,
+     emotionalWeight, importance, decayRate, sourceMessage.slice(0, 500)]
   );
   const factId = res.insertId;
-  console.log(`[facts] stored for ${userName}: "${fact}" (${category}) conf=${confidence.toFixed(2)}`);
+  console.log(`[facts] stored for ${userName}: "${fact}" (${category}) conf=${confidence.toFixed(2)} imp=${importance.toFixed(2)}`);
 
   // ── Step 5: Embed immediately into Qdrant as user_fact ────────────────────
   // Don't wait for sleep cycle — facts should be searchable right away
@@ -666,11 +711,9 @@ export async function getConfirmedFacts(userId, limit = 6) {
          AND conflict_score < 0.5          -- exclude high-conflict/stale facts
          AND memory_strength > 0.15        -- exclude nearly-forgotten facts
        ORDER BY
-         -- Prioritise high-confidence facts
+         -- Prioritise by computed importance (confidence + emotional weight + recency + reinforcement)
+         importance DESC,
          memory_strength DESC,
-         -- Then freshness
-         CASE WHEN updated_at > DATE_SUB(NOW(), INTERVAL 7 DAY) THEN 0 ELSE 1 END ASC,
-         -- Then low conflict
          conflict_score ASC,
          updated_at DESC
        LIMIT ?`,

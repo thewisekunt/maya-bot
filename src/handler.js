@@ -18,7 +18,7 @@ import { estimateEntropy, estimateEntropyFast, getEntropyZone, getKnownNames, ge
 import { getMayaReply } from './llm.js';
 import { shouldDeliberate, deliberate, webSearch } from './think.js';
 import { getMomentum, updateMomentum, synthesizeMoment, predictLanding, isReactionMessage, getMomentumZone } from './moment.js';
-import { getEmojiHint } from './emoji.js';
+import { getEmojiHint, getReactEmoji } from './emoji.js';
 import { getReferencedContext, getScopedFacts, getUserGenderAndRoles, syncMemberRoles, getEmotionalContext, clearEmotionFor, inferGenderFromText } from './context_enricher.js';
 import { saveNotification, markReplied } from './inbox.js';
 import { resolveEntities, buildEntityContext, isAddressedToOther, indexMember } from './entity.js';

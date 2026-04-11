@@ -430,10 +430,15 @@ async function _send(msg, result, channelId, isDM, text, client) {
     notifyReplied(channelId, msg.author.id);
     const replyText = result.text || '';
     if (replyText.length <= 2000) {
-      await msg.reply(replyText);
+      await msg.reply(replyText).catch(async (err) => {
+        // Reply fails if original message was deleted — fall back to channel send
+        if (err.code === 10008 || err.message?.includes('Unknown message')) {
+          await msg.channel.send(replyText).catch(() => {});
+        }
+      });
     } else {
       for (const chunk of replyText.match(/[\s\S]{1,1990}/g) || [replyText]) {
-        await msg.channel.send(chunk);
+        await msg.channel.send(chunk).catch(() => {});
       }
     }
     // Reply is already recorded by _recordSession in the caller

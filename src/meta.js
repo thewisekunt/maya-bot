@@ -221,7 +221,7 @@ Rules:
     const { data, status } = await axios.post(
       config.llm.endpoint,
       {
-        model:       'deepseek/deepseek-chat-v3-0324',  // fast + cheap
+        model:       config.llm.models.meta,
         messages:    [{ role: 'user', content: prompt }],
         temperature: 0.3,   // lower temp — meta should be considered, not creative
         max_tokens:  150,
@@ -377,7 +377,7 @@ export async function updateUserBelief(userId, eventText, sentiment, sentimentSc
       if (newConfidence < 0.2) {
         await db.execute(
           `UPDATE maya_beliefs SET statement=CONCAT('uncertain about: ', statement)
-           WHERE id=?`, [existing.id]
+           WHERE id=? AND statement NOT LIKE 'uncertain about:%'`, [existing.id]
         );
       }
 

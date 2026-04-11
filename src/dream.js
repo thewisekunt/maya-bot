@@ -1,4 +1,5 @@
 import { updateUserBelief, updateSelfBelief, detectIdentityConflict } from './meta.js';
+import { decayDesires } from './desires.js';
 import { runLearningCycle } from './learn.js';
 /**
  * dream.js — Session-based memory consolidation
@@ -245,7 +246,7 @@ Rules:
   const { data, status } = await axios.post(
     config.llm.endpoint,
     {
-      model:       config.llm.model,
+      model:       config.llm.models.dream,
       messages:    [{ role: 'user', content: prompt }],
       temperature: 0.1,   // low temperature for factual extraction
       max_tokens:  1000,
@@ -334,7 +335,10 @@ async function _dreamCycle() {
       if (updates > 0) console.log(`[dream] learning: ${updates} weight updates`);
     }
 
-    // Phase 4d: stale fact decay (low-confidence + unrecalled facts weaken)
+    // Phase 4c: desire decay (desires fade without reinforcement)
+    await decayDesires().catch(e => console.error('[dream] desire decay:', e.message));
+
+    // Phase 4d: stale fact decay
     await _decayStateFacts().catch(e => console.error('[dream] fact decay:', e.message));
 
     // Phase 5: memory decay (run once per day max — check last run)
@@ -666,5 +670,54 @@ async function _decayStaleFacts() {
      SET conflict_score = LEAST(conflict_score + 0.1, 0.95)
      WHERE conflict_score > 0.5
        AND (last_recalled IS NULL OR last_recalled < DATE_SUB(NOW(), INTERVAL 7 DAY))`
+  ).catch(() => {});
+}
+
+// ── Fact staleness decay ──────────────────────────────────────────────────────
+async function _decayStateFacts() {
+  // Apply exponential decay: confidence *= exp(-decay_rate * days_since_reinforced)
+  // Using MySQL to approximate: multiply by (1 - decay_rate) per cycle (~30min)
+  // This approximates the continuous decay without expensive row-by-row calculation
+  await db.execute(
+    `UPDATE maya_facts
+     SET
+       memory_strength = GREATEST(0.05,
+         memory_strength * (1 - COALESCE(decay_rate, 0.01))
+       ),
+       importance = GREATEST(0.05,
+         importance * (1 - COALESCE(decay_rate, 0.01) * 0.5)
+       )
+     WHERE (last_reinforced IS NULL AND created_at < DATE_SUB(NOW(), INTERVAL 1 DAY))
+        OR (last_reinforced IS NOT NULL AND last_reinforced < DATE_SUB(NOW(), INTERVAL 2 DAY))`
+  ).catch(() => {});
+
+  // Boost importance for recently reinforced facts
+  await db.execute(
+    `UPDATE maya_facts
+     SET importance = LEAST(0.99,
+       memory_strength * 0.4 +
+       emotional_weight * 0.3 +
+       0.2 +
+       LEAST(0.1, LOG(1 + reinforcement_count) / LOG(10))
+     )
+     WHERE last_reinforced > DATE_SUB(NOW(), INTERVAL 2 DAY)`
+  ).catch(() => {});
+
+  // Delete facts that have decayed below survival threshold
+  // Only delete if: very weak AND low reinforcement AND not recently recalled
+  await db.execute(
+    `DELETE FROM maya_facts
+     WHERE importance < 0.12
+       AND reinforcement_count < 2
+       AND created_at < DATE_SUB(NOW(), INTERVAL 7 DAY)
+       AND (last_recalled IS NULL OR last_recalled < DATE_SUB(NOW(), INTERVAL 5 DAY))`
+  ).catch(() => {});
+
+  // Escalate conflict score on stale high-conflict facts
+  await db.execute(
+    `UPDATE maya_facts
+     SET conflict_score = LEAST(conflict_score + 0.1, 0.95)
+     WHERE conflict_score > 0.5
+       AND (last_reinforced IS NULL OR last_reinforced < DATE_SUB(NOW(), INTERVAL 7 DAY))`
   ).catch(() => {});
 }

@@ -122,25 +122,21 @@ export async function getSessionContext(channelId, limit = 15) {
   if (!sess) return [];
 
   try {
-    // Fetch user messages (limited) + Maya's last 3 replies (always included)
-    // This ensures Maya always sees what she last said, even in busy channels
-    // where the limit might cut off her replies
+    // Fetch ALL recent messages in channel order — all speakers, not just current user.
+    // This is critical: Maya needs to see the full group conversation to know
+    // who is talking to whom. Without this she misattributes messages.
+    // Maya's own replies always included (they're part of the thread she's in).
+    const safeLimit = Math.min(limit, 20);
     const [rows] = await db.execute(
-      `(SELECT discord_user_id, user_name, sender, message, created_at
-        FROM maya_session_messages
-        WHERE session_id = ? AND sender != 'maya'
-        ORDER BY created_at DESC
-        LIMIT ?)
-       UNION ALL
-       (SELECT discord_user_id, user_name, sender, message, created_at
-        FROM maya_session_messages
-        WHERE session_id = ? AND sender = 'maya'
-        ORDER BY created_at DESC
-        LIMIT 4)
-       ORDER BY created_at ASC`,
-      [sess.sessionId, limit, sess.sessionId]
+      `SELECT discord_user_id, user_name, sender, message, created_at
+       FROM maya_session_messages
+       WHERE session_id = ?
+       ORDER BY created_at DESC
+       LIMIT ?`,
+      [sess.sessionId, safeLimit]
     );
-    return rows;
+    // Return in chronological order (oldest first)
+    return rows.reverse();
   } catch { return []; }
 }
 
