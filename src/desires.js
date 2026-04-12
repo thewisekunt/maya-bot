@@ -45,10 +45,10 @@ export async function getActiveDesires() {
   if (_cache && Date.now() - _cacheTs < CACHE_TTL) return _cache;
   try {
     const [rows] = await db.execute(
-      `SELECT id, desire_type, target_id, target_label, strength, source, context, created_at
+      `SELECT id, type, target_id, target_label, strength, source, context, created_at
        FROM maya_desires
        WHERE strength > 0.20
-         AND fulfilled_at IS NULL
+         AND fulfilled = 0
          AND (expires_at IS NULL OR expires_at > NOW())
        ORDER BY strength DESC
        LIMIT 10`
@@ -94,15 +94,15 @@ export async function getDesireModifier(userId, currentTopics = []) {
 
     // User-directed desires
     if (d.target_id === userId) {
-      if (d.desire_type === 'talk_to')         modifier += strength * 0.35;
-      if (d.desire_type === 'avoid')            modifier -= strength * 0.30;
-      if (d.desire_type === 'resolve_conflict') modifier += strength * 0.25;
-      if (d.desire_type === 'create_distance')  modifier -= strength * 0.20;
-      if (d.desire_type === 'seek_validation')  modifier += strength * 0.15;
+      if (d.type === 'talk_to')         modifier += strength * 0.35;
+      if (d.type === 'avoid')            modifier -= strength * 0.30;
+      if (d.type === 'resolve_conflict') modifier += strength * 0.25;
+      if (d.type === 'create_distance')  modifier -= strength * 0.20;
+      if (d.type === 'seek_validation')  modifier += strength * 0.15;
     }
 
     // Topic-directed desires
-    if (d.desire_type === 'explore_topic' && d.target_label) {
+    if (d.type === 'explore_topic' && d.target_label) {
       const topicMatch = currentTopics.some(t =>
         t.toLowerCase().includes(d.target_label.toLowerCase()) ||
         d.target_label.toLowerCase().includes(t.toLowerCase())
@@ -128,9 +128,9 @@ export async function upsertDesire({ type, targetId = null, targetLabel = null, 
   try {
     // Check for existing desire of same type + target
     const [[existing]] = await db.execute(
-      `SELECT id, strength, desire_type FROM maya_desires
-       WHERE desire_type=? AND (target_id=? OR (target_id IS NULL AND ?  IS NULL))
-         AND fulfilled_at IS NULL
+      `SELECT id, strength, type FROM maya_desires
+       WHERE type=? AND (target_id=? OR (target_id IS NULL AND ? IS NULL))
+         AND fulfilled = 0
          AND (expires_at IS NULL OR expires_at > NOW())
        LIMIT 1`,
       [type, targetId, targetId]
@@ -154,7 +154,7 @@ export async function upsertDesire({ type, targetId = null, targetLabel = null, 
     if (conflictType && targetId) {
       const [[conflict]] = await db.execute(
         `SELECT id, strength FROM maya_desires
-         WHERE desire_type=? AND target_id=? AND fulfilled_at IS NULL
+         WHERE type=? AND target_id=? AND fulfilled = 0
          LIMIT 1`,
         [conflictType, targetId]
       );
@@ -164,7 +164,7 @@ export async function upsertDesire({ type, targetId = null, targetLabel = null, 
         return;
       } else if (conflict) {
         // New desire is stronger — suppress the old one
-        await db.execute(`UPDATE maya_desires SET fulfilled_at=NOW() WHERE id=?`, [conflict.id]);
+        await db.execute(`UPDATE maya_desires SET fulfilled = 1 WHERE id=?`, [conflict.id]);
       }
     }
 
@@ -174,7 +174,7 @@ export async function upsertDesire({ type, targetId = null, targetLabel = null, 
       : null;
 
     await db.execute(
-      `INSERT INTO maya_desires (desire_type, target_id, target_label, strength, source, context, expires_at)
+      `INSERT INTO maya_desires (type, target_id, target_label, strength, source, context, expires_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [type, targetId, targetLabel?.slice(0, 100), strength, source, context?.slice(0, 200), expires]
     );
@@ -191,9 +191,9 @@ export async function upsertDesire({ type, targetId = null, targetLabel = null, 
 export async function fulfillDesire(type, targetId = null) {
   _cache = null;
   await db.execute(
-    `UPDATE maya_desires SET fulfilled_at=NOW(), strength=0
-     WHERE desire_type=? AND (target_id=? OR target_id IS NULL)
-       AND fulfilled_at IS NULL`,
+    `UPDATE maya_desires SET fulfilled = 1, strength = 0
+     WHERE type=? AND (target_id=? OR target_id IS NULL)
+       AND fulfilled = 0`,
     [type, targetId]
   ).catch(() => {});
 }
@@ -208,16 +208,16 @@ export async function decayDesires() {
   await db.execute(
     `UPDATE maya_desires
      SET strength = GREATEST(0.05, strength * 0.97)
-     WHERE fulfilled_at IS NULL
+     WHERE fulfilled = 0
        AND (expires_at IS NULL OR expires_at > NOW())`
   ).catch(() => {});
 
   // Prune dormant desires (strength < 0.1 and older than 3 days)
   await db.execute(
-    `UPDATE maya_desires SET fulfilled_at=NOW()
+    `UPDATE maya_desires SET fulfilled = 1
      WHERE strength < 0.10
        AND created_at < DATE_SUB(NOW(), INTERVAL 3 DAY)
-       AND fulfilled_at IS NULL`
+       AND fulfilled = 0`
   ).catch(() => {});
 
   console.log('[desire] decay cycle complete');
@@ -315,7 +315,7 @@ export async function getDesireContext() {
       resolve_conflict:`feels something is unresolved${target}`,
       seek_validation: `wants to feel seen`,
       create_distance: `emotionally withdrawing${target}`,
-    }[d.desire_type] || d.desire_type;
+    }[d.type] || d.type;
     return desc;
   });
 
@@ -341,11 +341,11 @@ export async function getDesirePressure(userId) {
   for (const d of desires) {
     if (d.target_id !== userId && d.target_id !== null) continue;
     const s = parseFloat(d.strength || 0);
-    if (d.desire_type === 'talk_to')          pressure += s * 0.8;
-    if (d.desire_type === 'resolve_conflict')  pressure += s * 0.6;
-    if (d.desire_type === 'seek_validation')   pressure += s * 0.3;
-    if (d.desire_type === 'avoid')             pressure -= s * 0.8;
-    if (d.desire_type === 'create_distance')   pressure -= s * 0.6;
+    if (d.type === 'talk_to')          pressure += s * 0.8;
+    if (d.type === 'resolve_conflict')  pressure += s * 0.6;
+    if (d.type === 'seek_validation')   pressure += s * 0.3;
+    if (d.type === 'avoid')             pressure -= s * 0.8;
+    if (d.type === 'create_distance')   pressure -= s * 0.6;
   }
   return Math.max(-1, Math.min(1, pressure));
 }

@@ -51,9 +51,9 @@ export function resolveIntent(inner, opts = {}) {
   // e.g. if she has a strong "I don't grovel" self-belief, avoid can't force groveling
   // This is kept simple: desire creates distance only adjusts thresholds, not overrides
   const targetUserId = opts.userId || null;
-  const hasAvoidDesire  = activeDesires.some(d => d.desire_type === 'avoid'  && d.target_id === targetUserId);
-  const hasTalkDesire   = activeDesires.some(d => d.desire_type === 'talk_to' && d.target_id === targetUserId);
-  const hasResolveDesire = activeDesires.some(d => d.desire_type === 'resolve_conflict' && d.target_id === targetUserId);
+  const hasAvoidDesire  = activeDesires.some(d => d.type === 'avoid'  && d.target_id === targetUserId);
+  const hasTalkDesire   = activeDesires.some(d => d.type === 'talk_to' && d.target_id === targetUserId);
+  const hasResolveDesire = activeDesires.some(d => d.type === 'resolve_conflict' && d.target_id === targetUserId);
 
   const { isMention = false, isDM = false, isReply = false, isSleeping = false } = opts;
 
