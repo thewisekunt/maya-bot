@@ -43,8 +43,10 @@ export function resolveIntent(inner, opts = {}) {
     obsState,
     energy,
     situation,
-    activeDesires = [],
-    desireModifier = 0,
+    activeDesires   = [],
+    desireModifier  = 0,
+    needsClarification = false,
+    deliberation    = null,
   } = inner;
 
   // Identity anchor check — some desires are blocked by who Maya IS
@@ -148,6 +150,12 @@ export function resolveIntent(inner, opts = {}) {
   // Selective identity + mid intent = more likely to react than reply
   if (isSelectiveIdentity && intentScore < 0.65 && !situation?.isDirect) {
     return { action: 'react', reason: 'selective identity — not compelled', emoji: '👀' };
+  }
+
+  // ── Low confidence — ask for clarification instead of guessing ───────────
+  // Only when Maya deliberated and found she doesn't have enough to go on
+  if (needsClarification && !situation?.isDirect && intentScore < 0.65) {
+    return { action: 'ask', reason: 'deliberation found low confidence — needs context' };
   }
 
   // ── High intent — full reply ───────────────────────────────────────────────

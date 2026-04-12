@@ -73,6 +73,9 @@ export async function runInnerVoice(input) {
     isMention    = false,
     isDM         = false,
     isReply      = false,
+    deliberation = null,    // output from think.js deliberate()
+    mediaEmotionScore   = 0,    // 0–1 from vision.js
+    mediaEmotionValence = 'neutral',
   } = input;
 
   // ── 1. Internal state ─────────────────────────────────────────────────────
@@ -103,14 +106,23 @@ export async function runInnerVoice(input) {
   });
 
   // ── 4. Context force (what's pulling from outside) ────────────────────────
-  const contextForce = _computeContextForce({
+  const baseContextForce = _computeContextForce({
     notification, nlpSignal, isMention, isDM, isReply, momentum,
   });
 
-  // ── 5. Social risk ────────────────────────────────────────────────────────
-  const socialRisk = _computeSocialRisk({
+  // ── 5. Social risk (includes deliberation confidence) ────────────────────
+  let socialRisk = _computeSocialRisk({
     obsState, energy, chanEntropy, trustLevel,
   });
+
+  // Low deliberation confidence = Maya doesn't know what she's talking about → more risk
+  if (deliberation?.confidence === 'low') {
+    socialRisk = Math.min(1, socialRisk + 0.20);
+    console.log('[iv] deliberation confidence=low → socialRisk +0.20');
+  }
+
+  // Emotional media boosts contextForce — something visual happened, more reason to respond
+  const mediaForceBoost = Math.min(0.25, mediaEmotionScore * 0.4);
 
   // ── 6. Belief conflict check ──────────────────────────────────────────────
   const beliefConflict = userId
@@ -131,6 +143,9 @@ export async function runInnerVoice(input) {
     situation, obsState, psyche, message, nlpSignal,
     beliefConflict, trustLevel, desirePressure, identityCore,
   });
+
+  // Apply media emotion boost to contextForce
+  const contextForce = Math.min(1, baseContextForce + mediaForceBoost);
 
   // ── 10. Intent score (now includes desire pressure) ───────────────────────
   // desirePressure is -1 to +1: positive = drawn toward, negative = avoid
@@ -165,10 +180,17 @@ export async function runInnerVoice(input) {
     activeDesires, identityCore,
   }).catch(() => {});
 
+  // When deliberation confidence is low, signal ask_clarification
+  const needsClarification = deliberation?.confidence === 'low'
+    && !situation.isDirect
+    && (deliberation?.need && deliberation.need !== 'nothing');
+
   return {
     situation,
     toolPlan,
     intentScore: smoothedIntent,  // smoothed via EWMA
+    needsClarification,
+    deliberation,
     internalPressure,
     contextForce,
     socialRisk,

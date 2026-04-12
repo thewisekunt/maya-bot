@@ -106,12 +106,19 @@ export async function extractMediaContext(msg) {
     ...otherMedia,
   ];
 
+  // Compute overall emotional signal from all described images
+  const allDesc = imageDescs.join(' ');
+  const mediaEmotion = extractImageEmotion(allDesc);
+
   return {
-    hasMedia:      parts.length > 0,
+    hasMedia:       parts.length > 0,
     visionWorked,
-    mediaContext:  parts.join('\n'),
+    mediaContext:   parts.join('\n'),
     embedSummaries,
     imageDescs,
+    emotionScore:   mediaEmotion.intensity,   // 0–1 emotional intensity
+    emotionValence: mediaEmotion.valence,      // 'positive'|'negative'|'neutral'
+    visionConfidence: visionWorked ? 0.85 : (parts.length > 0 ? 0.40 : 0),
   };
 }
 
@@ -291,6 +298,42 @@ function _extractGifName(embed) {
       .trim();
   }
   return '';
+}
+
+// ── Image emotion extractor ──────────────────────────────────────────────────
+// Converts visual content into an emotion signal for psyche injection.
+// Keeps it simple — heuristic scan of the description text.
+// Returns 0–1 emotional intensity (0=neutral, 1=highly emotional)
+
+export function extractImageEmotion(descriptionText) {
+  if (!descriptionText) return { intensity: 0, valence: 'neutral' };
+  const lower = descriptionText.toLowerCase();
+
+  let intensity = 0;
+  let valence   = 'neutral';
+
+  // High arousal negative
+  if (/(cry|crying|tears|sob|sad|pain|hurt|alone|broken|grief|suffering|death|dead|dying|tragic)/.test(lower)) {
+    intensity = 0.65; valence = 'negative';
+  }
+  // High arousal positive
+  else if (/(laugh|happy|joy|celebrate|excited|hug|smile|love|cute|adorable|funny|hilarious|wholesome)/.test(lower)) {
+    intensity = 0.60; valence = 'positive';
+  }
+  // Anger / conflict
+  else if (/(angry|rage|fight|violent|aggressive|shock|horror|disgusting|cringe)/.test(lower)) {
+    intensity = 0.70; valence = 'negative';
+  }
+  // Mild interest
+  else if (/(interesting|cool|wow|impressive|beautiful|stunning|aesthetic)/.test(lower)) {
+    intensity = 0.30; valence = 'positive';
+  }
+  // Meme / humor signal (usually high valence)
+  else if (/(meme|caption|text overlay|impact font|drake|distracted|this is fine)/.test(lower)) {
+    intensity = 0.40; valence = 'positive';
+  }
+
+  return { intensity, valence };
 }
 
 // ── Embed summariser ──────────────────────────────────────────────────────────

@@ -130,6 +130,15 @@ export async function handleMessage({
   if (hasMedia) {
     try {
       const media = await extractMediaContext(msg);
+    // If vision worked and image has emotional content, nudge psyche immediately
+    if (media.visionWorked && media.emotionScore > 0.3) {
+      // Inject image emotion as a brief sentiment signal before psyche runs
+      // Positive images: slight dopamine lift | Negative images: oxytocin/empathy lift
+      const emoSign = media.emotionValence === 'positive' ? 1 : -0.5;
+      // Will be picked up by psyche's hormone update via sentimentScore override
+      media._psycheSentimentBoost = media.emotionScore * emoSign * 0.3;
+      console.log(`[vision] emotion=${media.emotionValence} intensity=${media.emotionScore.toFixed(2)} → psyche nudge`);
+    }
       if (media.hasMedia) {
         mediaContext = media.mediaContext;
         visionWorked = media.visionWorked;
@@ -326,12 +335,17 @@ export async function handleMessage({
   // ── 9. PRESENCE DECISION ─────────────────────────────────────────────────
   // ── Inner voice: situation understanding + tool planning ────────────────
   const innerCognition = await runInnerVoice({
-    notification: msg?._notification || null,  // set by index.js if tier-1
-    message:      richMessageText,
+    notification:     msg?._notification || null,
+    message:          richMessageText,
     userId, channelId, guildId,
     nlpSignal, entropy, trustLevel,
-    attachmentScore: attachmentScore || psycheState?.attachment || 0.3,
+    attachmentScore:  attachmentScore || psycheState?.attachment || 0.3,
     isMention, isDM, isReply,
+    // Feed deliberation result into inner voice so confidence affects decisions
+    deliberation:     thought || null,
+    // Feed vision emotion signal
+    mediaEmotionScore: media?.emotionScore || 0,
+    mediaEmotionValence: media?.emotionValence || 'neutral',
   });
 
   // ── Intent engine: what should Maya do? ──────────────────────────────────
@@ -356,6 +370,21 @@ export async function handleMessage({
   // treat as ignore — Maya chose silence
 
   // ── REACT ─────────────────────────────────────────────────────────────────
+  // ── ASK — Maya needs clarification ─────────────────────────────────────────
+  if (action === 'ask') {
+    const need = innerCognition.deliberation?.need || '';
+    if (need && need !== 'nothing') {
+      // Inject clarification note into thoughtContext and fall through to normal reply
+      // This lets Maya ask a question naturally instead of hallucinating an answer
+      thoughtContext = thoughtContext
+        ? thoughtContext + `\n[Maya is uncertain about: "${need}". Ask ONE short clarifying question, casually. Don't explain why.]`
+        : `[Maya is uncertain about: "${need}". Ask ONE short clarifying question, casually, in her voice. Don't explain why.]`;
+      console.log('[intent] ask → injecting clarification note, falling through to reply');
+      // Fall through to the reply path below — action treated as 'reply'
+    }
+    // If no need, also fall through to normal reply
+  }
+
   if (action === 'react') {
     // Try server emoji first if decision flagged it
     let reactEmoji = decision.emoji;
@@ -471,6 +500,7 @@ export async function handleMessage({
 
   // ── Deliberation gate ──────────────────────────────────────────────────────
   let thoughtContext = '';
+  let thought = null;  // deliberation result — accessible after the block
   const deliberateTrigger = shouldDeliberate(richMessageText, psycheState, knownFacts);
   if (deliberateTrigger) {
     console.log(`[think] triggered: ${deliberateTrigger}`);
@@ -491,7 +521,7 @@ export async function handleMessage({
       }
     } else {
       // Factual/knowledge trigger — use deliberation LLM to decide what to do
-      const thought = await deliberate(richMessageText, context, knownFacts, deliberateTrigger).catch(() => null);
+      thought = await deliberate(richMessageText, context, knownFacts, deliberateTrigger, psycheState).catch(() => null);
       if (thought) {
         console.log(`[think] confidence=${thought.confidence} search=${thought.shouldSearch} query="${thought.searchQuery}"`);
         const tParts = [];

@@ -42,6 +42,7 @@ export async function getServerSocialGraph(guildId) {
             WHERE guild_id = ? AND discord_user_id != 'maya'
           )
        ORDER BY COALESCE(r.trust_level, 1) DESC,
+                CASE WHEN r.last_interaction > DATE_SUB(NOW(), INTERVAL 7 DAY) THEN 0 ELSE 1 END ASC,
                 COALESCE(r.total_messages, 0) DESC
        LIMIT 30`,
       [guildId, guildId]
@@ -64,14 +65,43 @@ export async function buildServerSocialSummary(guildId, currentUserId) {
 
   const TRUST_LABELS = { 5:'close friend', 4:'friend', 3:'known', 2:'acquaintance', 1:'stranger' };
 
+  // Fetch behavioral traits from beliefs for top people
+  let beliefMap = {};
+  try {
+    const topIds = people.slice(0, 10).map(p => p.discord_user_id).filter(Boolean);
+    if (topIds.length) {
+      const placeholders = topIds.map(() => '?').join(',');
+      const [beliefs] = await db.execute(
+        `SELECT target_id, statement FROM maya_beliefs
+         WHERE target_id IN (${placeholders}) AND type='user'
+           AND confidence > 0.35
+           AND statement NOT LIKE '%uncertain%'
+           AND LENGTH(statement) < 80
+         ORDER BY confidence DESC`,
+        topIds
+      );
+      for (const b of beliefs) {
+        if (!beliefMap[b.target_id]) {
+          // Extract the core trait — "tends to be positive" → "usually positive"
+          const trait = b.statement
+            .replace(/tends to (have |be )?/i, 'usually ')
+            .replace(/toward conflict or tension/i, 'can be tense')
+            .slice(0, 40);
+          beliefMap[b.target_id] = trait;
+        }
+      }
+    }
+  } catch { /* non-fatal */ }
+
   const lines = people
-    .filter(p => p.discord_user_id !== currentUserId)  // exclude current speaker
+    .filter(p => p.discord_user_id !== currentUserId)
     .slice(0, 10)
     .map(p => {
       const trust = TRUST_LABELS[p.trust_level] || 'stranger';
       const msgs  = p.total_messages || p.message_count || 0;
       const dm    = p.dm_count > 0 ? ', DMs' : '';
-      return `${p.name} (${trust}${dm}, ~${msgs} msgs)`;
+      const trait = beliefMap[p.discord_user_id] ? `, ${beliefMap[p.discord_user_id]}` : '';
+      return `${p.name} (${trust}${dm}, ~${msgs} msgs${trait})`;
     })
     .join(', ');
 
@@ -147,4 +177,32 @@ export async function getUserRelationship(userAId, userBId, guildId) {
     );
     return row || null;
   } catch { return null; }
+}
+
+/**
+ * Get a quick trust + relationship signal for a user.
+ * Used by inner_voice to modulate contextForce and socialRisk.
+ * Returns { trustLevel, isClose, isStranger, hasDMs }
+ */
+export async function getRelationshipSignal(userId) {
+  try {
+    const [[row]] = await db.execute(
+      `SELECT r.trust_level, r.dm_count, r.attachment_score,
+              r.ignore_count, r.last_interaction
+       FROM maya_user_relationships r
+       WHERE r.discord_user_id = ?
+       LIMIT 1`,
+      [userId]
+    );
+    if (!row) return { trustLevel: 1, isClose: false, isStranger: true, hasDMs: false };
+    return {
+      trustLevel:    row.trust_level || 1,
+      isClose:       row.trust_level >= 4,
+      isStranger:    row.trust_level <= 2,
+      hasDMs:        (row.dm_count || 0) > 0,
+      attachScore:   parseFloat(row.attachment_score || 0.3),
+    };
+  } catch {
+    return { trustLevel: 1, isClose: false, isStranger: true, hasDMs: false };
+  }
 }

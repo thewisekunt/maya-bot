@@ -41,6 +41,16 @@ export function shouldDeliberate(text, psycheState = null, knownFacts = []) {
   // Social questions never need deliberation — Maya just responds naturally
   if (SOCIAL_Q.test(text)) return null;
 
+  // Energy gate — tired Maya doesn't overthink
+  // Low dopamine = depleted, skip deliberation to preserve cognitive resources
+  if (psycheState?.hormones?.dopamine < 0.30) return null;
+
+  // Curiosity trigger — high entropy + unclear context → Maya wants to understand
+  // Even without a direct question, confusion generates deliberation
+  if (psycheState?.entropy > 6 && text.length > 15 && !KNOWLEDGE_Q.test(text)) {
+    return 'curiosity_trigger';
+  }
+
   // Explicit search request
   if (SEARCH_REQ.test(text)) return 'search_requested';
 
@@ -78,7 +88,7 @@ export function shouldDeliberate(text, psycheState = null, knownFacts = []) {
  *
  * Returns enriched context string to inject into the main reply call.
  */
-export async function deliberate(text, context, knownFacts, trigger) {
+export async function deliberate(text, context, knownFacts, trigger, psycheState = null) {
   const factSummary = knownFacts.length > 0
     ? `Known facts:\n${knownFacts.slice(0, 4).map(f => `• ${f}`).join('\n')}`
     : 'No relevant stored facts.';
@@ -87,11 +97,17 @@ export async function deliberate(text, context, knownFacts, trigger) {
     ? `Recent conversation:\n${context.slice(-800)}`
     : '';
 
+  // Inject psyche state into deliberation — mood affects how Maya reasons
+  const psycheNote = psycheState
+    ? `Maya's current state: energy=${(psycheState?.hormones?.dopamine || 0.5).toFixed(2)} entropy=${(psycheState?.entropy || 0).toFixed(1)}/10`
+    : '';
+
   const prompt = `You are Maya's internal reasoning process. Be brief and direct.
 CRITICAL RULE: Only state things Maya actually knows from the facts/context above. Do NOT invent people, places, or events. If Maya doesn't know something, say "nothing relevant".
 
 ${recentCtx}
 ${factSummary}
+${psycheNote}
 
 User message: "${text}"
 Trigger: ${trigger}
@@ -107,7 +123,7 @@ CONFIDENCE: [high/medium/low — how confident can Maya be answering without mor
     const { data, status } = await axios.post(
       config.llm.endpoint,
       {
-        model:       config.llm.model,
+        model:       config.llm.models.think,
         messages:    [{ role: 'user', content: prompt }],
         temperature: 0.1,
         max_tokens:  120,
@@ -167,7 +183,7 @@ async function _openRouterSearch(query) {
     const { data, status } = await axios.post(
       config.llm.endpoint,
       {
-        model:    config.llm.model,
+        model:    config.llm.models.think,
         messages: [{ role: 'user', content: `Search for: ${query}\n\nReturn only the key facts, 2-3 sentences max.` }],
         tools: [{
           type: 'function',
@@ -232,9 +248,17 @@ function _parseDeliberation(raw, originalText, trigger) {
     if (m) lines[m[1].toUpperCase()] = m[2].trim();
   });
 
+  const need = lines.NEED || '';
+
+  // Store curiosity as vector memory — Maya develops genuine curiosity over time
+  // "what Maya wondered" creates a curiosity trace in her semantic memory
+  if (need && need !== 'nothing' && need.length > 5) {
+    _storeCuriosity(need, originalText).catch(() => {});
+  }
+
   return {
-    know:       lines.KNOW       || '',
-    need:       lines.NEED       || '',
+    know:       lines.KNOW  || '',
+    need,
     shouldSearch: (lines.SEARCH || '').toLowerCase() === 'yes',
     searchQuery:  lines.QUERY    || '',
     confidence:   lines.CONFIDENCE || 'medium',
@@ -274,4 +298,25 @@ function _topicOverlap(a, b) {
   let overlap = 0;
   for (const w of wordsA) if (wordsB.has(w)) overlap++;
   return overlap / Math.min(wordsA.size, wordsB.size);
+}
+
+// ── Curiosity memory ──────────────────────────────────────────────────────────
+// Stores what Maya wondered about as a curiosity trace in vector memory.
+// Over time this creates a genuine curiosity profile — topics she keeps encountering.
+async function _storeCuriosity(need, sourceText) {
+  try {
+    const { embedText }    = await import('./embedder.js');
+    const { upsertMemory } = await import('./vector.js');
+    const vec = await embedText(`Maya wondered: ${need}`);
+    if (vec) {
+      await upsertMemory({
+        userId:   'maya',
+        guildId:  null,
+        text:     `Maya wondered: ${need}`,
+        type:     'curiosity',
+        metadata: { source: sourceText?.slice(0, 100), timestamp: Date.now() },
+        vector:   vec,
+      });
+    }
+  } catch { /* non-fatal */ }
 }
