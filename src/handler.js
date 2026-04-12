@@ -24,6 +24,9 @@ import { saveNotification, markReplied } from './inbox.js';
 import { resolveEntities, buildEntityContext, isAddressedToOther, indexMember } from './entity.js';
 import { detectCommitment } from './commitments.js';
 import { logDecision, resolveDecision, computeReward } from './learn.js';
+
+// Track pending decision IDs per channel so we can resolve them next message
+const _pendingDecisions = new Map();  // channelId → decision log id
 import { buildContextLine, upsertGuild, upsertChannel } from './context.js';
 import { runInnerVoice, evaluateReply, executeToolPlan } from './inner_voice.js';
 import { onGoodInteraction, onConflict, onIgnored, getDominantDesire, updateDesiresFromOutcome, getDesireContext } from './desires.js';
@@ -222,6 +225,10 @@ export async function handleMessage({
   const { zone, line: zoneLine } = getEntropyZone(entropy);
 
   // Compute Maya's dynamic internal state from all available signals
+  // Pull active session ID from STM so psyche can write mood snapshots
+  const { getActiveSession } = await import('./stm.js');
+  const activeSessionId = getActiveSession(channelId) || null;
+
   const psycheState = await updateState({
     channelId,
     entropy,
@@ -231,7 +238,7 @@ export async function handleMessage({
     trustLevel,
     velocity:      2,
     selfTraits:    [],
-    sessionId:     null,
+    sessionId:     activeSessionId,
   }).catch(() => ({ energy: 0.5, warmth: 0.6, seriousness: 0.4, monologue: '' }));
 
   // ── Current moment synthesis ─────────────────────────────────────────────
@@ -613,13 +620,25 @@ export async function handleMessage({
     detectCommitment(result.text, userId, channelId, guildId).catch(() => {});
   }
 
-  // Log this reply decision for learning (fire and forget)
-  if (result?.type === 'reply' && psycheState) {
-    logDecision('presence', 'reply', {
-      intent: nlpSignal?.intent, trustLevel,
-      sentiment: nlpSignal?.sentiment,
-      isDM, channelId,
-    }, psycheState).catch(() => {});
+  // Log this reply decision for learning
+  // Also resolve any pending decisions from previous message with current state as outcome
+  if (psycheState) {
+    // Resolve previous unresolved decision for this channel (measure outcome)
+    const prevDecisionId = _pendingDecisions.get(channelId);
+    if (prevDecisionId) {
+      resolveDecision(prevDecisionId, psycheState).catch(() => {});
+      _pendingDecisions.delete(channelId);
+    }
+
+    if (result?.type === 'reply') {
+      logDecision('presence', 'reply', {
+        intent: nlpSignal?.intent, trustLevel,
+        sentiment: nlpSignal?.sentiment,
+        isDM, channelId,
+      }, psycheState).then(logId => {
+        if (logId) _pendingDecisions.set(channelId, logId);
+      }).catch(() => {});
+    }
   }
 
   // Extract facts from user message (fire and forget)

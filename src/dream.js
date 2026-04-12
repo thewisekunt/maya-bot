@@ -298,6 +298,12 @@ async function _dreamCycle() {
       `SELECT COUNT(*) as n FROM maya_decision_log WHERE resolved_at IS NOT NULL AND reward IS NOT NULL`
     ).catch(() => [[{ n: 0 }]]);
 
+    // Auto-resolve stale decisions older than 1h with neutral reward
+    await db.execute(
+      `UPDATE maya_decision_log SET reward=0.0, resolved_at=NOW(), state_after=state_before
+       WHERE resolved_at IS NULL AND created_at < DATE_SUB(NOW(), INTERVAL 1 HOUR)`
+    ).catch(() => {});
+
     const hasWork = pendingEmbed.n > 0 || pendingNLP.n > 0 || pendingDecisions.n > 0;
 
     // Beliefs, reaction feedback, self-belief — run every cycle regardless of pending work
@@ -337,6 +343,9 @@ async function _dreamCycle() {
 
     // Phase 4c: desire decay (desires fade without reinforcement)
     await decayDesires().catch(e => console.error('[dream] desire decay:', e.message));
+
+    // Phase 4e: housekeeping — prune stale notifications and orphaned evidence
+    await _housekeeping().catch(e => console.error('[dream] housekeeping:', e.message));
 
     // Phase 4d: stale fact decay
     await _decayStateFacts().catch(e => console.error('[dream] fact decay:', e.message));
@@ -505,10 +514,20 @@ async function _updateBeliefs() {
       const sentiment      = isPositive ? 'positive' : isNegative ? 'negative' : 'neutral';
 
       // Build a descriptive event summary for the belief
-      const eventText = `${u.user_name}: ${msgs} msgs, trust ${trust}/5, `
-        + `${harmony} harmony / ${conflict} conflict`;
+      // Build a CLEAN belief statement — not raw metadata
+      // Must be readable and standalone, not a data dump
+      let beliefStatement;
+      if (isPositive) {
+        beliefStatement = trust >= 4
+          ? `${u.user_name} is generally warm and positive in conversations`
+          : `${u.user_name} tends to have positive interactions`;
+      } else if (isNegative) {
+        beliefStatement = `${u.user_name} tends toward conflict or tension in conversations`;
+      } else {
+        beliefStatement = `${u.user_name} has a mixed or neutral interaction pattern`;
+      }
 
-      await updateUserBelief(u.discord_user_id, eventText, sentiment, sentimentScore);
+      await updateUserBelief(u.discord_user_id, beliefStatement, sentiment, sentimentScore);
       await new Promise(res => setTimeout(res, 80));
     } catch { /* non-fatal per user */ }
   }
@@ -787,5 +806,34 @@ async function _applyReactionFeedback() {
 
   if (nudges.length > 0) {
     console.log(`[dream] reaction feedback: ${nudges.length} personality nudges applied`);
+  }
+}
+
+// ── Housekeeping ───────────────────────────────────────────────────────────────
+// Runs each dream cycle to keep tables lean
+async function _housekeeping() {
+  // Delete notifications older than 7 days (they pile up fast — 10k+ rows)
+  const [notifResult] = await db.execute(
+    `DELETE FROM maya_notifications
+     WHERE created_at < DATE_SUB(NOW(), INTERVAL 7 DAY)
+     LIMIT 500`  // batch limit to avoid long locks
+  ).catch(() => [{ affectedRows: 0 }]);
+
+  // Delete orphaned belief evidence (beliefs were deleted, evidence lingers)
+  await db.execute(
+    `DELETE FROM belief_evidence
+     WHERE belief_id NOT IN (SELECT id FROM maya_beliefs)
+     LIMIT 200`
+  ).catch(() => {});
+
+  // Delete old session messages (keep last 30 days)
+  await db.execute(
+    `DELETE FROM maya_session_messages
+     WHERE created_at < DATE_SUB(NOW(), INTERVAL 30 DAY)
+     LIMIT 500`
+  ).catch(() => {});
+
+  if (notifResult.affectedRows > 0) {
+    console.log(`[dream] housekeeping: pruned ${notifResult.affectedRows} old notifications`);
   }
 }
