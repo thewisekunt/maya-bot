@@ -127,19 +127,11 @@ export async function handleMessage({
   let mediaContext    = '';
   let richMessageText = message;
   let visionWorked    = false;
+  let media           = null;  // hoisted so runInnerVoice can read emotion signals
 
   if (hasMedia) {
     try {
-      const media = await extractMediaContext(msg);
-    // If vision worked and image has emotional content, nudge psyche immediately
-    if (media.visionWorked && media.emotionScore > 0.3) {
-      // Inject image emotion as a brief sentiment signal before psyche runs
-      // Positive images: slight dopamine lift | Negative images: oxytocin/empathy lift
-      const emoSign = media.emotionValence === 'positive' ? 1 : -0.5;
-      // Will be picked up by psyche's hormone update via sentimentScore override
-      media._psycheSentimentBoost = media.emotionScore * emoSign * 0.3;
-      console.log(`[vision] emotion=${media.emotionValence} intensity=${media.emotionScore.toFixed(2)} → psyche nudge`);
-    }
+      media = await extractMediaContext(msg);
       if (media.hasMedia) {
         mediaContext = media.mediaContext;
         visionWorked = media.visionWorked;
@@ -147,6 +139,12 @@ export async function handleMessage({
           ? mediaContext
           : `${message}\n${mediaContext}`;
         console.log(`[vision] extracted (visionWorked=${visionWorked}): ${mediaContext.slice(0, 100)}`);
+      }
+      // If vision worked and image has emotional content, log psyche nudge signal
+      if (media.visionWorked && media.emotionScore > 0.3) {
+        const emoSign = media.emotionValence === 'positive' ? 1 : -0.5;
+        media._psycheSentimentBoost = media.emotionScore * emoSign * 0.3;
+        console.log(`[vision] emotion=${media.emotionValence} intensity=${media.emotionScore.toFixed(2)} → psyche nudge`);
       }
     } catch (e) {
       console.error('[handler] vision:', e.message);
