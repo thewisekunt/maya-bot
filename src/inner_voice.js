@@ -146,8 +146,14 @@ export async function runInnerVoice(input) {
     0.15             // base participation score
   ));
 
+  // Apply EWMA smoothing to prevent jitter between reply/react on consecutive messages
+  const intentKey = `${channelId}:${userId}`;
+  const prevIntent = _intentHistory.get(intentKey) ?? intentScore;
+  const smoothedIntent = parseFloat((INTENT_ALPHA * intentScore + (1 - INTENT_ALPHA) * prevIntent).toFixed(3));
+  _intentHistory.set(intentKey, smoothedIntent);
+
   console.log(
-    `[iv] intent=${intentScore.toFixed(2)} force=${contextForce.toFixed(2)} ` +
+    `[iv] intent=${smoothedIntent.toFixed(2)} (raw=${intentScore.toFixed(2)}) force=${contextForce.toFixed(2)} ` +
     `pressure=${internalPressure.toFixed(2)} risk=${socialRisk.toFixed(2)} ` +
     `zone=${obsState.zone} tools=[${toolPlan.map(t => t.tool).join(',')}]`
   );
@@ -162,7 +168,7 @@ export async function runInnerVoice(input) {
   return {
     situation,
     toolPlan,
-    intentScore,
+    intentScore: smoothedIntent,  // smoothed via EWMA
     internalPressure,
     contextForce,
     socialRisk,
@@ -365,11 +371,26 @@ export async function executeToolPlan(toolPlan, { userId, guildId, channelId, me
         }
 
         case 'webSearch': {
-          // Extract what to search from the message and run it
-          const { shouldDeliberate, webSearch } = await import('./think.js');
+          const { webSearch } = await import('./think.js');
           const query = message.slice(0, 100);
           const results = await webSearch(query).catch(() => null);
           if (results) additions.push(`[Search context: ${results.slice(0, 300)}]`);
+          break;
+        }
+
+        case 'roamChannel': {
+          // Fetch recent messages from a referenced channel
+          const { fetchChannelByName, fetchChannelContext } = await import('./roam.js');
+          const client = (await import('./index.js').catch(() => null))?.client;
+          if (client && guildId) {
+            // Detect channel reference in message
+            const chanMatch = message.match(/#([a-z0-9-]+)/i);
+            let ctx = null;
+            if (chanMatch) {
+              ctx = await fetchChannelByName(client, guildId, chanMatch[1], 8).catch(() => null);
+            }
+            if (ctx) additions.push(ctx);
+          }
           break;
         }
 
@@ -538,6 +559,11 @@ Return ONLY valid JSON array (can be empty):
         }
       }
     } catch { /* tool planning is non-fatal — proceed without */ }
+  }
+
+  // Message references a Discord channel — roam to get context
+  if (/#[a-z0-9_-]+/i.test(message)) {
+    tools.push({ tool: 'roamChannel', reason: 'message references a specific channel' });
   }
 
   return tools;

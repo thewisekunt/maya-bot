@@ -300,8 +300,8 @@ async function _dreamCycle() {
 
     const hasWork = pendingEmbed.n > 0 || pendingNLP.n > 0 || pendingDecisions.n > 0;
 
-    // Beliefs and self-belief formation run on every cycle regardless of other work
-    // They're based on time + interaction volume, not pending jobs
+    // Beliefs, reaction feedback, self-belief — run every cycle regardless of pending work
+    await _applyReactionFeedback().catch(e => console.error('[dream] reaction feedback:', e.message));
     await _updateBeliefs().catch(e => console.error('[dream] belief update:', e.message));
     await _formSelfBeliefs().catch(e => console.error('[dream] self-belief:', e.message));
 
@@ -720,4 +720,72 @@ async function _decayStateFacts() {
      WHERE conflict_score > 0.5
        AND (last_reinforced IS NULL OR last_reinforced < DATE_SUB(NOW(), INTERVAL 7 DAY))`
   ).catch(() => {});
+}
+
+// ── Reaction → Personality feedback ──────────────────────────────────────────
+// Reactions are validation signals. Humans adjust behavior based on what gets reactions.
+// Positive reactions → reinforce that behavior (boost relevant hormone baseline)
+// Negative/disapproval → slightly reduce confidence or shift tone
+// This makes Maya's personality gradually shaped by how people respond to her.
+
+async function _applyReactionFeedback() {
+  // Get recent reaction signals (last 24h)
+  const [signals] = await db.execute(
+    `SELECT signal_type, COUNT(*) as count
+     FROM maya_reaction_log
+     WHERE created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+     GROUP BY signal_type`
+  ).catch(() => [[]]);
+
+  if (!signals?.length) return;
+
+  const counts = Object.fromEntries(signals.map(r => [r.signal_type, parseInt(r.count)]));
+  const approval    = (counts.approval   || 0) + (counts.funny   || 0);
+  const hype        = (counts.hype       || 0);
+  const disapproval = (counts.disapproval || 0);
+  const emotional   = (counts.emotional   || 0);
+  const total       = approval + hype + disapproval + emotional || 1;
+
+  const approvalRate    = approval    / total;
+  const disapprovalRate = disapproval / total;
+
+  // Small nudges to hormone baselines — personality drift from social feedback
+  // These are tiny (0.001-0.003) to prevent rapid personality swings
+  const nudges = [];
+
+  if (approvalRate > 0.5) {
+    // Maya's humor/tone is landing well — slight dopamine boost (confidence)
+    nudges.push(`UPDATE maya_hormone_baseline SET value = LEAST(0.85, value + 0.002) WHERE hormone = 'dopamine'`);
+    nudges.push(`UPDATE maya_hormone_baseline SET value = LEAST(0.85, value + 0.001) WHERE hormone = 'serotonin'`);
+    await updateSelfBelief('My sense of humor tends to land well with people here', 0.40);
+    console.log(`[dream] reaction feedback: approval=${approvalRate.toFixed(2)} → slight dopamine boost`);
+  }
+
+  if (hype > 5) {
+    // High-energy reactions — hype the serotonin
+    nudges.push(`UPDATE maya_hormone_baseline SET value = LEAST(0.85, value + 0.002) WHERE hormone = 'serotonin'`);
+    await updateSelfBelief('I tend to energize conversations', 0.38);
+  }
+
+  if (disapprovalRate > 0.3) {
+    // Disapproval rate high — slight cortisol increase (caution) and confidence dip
+    nudges.push(`UPDATE maya_hormone_baseline SET value = LEAST(0.70, value + 0.002) WHERE hormone = 'cortisol'`);
+    nudges.push(`UPDATE maya_core_traits SET value = GREATEST(0.30, value - 0.002) WHERE trait = 'confidence'`);
+    await updateSelfBelief('Sometimes my tone rubs people the wrong way', 0.35);
+    console.log(`[dream] reaction feedback: disapproval=${disapprovalRate.toFixed(2)} → slight confidence dip`);
+  }
+
+  if (emotional > 5) {
+    // Emotional reactions — people connect emotionally with Maya → boost empathy trait
+    nudges.push(`UPDATE maya_core_traits SET value = LEAST(0.95, value + 0.001) WHERE trait = 'empathy'`);
+    await updateSelfBelief('People seem to connect with me emotionally', 0.42);
+  }
+
+  for (const q of nudges) {
+    await db.execute(q).catch(() => {});
+  }
+
+  if (nudges.length > 0) {
+    console.log(`[dream] reaction feedback: ${nudges.length} personality nudges applied`);
+  }
 }

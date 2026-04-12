@@ -36,6 +36,8 @@ import { w as learnedWeight, logDecision, resolveDecision, updatePatternMemory, 
 
 import db from './db.js';
 import { isSleeping } from './sleep.js';
+import { getDesirePressure, onIgnored, onGoodInteraction } from './desires.js';
+import { markMissing } from './context_enricher.js';
 import { saveMessage } from './memory.js';
 import axios from 'axios';
 import { config } from './config.js';
@@ -68,6 +70,9 @@ function _markUnreachable(userId, channelId) {
     [userId]
   ).catch(() => {});
   console.log(`[initiate] marked ${userId} unreachable for 30min, attachment -0.05`);
+  // Store emotional presence — Maya was thinking about them but couldn't reach them
+  markMissing(userId, 'them', 0.6, channelId).catch(() => {});
+  onIgnored(userId, 'them').catch(() => {});
 }
 
 function _isUnreachable(userId) {
@@ -143,7 +148,8 @@ async function _tick() {
 
   // ── Decision ──────────────────────────────────────────────────────────────
   const learnedThreshold = await learnedWeight('initiation', 'threshold', PRESSURE_THRESHOLD);
-  if (pressure <= risk + learnedThreshold) {
+  // Net pressure must exceed threshold — not pressure vs threshold+risk (was too strict)
+  if ((pressure - risk) <= learnedThreshold) {
     console.log('[initiate] pressure insufficient — staying silent');
     return;
   }
@@ -271,13 +277,23 @@ async function _calculatePressure(state) {
     attachmentSignal * aw +
     memSignal        * mw;
 
+  // Desire boost: if Maya has an active talk_to/resolve desire for the top user
+  let desireBoost = 0;
+  if (topUser?.discord_user_id) {
+    const dp = await getDesirePressure(topUser.discord_user_id).catch(() => 0);
+    desireBoost = Math.max(0, dp) * 0.15;  // only positive desires boost initiation
+  }
+
+  const finalPressure = Math.min(1, pressure + desireBoost);
+
   console.log(
     `[initiate] tick — entropy=${entropySignal.toFixed(2)} curiosity=${curiositySignal.toFixed(2)} ` +
-    `attachment=${attachmentSignal.toFixed(2)} mem=${memSignal.toFixed(2)} → pressure=${pressure.toFixed(2)} ` +
+    `attachment=${attachmentSignal.toFixed(2)} mem=${memSignal.toFixed(2)} ` +
+    `desire=${desireBoost.toFixed(2)} → pressure=${finalPressure.toFixed(2)} ` +
     `topUser=${topUser?.display_name || 'none'}`
   );
 
-  return { pressure, topUser, candidates: users };
+  return { pressure: finalPressure, topUser, candidates: users };
 }
 
 // ── Calculate social risk ─────────────────────────────────────────────────────
@@ -441,7 +457,7 @@ Output ONLY the message, nothing else.`;
     const { data, status } = await axios.post(
       config.llm.endpoint,
       {
-        model:       config.llm.model,
+        model:       config.llm.models.utility,
         messages:    [{ role: 'user', content: prompt }],
         temperature: 0.9,
         max_tokens:  60,

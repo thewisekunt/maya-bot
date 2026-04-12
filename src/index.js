@@ -31,11 +31,13 @@ function _resolveMentions(msg) {
   let text = msg.content;
   if (!text) return '';
   text = text.replace(/<@!?(\d+)>/g, (match, userId) => {
+    // Keep @ prefix so Maya knows this was an address/mention, not just a name
+    // "@horse how are you" vs "horse how are you" — huge semantic difference
     const member = msg.guild?.members?.cache?.get(userId);
-    if (member) return member.displayName || member.user?.username || '';
+    if (member) return '@' + (member.displayName || member.user?.username || userId);
     const user = msg.client?.users?.cache?.get(userId);
-    if (user) return user.username || '';
-    return '';
+    if (user) return '@' + (user.username || userId);
+    return '@' + userId;  // fallback: show ID with @ so it's still recognizable as mention
   });
   text = text.replace(/<@&(\d+)>/g, (match, roleId) => {
     const role = msg.guild?.roles?.cache?.get(roleId);
@@ -380,6 +382,17 @@ function _recordSession(msg, channelId, isDM, text, result) {
 
 async function _send(msg, result, channelId, isDM, text, client) {
   if (!result) return;
+  // LLM chose silence — honor it, save user msg to memory but don't reply
+  if (result.type === 'ignore') {
+    const { saveMessage } = await import('./memory.js');
+    saveMessage({
+      userId: msg.author.id, prefName: msg.member?.displayName || msg.author.username,
+      guildId: msg.guild?.id || null, channelId,
+      contextType: isDM ? 'dm' : 'server', isPrivate: isDM,
+      sender: 'user', message: text, entropy: 0.3,
+    }).catch(() => {});
+    return;
+  }
 
   const guildId    = msg.guild?.id || null;
   const userId     = msg.author.id;
@@ -525,6 +538,9 @@ client.on('messageReactionAdd', async (reaction, user) => {
     const { getMode } = await import('./presence.js');
     const mode = getMode(channelId);
     if (mode === 0) return;
+
+    // Never mirror reactions to Maya's OWN messages — she'd be reacting to herself
+    if (reaction.message.author?.id === client.user.id) return;
 
     const lastMirror = _recentMirrors.get(channelId) || 0;
     if (Date.now() - lastMirror < 15_000) return;
