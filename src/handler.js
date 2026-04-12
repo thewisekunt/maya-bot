@@ -44,6 +44,7 @@ export async function handleMessage({
   // ── 1. Context ────────────────────────────────────────────────────────────
   const isDM        = !msg.guild;
   const contextType = isDM ? 'dm' : 'server';
+  let thought = null;  // deliberation result — set below if triggered
   const isPrivate   = isDM;
   const channelId   = msg.channel?.id    || null;
   const channelName = isDM ? 'DM' : (msg.channel?.name || 'unknown');
@@ -500,7 +501,6 @@ export async function handleMessage({
 
   // ── Deliberation gate ──────────────────────────────────────────────────────
   let thoughtContext = '';
-  let thought = null;  // deliberation result — accessible after the block
   const deliberateTrigger = shouldDeliberate(richMessageText, psycheState, knownFacts);
   if (deliberateTrigger) {
     console.log(`[think] triggered: ${deliberateTrigger}`);
