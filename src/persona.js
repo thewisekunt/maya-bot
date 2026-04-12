@@ -424,25 +424,27 @@ export async function extractAndStoreFact(userId, message) {
   if (!shouldLLMExtract) return;
 
   try {
-    const prompt = `Extract personal facts about the speaker from this message. The speaker's name is "${userName}".
+    const prompt = `Extract stable personal facts about ${userName} from this Discord message.
 
 Message: "${cleaned}"
 
-Rules:
-- Only extract facts the speaker states about THEMSELVES using "I" or "my"
-- SKIP anything said in second-person ("you are...", "you have...", "are you...") — those are about someone else
-- SKIP questions entirely
-- SKIP statements about Maya/the bot ("are you an AI", "you are a bot")
-- Rewrite first-person to third-person: "I have a business" → "${userName} has a business"
-- Include negations: "I am not a student" → "${userName} is not a student"
-- Categories: occupation | preference | identity | location | relationship
-- Only extract CLEAR, SPECIFIC facts about ${userName}. Skip vague or ambiguous statements.
-- If no facts about ${userName}, return empty array.
+STRICT RULES — any violation = return []:
+1. Only facts true for months, not moments ("right now", "currently", "feeling X" = skip)
+2. Rewrite first-person to third-person: "I love gaming" → "${userName} loves gaming"
+3. NEVER store negations as facts: "I'm not sad", "not talking to you" = skip entirely
+4. NEVER store facts directed at Maya: "loves you", "needs you", "hates you" = skip
+5. No vague pronouns: "this guy", "someone", "that person" = reject
+6. No single emotional moments: "feeling sad right now", "hit a wall today" = skip
+7. Fact must be standalone — readable with zero conversation context
+8. Format: "${userName} [specific verb] [specific object]"
+9. Max 2 facts. When uncertain, return []
+10. SKIP questions, skip bot-related statements, skip temporary states
 
-Respond with ONLY valid JSON, no explanation:
+Categories: identity | preference | relationship | location | behavior
+
+Return ONLY a JSON array (no backticks, no explanation):
 [{"fact": "...", "category": "..."}]
-or
-[]`;
+or []`;
 
     const { data, status } = await axios.post(
       config.llm.endpoint,
@@ -474,12 +476,37 @@ or
     try { facts = JSON.parse(jsonStr); } catch { return; }
     if (!Array.isArray(facts) || facts.length === 0) return;
 
+    // Max 2 facts per message — prevents over-fitting one emotional moment
+    const MAX_FACTS_PER_MSG = 2;
+    let storedCount = 0;
+
     for (const { fact, category } of facts) {
-      if (!fact || typeof fact !== 'string' || fact.length < 5) continue;
+      if (storedCount >= MAX_FACTS_PER_MSG) break;
+      if (!fact || typeof fact !== 'string' || fact.length < 10) continue;
       if (!category) continue;
-      // Skip if this exact fact was already stored by regex
-      const isDupe = regexFound && fact.toLowerCase().includes(userName.toLowerCase());
+
+      const factLower = fact.toLowerCase();
+      const uname = userName.toLowerCase();
+
+      // Must start with userName (not "you", "I", "Maya", "she")
+      if (!factLower.startsWith(uname.slice(0, 6))) continue;
+
+      // Reject vague pronouns
+      if (/this guy|this person|someone|something/.test(factLower)) continue;
+
+      // Reject temporal/negation garbage — the #1 source of noise
+      if (/right now|currently|today|this moment/.test(factLower)) continue;
+      if (/feeling (really|so|very|a bit)/.test(factLower)) continue;
+      if (/ is not | are not | isn't | aren't | doesn't | don't /.test(fact)) continue;
+
+      // Reject facts directed at Maya
+      if (/loves you|hates you|needs you|needs maya/.test(factLower)) continue;
+
+      // Reject single-word or trivially short facts
+      if (fact.trim().split(/\s+/).length < 4) continue;
+
       await _storeFact(userId, userName, fact.slice(0, 200), category, 0.05, cleaned, 0, 0.4).catch(() => {});
+      storedCount++;
     }
 
   } catch (e) {
