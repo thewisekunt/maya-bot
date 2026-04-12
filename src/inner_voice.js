@@ -38,6 +38,10 @@ import { config } from './config.js';
 import axios from 'axios';
 import db    from './db.js';
 
+// ── Intent smoothing ────────────────────────────────────────────────────────
+const _intentHistory = new Map();
+const INTENT_ALPHA   = 0.4;
+
 // ── Pre-generation: situation understanding + tool planning ───────────────────
 
 /**
