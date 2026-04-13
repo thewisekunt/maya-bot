@@ -141,9 +141,7 @@ async function _processSessionInner(sessionId) {
 
   console.log(`[dream] session ${sessionId}: ${msgs.length} msgs, ${participantIds.length} participants`);
 
-  // ── Extract structured facts via LLM ────────────────────────────────────
-  let extracted;
-  // Retry once on 429 (rate limit) with a longer delay
+  // ── Extract structured facts via LLM — retry once on 429 ────────────────
   let extracted;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
