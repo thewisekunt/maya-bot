@@ -28,6 +28,33 @@ import { updateSlowDrift } from './psyche.js';
 import { embed, embedBatch } from './embedder.js';
 import { upsertMemory, upsertBatch, isConfigured } from './vector.js';
 import axios from 'axios';
+
+// ── Session processing queue ──────────────────────────────────────────────────
+// Sessions close concurrently (multiple channels idle at once) which fires
+// multiple LLM calls simultaneously → 429 rate limit errors.
+// Serial queue with a short delay between sessions prevents this.
+const _sessionQueue  = [];
+let   _sessionBusy   = false;
+const SESSION_GAP_MS = 8_000;  // 8 seconds between fact extractions
+
+async function _drainSessionQueue() {
+  if (_sessionBusy) return;
+  _sessionBusy = true;
+  while (_sessionQueue.length > 0) {
+    const sessionId = _sessionQueue.shift();
+    try {
+      await _processSessionInner(sessionId);
+    } catch (e) {
+      console.error(`[dream] session ${sessionId} processing error:`, e.message);
+    }
+    if (_sessionQueue.length > 0) {
+      // Gap between sessions — let the rate limiter breathe
+      await new Promise(r => setTimeout(r, SESSION_GAP_MS));
+    }
+  }
+  _sessionBusy = false;
+}
+
 import { config } from './config.js';
 
 const DREAM_INTERVAL_MS = parseInt(process.env.DREAM_INTERVAL_MINUTES || '30') * 60 * 1000;
@@ -62,7 +89,13 @@ export function notifyNewMessage() {
  * Process a closed session into LTM.
  * Called by stm.js when a session closes.
  */
-export async function processSession(sessionId) {
+// Public API: enqueue a session for serial processing
+export function processSession(sessionId) {
+  _sessionQueue.push(sessionId);
+  _drainSessionQueue().catch(() => {});
+}
+
+async function _processSessionInner(sessionId) {
   if (!isConfigured()) return;
   console.log(`[dream] processing session ${sessionId}`);
 
@@ -110,12 +143,23 @@ export async function processSession(sessionId) {
 
   // ── Extract structured facts via LLM ────────────────────────────────────
   let extracted;
-  try {
-    extracted = await _extractFacts(transcript, msgs, guildId);
-  } catch (e) {
-    console.error(`[dream] fact extraction failed for session ${sessionId}:`, e.message);
-    return;
+  // Retry once on 429 (rate limit) with a longer delay
+  let extracted;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      extracted = await _extractFacts(transcript, msgs, guildId);
+      break;
+    } catch (e) {
+      if (attempt === 1 && e.message?.includes('429')) {
+        console.warn(`[dream] session ${sessionId} rate-limited, retrying in 15s...`);
+        await new Promise(r => setTimeout(r, 15_000));
+        continue;
+      }
+      console.error(`[dream] fact extraction failed for session ${sessionId}:`, e.message);
+      return;
+    }
   }
+  if (!extracted) return;
 
   // ── Write to Qdrant with memory_type namespacing ────────────────────────
   const points = [];
