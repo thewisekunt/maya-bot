@@ -569,7 +569,8 @@ export async function handleMessage({
     lastExchangeQuality,
     refContext,
     emojiHint,
-    desireCtx: innerCognition.desireCtx || null,
+    desireCtx:      innerCognition.desireCtx || null,
+    innerCognition,
   });
 
   // Meta layer may have suppressed the response

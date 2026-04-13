@@ -247,7 +247,10 @@ export async function updateDesiresFromOutcome({ userId, userName, outcome, sent
   const af = emotions?.affection  || 0;
 
   // Positive harmony → want to talk to them more
-  if (isHarmony && trustLevel >= 3) {
+  // isDismissive: user is being short/negative without it being a real conflict
+  // (e.g. "chup ho jao", "stop blabbing", "go away") — don't reward with talk_to
+  const isDismissive = sentiment === 'negative' && !isConflict;
+  if (isHarmony && trustLevel >= 3 && !isDismissive) {
     await upsertDesire({
       type: 'talk_to', targetId: userId, targetLabel: userName,
       strength: 0.25 + af * 0.15,
@@ -352,6 +355,8 @@ export async function getDesirePressure(userId) {
 
 /** Called after a positive interaction — fulfills talk_to / resolve desires */
 export async function onGoodInteraction(userId, userName) {
+  // Only fulfills existing desires — talk_to creation is in updateDesiresFromOutcome
+  // This prevents double desire fires when handler calls both functions
   await fulfillDesire('talk_to', userId);
   await fulfillDesire('resolve_conflict', userId);
   await updateDesiresFromOutcome({

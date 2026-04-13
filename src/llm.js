@@ -89,6 +89,7 @@ export async function getMayaReply({
   lastExchangeQuality = 'none',
   emojiHint      = null,  // server emoji suggestions for this mood
   desireCtx      = null,  // active desires affecting this interaction
+  innerCognition = null,  // output from runInnerVoice — intent, episodic, boundary signals
 }) {
   // ── Build system prompt ───────────────────────────────────────────────────
   // When forceVerbal: strip REACT instruction entirely so the model never
@@ -209,9 +210,51 @@ export async function getMayaReply({
     sections.push(`(feeling: ${psycheState.monologue})`);
   }
 
-  // Section 2: Emotional presence + active desires
+  // Section 2: Emotional presence + active desires + inner voice signals
   if (emotionalCtx) sections.push(emotionalCtx);
   if (desireCtx) sections.push(`[Desires: ${desireCtx}]`);
+
+  // Inner voice signals — dynamic, derived from cognition layer not static prompts
+  if (innerCognition) {
+    const ivParts = [];
+    const intent = innerCognition.intentScore;
+    const action = innerCognition.action || innerCognition.reason;
+
+    // Intent + zone tells Maya how engaged she actually is
+    if (typeof intent === 'number') {
+      if (intent > 0.75)     ivParts.push("She's leaning in — wants to engage.");
+      else if (intent > 0.5) ivParts.push("She's paying attention.");
+      else if (intent > 0.35)ivParts.push("She's here but not pulled in.");
+      else                   ivParts.push("She's barely interested right now.");
+    }
+
+    // Deliberation confidence — affects how she answers knowledge questions
+    if (innerCognition.deliberation?.confidence === 'low') {
+      ivParts.push("She's not sure she knows enough to answer confidently — be honest.");
+    }
+    if (innerCognition.deliberation?.know && innerCognition.deliberation.know !== 'nothing relevant') {
+      ivParts.push(`What she already knows: ${innerCognition.deliberation.know.slice(0, 120)}`);
+    }
+
+    // Episodic: if user is asking about past topics
+    if (innerCognition.episodicContext?.isEpisodicQuery && innerCognition.episodicContext.prevTopic) {
+      ivParts.push(`Before this, she was talking about: ${innerCognition.episodicContext.prevTopic.topic}.`);
+    }
+
+    // Boundary: already caught at IV layer, but reinforce in prompt
+    if (innerCognition.boundaryType) {
+      const bd = {
+        sexual_harassment: "Someone just said something inappropriate. Don't engage — set a firm, brief boundary.",
+        degradation:       "They're being dismissive or rude. She doesn't have to tolerate it — respond with dignity.",
+        coercion:          "They're trying to make her comply. She decides for herself.",
+      };
+      ivParts.push(bd[innerCognition.boundaryType] || 'Set a clear boundary.');
+    }
+
+    if (ivParts.length > 0) {
+      sections.push('[Maya\'s internal state: ' + ivParts.join(' ') + ']');
+    }
+  }
 
   // Section 3: Conversation context
   if (contextTrunc) {

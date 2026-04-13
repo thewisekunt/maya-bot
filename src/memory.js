@@ -251,13 +251,24 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
           ? _relativeTime(new Date(mem.payload.created_at))
           : '';
         const tsTag = ts ? ` [${ts}]` : '';
-        // Raw messages already include speaker prefix ("Mario: hello")
+        // Raw messages may or may not include speaker prefix
         // Dream summaries are standalone sentences
         const isDreamOrSummary = mem.payload?.memory_type === 'conversation';
         if (isDreamOrSummary) {
           parts.push(`• ${mem.message}${tsTag}`);
         } else {
-          parts.push(`  ${mem.message}${tsTag}  (score: ${mem.score.toFixed(2)})`);
+          // Add speaker attribution if not already present
+          // Raw memories stored as "message text" need context of who said what
+          const sender   = mem.payload?.sender;
+          const userName = mem.payload?.user_name || mem.payload?.user_id;
+          let msgText    = mem.message || '';
+          // Only prefix if not already attributed (doesn't start with a name: pattern)
+          const alreadyAttributed = /^[A-Za-zऀ-ॿ].{0,30}:/.test(msgText);
+          if (!alreadyAttributed && sender) {
+            const label = sender === 'maya' ? 'Maya' : (userName || 'them');
+            msgText = `${label}: ${msgText}`;
+          }
+          parts.push(`  ${msgText}${tsTag}  (score: ${mem.score.toFixed(2)})`);
         }
       });
       parts.push('');

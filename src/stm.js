@@ -60,8 +60,10 @@ export async function openSession(channelId, guildId, triggeredByUserId) {
 
   _sessions.set(channelId, {
     sessionId,
-    lastActivity: Date.now(),
-    participants: new Set([triggeredByUserId]),
+    lastActivity:  Date.now(),
+    participants:  new Set([triggeredByUserId]),
+    topicHistory:  [],    // [{topic, startedAt, messageCount}]
+    currentTopic:  null,
   });
 
   console.log(`[stm] session opened for channel ${channelId} (id=${sessionId})`);
@@ -82,21 +84,27 @@ export async function recordSessionMessage(channelId, {
   if (sender === 'user') sess.participants.add(userId);
 
   // Fire and forget — don't block the reply on DB write
-  db.execute(
-    `INSERT INTO maya_session_messages
-       (session_id, discord_user_id, user_name, sender, message)
-     VALUES (?, ?, ?, ?, ?)`,
-    [sess.sessionId, userId, userName, sender, message]
-  ).then(() =>
-    db.execute(
-      `UPDATE maya_sessions
-       SET last_activity=NOW(),
-           message_count=message_count+1,
-           participant_ids=?
-       WHERE id=?`,
-      [JSON.stringify([...sess.participants]), sess.sessionId]
-    )
-  ).catch(e => console.error('[stm] record error:', e.message));
+  // Use separate calls to prevent ECONNRESET from killing both operations
+  (async () => {
+    try {
+      await db.execute(
+        `INSERT INTO maya_session_messages
+           (session_id, discord_user_id, user_name, sender, message)
+         VALUES (?, ?, ?, ?, ?)`,
+        [sess.sessionId, userId, userName, sender, message]
+      );
+    } catch (e) { console.error('[stm] record error:', e.message); return; }
+    try {
+      await db.execute(
+        `UPDATE maya_sessions
+         SET last_activity=NOW(),
+             message_count=message_count+1,
+             participant_ids=?
+         WHERE id=?`,
+        [JSON.stringify([...sess.participants]), sess.sessionId]
+      );
+    } catch { /* non-fatal — activity update can fail silently */ }
+  })();
 }
 
 /**
@@ -165,14 +173,62 @@ async function _closeSession(channelId) {
     );
     console.log(`[stm] session closed (id=${sess.sessionId})`);
 
-    // Trigger dream processing for this session
+    // Trigger dream processing for this session (queued — returns void)
     const { processSession } = await import('./dream.js');
-    processSession(sess.sessionId).catch(e =>
-      console.error('[stm] dream processSession error:', e.message)
-    );
+    try { processSession(sess.sessionId); } catch (e) {
+      console.error('[stm] dream processSession error:', e.message);
+    }
   } catch (e) {
     console.error('[stm] close error:', e.message);
   }
+}
+
+/**
+ * Update the current topic for a session.
+ * Called from handler when inner_voice detects a topic shift.
+ * @param {string} channelId
+ * @param {string} topic — short label like "gaming", "relationships", "bullying"
+ */
+export function updateSessionTopic(channelId, topic) {
+  const sess = _sessions.get(channelId);
+  if (!sess) return;
+  // Only update if topic actually changed
+  if (sess.currentTopic === topic) {
+    // Increment message count for current topic
+    if (sess.topicHistory.length > 0) {
+      sess.topicHistory[sess.topicHistory.length - 1].messageCount++;
+    }
+    return;
+  }
+  // New topic — push to history
+  sess.topicHistory.push({
+    topic,
+    startedAt:    Date.now(),
+    messageCount: 1,
+  });
+  // Keep last 10 topics
+  if (sess.topicHistory.length > 10) sess.topicHistory.shift();
+  sess.currentTopic = topic;
+}
+
+/**
+ * Get the episodic topic log for a session — what topics were discussed.
+ * Returns ordered list from oldest to newest.
+ */
+export function getTopicHistory(channelId) {
+  const sess = _sessions.get(channelId);
+  if (!sess) return [];
+  return sess.topicHistory || [];
+}
+
+/**
+ * Get the previous topic before the current one.
+ * Used by inner_voice to answer "what were we talking about before this?"
+ */
+export function getPreviousTopic(channelId) {
+  const sess = _sessions.get(channelId);
+  if (!sess || !sess.topicHistory || sess.topicHistory.length < 2) return null;
+  return sess.topicHistory[sess.topicHistory.length - 2];
 }
 
 /**
