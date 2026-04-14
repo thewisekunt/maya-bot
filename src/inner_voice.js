@@ -723,13 +723,6 @@ function _detectBoundaryViolation(text) {
 }
 
 // ── Boundary violation detector ───────────────────────────────────────────────
-function _detectBoundaryViolation(text) {
-  if (!text) return null;
-  if (BOUNDARY_SEXUAL.test(text)) return 'sexual_harassment';
-  if (BOUNDARY_DEGRAD.test(text)) return 'degradation';
-  if (BOUNDARY_COERCE.test(text)) return 'coercion';
-  return null;
-}
 
 // ── Episodic memory resolver ──────────────────────────────────────────────────
 // Runs in IV layer — zero LLM cost.
