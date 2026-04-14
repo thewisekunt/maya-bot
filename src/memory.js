@@ -88,22 +88,66 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
         } catch { /* non-fatal */ }
       } else {
         // Group chat — show speakers clearly, track unique speakers
-        const speakers = new Set(
-          sessionMsgs.filter(m => m.sender !== 'maya').map(m => m.user_name).filter(Boolean)
-        );
-        const speakerList = [...speakers].join(', ');
+        // Build speaker list — will be updated after collision detection below
+        const _speakerRaw = sessionMsgs.filter(m => m.sender !== 'maya');
+        // Generate disambiguated speaker list
+        const _speakerNames = new Set();
+        const _snCount = {};
+        _speakerRaw.forEach(r => {
+          if (r.user_name) {
+            _snCount[r.user_name] = (_snCount[r.user_name] || new Set());
+            _snCount[r.user_name].add(r.discord_user_id || '?');
+          }
+        });
+        _speakerRaw.forEach(r => {
+          if (!r.user_name) return;
+          if (_snCount[r.user_name].size > 1) {
+            const uid = r.discord_user_id || '';
+            _speakerNames.add(`${r.user_name}#${uid.slice(-4)}`);
+          } else {
+            _speakerNames.add(r.user_name);
+          }
+        });
+        const speakerList = [..._speakerNames].join(', ');
         parts.push(`--- Group chat. People here: ${speakerList || 'unknown'}. Maya is one of them. ---`);
         parts.push('--- NOT every message is to Maya. [Maya said] marks what Maya already replied. Only reply to the LAST message. ---');
         parts.push('');
 
         // Show ALL messages with speaker attribution — including Maya's replies
         // Maya's replies labelled clearly so she knows what she already said
+        // Build a name→userId collision map so we can disambiguate same-name users
+        // If two users share a display name, tag both with a short ID suffix
+        const nameCount = {};
+        sessionMsgs.forEach(sm => {
+          if (sm.sender !== 'maya' && sm.user_name) {
+            nameCount[sm.user_name] = (nameCount[sm.user_name] || new Set());
+            nameCount[sm.user_name].add(sm.discord_user_id || sm.user_id || '?');
+          }
+        });
+        // Names used by more than one userId → ambiguous, need disambiguation
+        const ambiguousNames = new Set(
+          Object.entries(nameCount)
+            .filter(([, ids]) => ids.size > 1)
+            .map(([name]) => name)
+        );
+
         sessionMsgs.forEach(m => {
-          const who    = m.sender === 'maya' ? 'Maya' : (m.user_name || '?');
           const isMaya = m.sender === 'maya';
           const ts     = m.created_at ? _relativeTime(new Date(m.created_at)) : '';
           const tsTag  = ts ? ` [${ts}]` : '';
-          // Maya's messages marked with [Maya said:] so LLM knows she already replied
+          let who;
+          if (isMaya) {
+            who = 'Maya';
+          } else {
+            const rawName = m.user_name || '?';
+            // If this name is used by multiple user IDs, append a short disambiguator
+            if (ambiguousNames.has(rawName) && (m.discord_user_id || m.user_id)) {
+              const uid = m.discord_user_id || m.user_id || '';
+              who = `${rawName}#${uid.slice(-4)}`;  // last 4 chars of discord ID
+            } else {
+              who = rawName;
+            }
+          }
           const prefix = isMaya ? `  [Maya said]${tsTag}:` : `  ${who}${tsTag}:`;
           parts.push(`${prefix} ${m.message}`);
         });

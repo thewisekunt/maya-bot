@@ -160,6 +160,15 @@ export async function getMayaReply({
     }
   }
 
+  // ── Memory grounding instruction ──────────────────────────────────────────
+  // Prevents hallucination: Maya must not invent facts about people or events.
+  // Past context in the user prompt is reference material — not a script to follow.
+  parts.push(
+    'MEMORY RULE: Only reference past context if it is directly relevant to what is being said NOW. ' +
+    'Never invent details, names, events, or conversations that are not in the provided context. ' +
+    'If you do not know something, say you don\'t know or ask — do not fabricate.'
+  );
+
   if (gender) {
     const genderNote = gender === 'female' ? 'she/her' : gender === 'male' ? 'he/him' : 'they/them';
     parts.push(`${prefName} uses ${genderNote} pronouns.`);
@@ -249,6 +258,11 @@ export async function getMayaReply({
         coercion:          "They're trying to make her comply. She decides for herself.",
       };
       ivParts.push(bd[innerCognition.boundaryType] || 'Set a clear boundary.');
+    }
+
+    // Habituation — repeated pattern detected
+    if (innerCognition.habituationNote) {
+      ivParts.push(innerCognition.habituationNote);
     }
 
     if (ivParts.length > 0) {

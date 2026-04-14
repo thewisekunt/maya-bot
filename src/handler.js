@@ -343,8 +343,9 @@ export async function handleMessage({
     // Feed deliberation result into inner voice so confidence affects decisions
     deliberation:     thought || null,
     // Feed vision emotion signal
-    mediaEmotionScore: media?.emotionScore || 0,
+    mediaEmotionScore:   media?.emotionScore   || 0,
     mediaEmotionValence: media?.emotionValence || 'neutral',
+    mediaContext:        mediaContext || '',
   });
 
   // ── Intent engine: what should Maya do? ──────────────────────────────────
@@ -481,10 +482,13 @@ export async function handleMessage({
   );
 
   // Build final message (inject "cannot see" if vision failed)
+  // IMPORTANT: stickers always produce text context via _interpretSticker — they
+  // don't need vision LLM calls. Never tell Maya she can't see a sticker.
+  const hasStickerOnly = msg.stickers?.size > 0 && msg.attachments?.size === 0 && msg.embeds?.length === 0;
   let finalMessage = richMessageText;
-  if (hasMedia && !visionWorked && message !== '[media]') {
+  if (hasMedia && !visionWorked && !hasStickerOnly && message !== '[media]') {
     finalMessage = `${message}\n[Note: image/file attached but I cannot view it]`;
-  } else if (hasMedia && !visionWorked && message === '[media]') {
+  } else if (hasMedia && !visionWorked && !hasStickerOnly && message === '[media]') {
     finalMessage = `[User sent an image I cannot view]`;
   }
 

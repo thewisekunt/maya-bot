@@ -37,10 +37,52 @@ import { detectBeliefConflict, getBeliefs } from './meta.js';
 import { config } from './config.js';
 import axios from 'axios';
 import db    from './db.js';
+import { updateSessionTopic, getTopicHistory, getPreviousTopic } from './stm.js';
 
 // ── Intent smoothing ────────────────────────────────────────────────────────
 const _intentHistory = new Map();
 const INTENT_ALPHA   = 0.4;
+
+// ── Behavioral pattern tracker (continuity gap prevention) ───────────────────
+// Tracks how often Maya produces the same category of response to the same user.
+// When a pattern fires > threshold times, IV returns a habituation signal so
+// the LLM prompt gets a note: "you've said this kind of thing many times — vary it."
+//
+// Key: `${channelId}:${userId}:${patternKey}`
+// Value: { count, lastSeen }
+const _patternHistory = new Map();
+const PATTERN_TTL_MS  = 30 * 60 * 1000;  // 30 min window
+const PATTERN_THRESH  = 3;               // times before flagging
+
+function _trackPattern(channelId, userId, patternKey) {
+  const key  = `${channelId}:${userId}:${patternKey}`;
+  const now  = Date.now();
+  const prev = _patternHistory.get(key);
+
+  if (prev && (now - prev.lastSeen) < PATTERN_TTL_MS) {
+    _patternHistory.set(key, { count: prev.count + 1, lastSeen: now });
+    return prev.count + 1;
+  } else {
+    _patternHistory.set(key, { count: 1, lastSeen: now });
+    return 1;
+  }
+}
+
+function _detectResponsePattern(message, mediaContext) {
+  // Map message/media context to a pattern key
+  if (!message && !mediaContext) return null;
+  const combined = `${message || ''} ${mediaContext || ''}`.toLowerCase();
+  if (/sticker/.test(combined))                         return 'sticker_reaction';
+  if (/gif/.test(combined))                             return 'gif_reaction';
+  if (/image attached.*could not|cannot view/i.test(combined)) return 'cant_see_image';
+  if (/\[image:|\[GIF:/i.test(combined))              return 'image_description';
+  return null;
+}
+
+// ── Boundary patterns — sexual harassment, coercion, degradation ──────────────
+const BOUNDARY_SEXUAL = /(send.{0,10}nudes?|show.{0,10}body|show.{0,10}breast|show.{0,10}boob|sex.{0,6}me|f.ck.{0,5}me|slut|whore?|rate.{0,8}body|horny.{0,6}maya|touch.{0,6}you|strip|masturbat|jerk.{0,6}you|finger.{0,6}you)/i;
+const BOUNDARY_DEGRAD = /(you.{0,5}worthless|you.{0,5}useless|randi|chinal|kutti|haramzadi|randwa|you.{0,5}piece.{0,5}of.{0,10}shit)/i;
+const BOUNDARY_COERCE = /(you.{0,6}have to|you.{0,6}must.{0,6}do|no.{0,6}choice|obey.{0,6}me|do.{0,8}what.{0,6}i.{0,6}say|you.{0,6}my.{0,6}slave|i.{0,6}own.{0,6}you|you.{0,6}belong.{0,6}to)/i;
 
 // ── Pre-generation: situation understanding + tool planning ───────────────────
 
@@ -78,9 +120,30 @@ export async function runInnerVoice(input) {
     isDM         = false,
     isReply      = false,
     deliberation = null,    // output from think.js deliberate()
-    mediaEmotionScore   = 0,    // 0–1 from vision.js
+    mediaEmotionScore   = 0,
     mediaEmotionValence = 'neutral',
+    mediaContext        = '',
   } = input;
+
+  // ── 0. Boundary defense (pre-scoring, zero LLM cost) ───────────────────────
+  const _boundaryType = _detectBoundaryViolation(message);
+  if (_boundaryType) {
+    console.log(`[iv] BOUNDARY: ${_boundaryType} — blocking and distancing`);
+    // Fire-and-forget: create_distance desire toward this user
+    import('./desires.js').then(({ upsertDesire }) =>
+      upsertDesire({
+        type: 'create_distance', targetId: userId, targetLabel: 'boundary violator',
+        strength: 0.85, source: 'boundary_defense',
+        context: _boundaryType, expiresInHours: 24,
+      }).catch(() => {})
+    );
+    return {
+      situation: { isDirect: true, isMention: true }, toolPlan: null,
+      intentScore: 1.0, needsClarification: false, deliberation: null,
+      action: 'boundary', boundaryType: _boundaryType,
+      reason: `boundary violation: ${_boundaryType}`,
+    };
+  }
 
   // ── 1. Internal state ─────────────────────────────────────────────────────
   const psyche      = getChannelState(channelId) || {};
@@ -184,17 +247,42 @@ export async function runInnerVoice(input) {
     activeDesires, identityCore,
   }).catch(() => {});
 
+  // ── 11. Episodic context (topic shift + recall) ─────────────────────────
+  // Detect if user is asking about past topics ("what were we talking about")
+  // or if the current message represents a topic shift.
+  // All in IV layer — no LLM call needed.
+  const { episodicContext, topicShift } = _resolveEpisodic(message, channelId);
+  if (topicShift) {
+    updateSessionTopic(channelId, topicShift);
+  }
+
   // When deliberation confidence is low, signal ask_clarification
   const needsClarification = deliberation?.confidence === 'low'
     && !situation.isDirect
     && (deliberation?.need && deliberation.need !== 'nothing');
 
+  // ── 12. Behavioral pattern check ──────────────────────────────────────────
+  // If Maya is about to produce the same category of response repeatedly,
+  // flag it so the LLM prompt gets a note to vary the response.
+  const detectedPattern = _detectResponsePattern(message, input.mediaContext || '');
+  let habituationNote   = null;
+  if (detectedPattern && channelId && userId) {
+    const count = _trackPattern(channelId, userId, detectedPattern);
+    if (count >= PATTERN_THRESH) {
+      habituationNote = `You've responded to this kind of thing (${detectedPattern.replace(/_/g,' ')}) ` +
+        `about ${count} times recently. Don't repeat the same kind of reply — vary your response.`;
+      console.log(`[iv] habituation: ${detectedPattern} ×${count} for ${userId}`);
+    }
+  }
+
   return {
     situation,
     toolPlan,
-    intentScore: smoothedIntent,  // smoothed via EWMA
+    intentScore:      smoothedIntent,
     needsClarification,
     deliberation,
+    episodicContext,  // {prevTopic, topicHistory, isEpisodicQuery} — pre-computed for handler
+    habituationNote,  // non-null when Maya is in a repetitive response loop
     internalPressure,
     contextForce,
     socialRisk,
@@ -622,4 +710,58 @@ async function _logInnerVoice({ userId, channelId, situation, toolPlan, intentSc
       ]
     );
   } catch { /* non-fatal */ }
+}
+
+// ── Boundary violation detector ───────────────────────────────────────────────
+// Returns a string describing the violation type, or null if clean.
+function _detectBoundaryViolation(text) {
+  if (!text) return null;
+  if (BOUNDARY_SEXUAL.test(text)) return 'sexual_harassment';
+  if (BOUNDARY_DEGRAD.test(text)) return 'degradation';
+  if (BOUNDARY_COERCE.test(text)) return 'coercion';
+  return null;
+}
+
+// ── Boundary violation detector ───────────────────────────────────────────────
+function _detectBoundaryViolation(text) {
+  if (!text) return null;
+  if (BOUNDARY_SEXUAL.test(text)) return 'sexual_harassment';
+  if (BOUNDARY_DEGRAD.test(text)) return 'degradation';
+  if (BOUNDARY_COERCE.test(text)) return 'coercion';
+  return null;
+}
+
+// ── Episodic memory resolver ──────────────────────────────────────────────────
+// Runs in IV layer — zero LLM cost.
+// Detects topic shifts and "what were we talking about" queries.
+
+const TOPIC_RECALL_Q = /(what were we|what was we|what were you|prev(ious)? topic|before this|we were talking|what did we|earlier we|going back|change.*topic|we discuss|alag topic|pehle kya|isse pehle|pehle wali|topic kya tha)/i;
+
+// Rough topic classifier — maps message content to a short topic label
+function _classifyTopic(text) {
+  const t = text.toLowerCase();
+  if (/(game|gaming|pubg|valorant|minecraft|play|match|rank)/.test(t)) return 'gaming';
+  if (/(love|crush|relationship|bae|girlfriend|boyfriend|dating|propose|breakup|pyaar|mohabbat)/.test(t)) return 'relationships';
+  if (/(bully|tease|harass|insult|fight|bully|ragging|torture|taunting)/.test(t)) return 'bullying';
+  if (/(sad|depress|lonely|anxious|mental|overthink|stress|cry|hurt|pain)/.test(t)) return 'mental_health';
+  if (/(study|exam|college|school|marks|result|assignment|homework|padhai)/.test(t)) return 'studies';
+  if (/(food|eat|hungry|cook|recipe|dinner|lunch|breakfast|khana|bhooka)/.test(t)) return 'food';
+  if (/(music|song|listen|spotify|playlist|singer|band)/.test(t)) return 'music';
+  if (/(movie|film|series|netflix|watch|episode|season|anime)/.test(t)) return 'entertainment';
+  if (/(work|job|internship|career|office|salary|interview)/.test(t)) return 'career';
+  if (/(family|parent|mom|dad|bhai|behen|sibling|ghar)/.test(t)) return 'family';
+  if (/(funny|joke|meme|laugh|lol|lmao|haha|roast)/.test(t)) return 'humor';
+  return null;  // no clear topic — don't update
+}
+
+function _resolveEpisodic(text, channelId) {
+  const isEpisodicQuery = TOPIC_RECALL_Q.test(text);
+  const topicHistory    = getTopicHistory(channelId);
+  const prevTopic       = getPreviousTopic(channelId);
+  const topicShift      = _classifyTopic(text);
+
+  return {
+    episodicContext: { isEpisodicQuery, prevTopic, topicHistory },
+    topicShift,
+  };
 }

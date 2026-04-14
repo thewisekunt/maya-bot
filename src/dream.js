@@ -169,7 +169,8 @@ async function _processSessionInner(sessionId) {
       const text = `${userName}: ${fact.text}`;
       try {
         const vec = await embed(text);
-        points.push({
+        console.log(`[dream] storing fact for ${userName}: ${fact.text?.slice(0, 80)}`);
+      points.push({
           id:      `uf_${sessionId}_${userId}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`,
           vector:  vec,
           payload: {
@@ -316,7 +317,17 @@ Rules:
   try {
     return JSON.parse(clean);
   } catch {
-    console.error('[dream] JSON parse failed:', clean.slice(0, 200));
+    // Log the raw response to diagnose why facts aren't storing
+    console.error('[dream] JSON parse failed. Raw (first 400):', clean.slice(0, 400));
+    // Try extracting just the JSON object if it's embedded in text
+    const jsonMatch = clean.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      try {
+        const extracted = JSON.parse(jsonMatch[0]);
+        console.log('[dream] JSON recovered from embedded text');
+        return extracted;
+      } catch { /* still failed */ }
+    }
     throw new Error('Invalid JSON from LLM');
   }
 }
