@@ -163,9 +163,22 @@ async function _processSessionInner(sessionId) {
   const points = [];
 
   // User facts — one per user per fact
+  // Post-extraction validation patterns
+  // Reject facts that are clearly Maya's own words misattributed to users
+  const MAYA_SPEECH_PATTERNS = [
+    /^sorry/i, /^i have a/i, /^i don'?t/i, /^i'?m not/i,
+    /^not interested/i, /^i already/i, /^i just/i,
+    /boyfriend|girlfriend/i,  // relationship status belongs to maya_traits, not user_facts
+  ];
+
   for (const [userId, facts] of Object.entries(extracted.user_facts || {})) {
     const userName = msgs.find(m => m.discord_user_id === userId)?.user_name || userId;
     for (const fact of facts) {
+      // Skip facts that look like misattributed Maya speech
+      if (MAYA_SPEECH_PATTERNS.some(p => p.test(fact.text || ''))) {
+        console.log(`[dream] skipping likely-misattributed fact for ${userName}: "${fact.text?.slice(0,60)}"`);
+        continue;
+      }
       const text = `${userName}: ${fact.text}`;
       try {
         const vec = await embed(text);
@@ -281,7 +294,10 @@ Extract and return this exact JSON structure:
 Rules:
 - Only include facts clearly stated, not inferred
 - User facts must use the user's discord_user_id as the key
+- CRITICAL: Lines beginning with "Maya:" are Maya's OWN speech. NEVER store Maya's words as facts about another user. Only extract facts from lines that belong to that specific user.
 - Rewrite all first-person ("I love pizza") to third-person ("Danish loves pizza")
+- Do NOT extract social deflections, refusals, or politeness phrases as facts (e.g. "sorry", "I have a bf", "not interested" — these are conversational, not facts)
+- Do NOT infer relationships between Maya and users (e.g. "Mario is Maya's boyfriend" is not extractable unless Mario himself stated it)
 - If nothing clear was stated for a field, use null or []
 - conflict_score 0.0 = stated as definite fact, 0.5 = opinion/preference, 1.0 = contradicts known info
 - Return ONLY the JSON object, no markdown, no explanation`;

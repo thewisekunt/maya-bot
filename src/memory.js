@@ -274,12 +274,24 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
     const convMemsFinal = dedupedConv;
 
     if (userFacts.length > 0) {
-      parts.push(`--- What Maya knows about ${prefName} (from memory) ---`);
-      userFacts.forEach(f => {
-        const text = f.payload?.fact_text || f.message;
-        if (text) parts.push(`• ${text}`);
+      const cleanFacts = userFacts.filter(f => {
+        const text     = f.payload?.fact_text || f.message || '';
+        const conflict = f.payload?.conflict_score ?? 0.5;
+        // Skip: Maya's own speech misattributed, social deflections, high-conflict facts
+        if (f.payload?.sender === 'maya')              return false;
+        if (/^maya:/i.test(text))                      return false;
+        if (/sorry.*have|have a (bf|gf|boyfriend|girlfriend)/i.test(text)) return false;
+        if (conflict > 0.8)                            return false;
+        return true;
       });
-      parts.push('');
+      if (cleanFacts.length > 0) {
+        parts.push(`--- What Maya knows about ${prefName} (from memory) ---`);
+        cleanFacts.forEach(f => {
+          const text = f.payload?.fact_text || f.message;
+          if (text) parts.push(`• ${text}`);
+        });
+        parts.push('');
+      }
     }
 
     if (selfTraitsVec.length > 0) {
