@@ -1,3 +1,5 @@
+import { processMorningInbox, dismissOldNotifications } from './inbox.js';
+import { saveMessage } from './memory.js';
 /**
  * sleep.js — Maya's nightly sleep cycle
  *
@@ -83,7 +85,8 @@ async function _checkSleepSchedule() {
 
   // Log state every 10 minutes to make sleep issues visible
   if (mins % 10 === 0) {
-    console.log(`[sleep] status: sleeping=${_sleeping} shouldSleep=${shouldSleep} time=${ist.toTimeString().slice(0,5)} IST`);
+    const istTime = `${String(ist.getHours()).padStart(2,'0')}:${String(ist.getMinutes()).padStart(2,'0')}`;
+    console.log(`[sleep] status: sleeping=${_sleeping} shouldSleep=${shouldSleep} time=${istTime} IST`);
   }
 
   if (shouldSleep && !_sleeping) {
@@ -97,7 +100,8 @@ async function _checkSleepSchedule() {
 async function _enterSleep() {
   _sleeping = true;
   const ist = _nowIST();
-  console.log(`[sleep] Maya going to sleep at ${ist.toTimeString().slice(0,5)} IST`);
+  const istStr = `${String(ist.getHours()).padStart(2,'0')}:${String(ist.getMinutes()).padStart(2,'0')}`;
+  console.log(`[sleep] Maya going to sleep at ${istStr} IST`);
 
   // Log sleep start
   try {
@@ -143,13 +147,19 @@ async function _postSleepMessage() {
   const msg = sleepMsgs[Math.floor(Math.random() * sleepMsgs.length)];
 
   await channel.send(msg).catch(() => {});
+  saveMessage({
+    userId: 'maya', prefName: 'Maya', guildId: channel.guild?.id || null,
+    channelId: ch.channel_id, contextType: 'server', isPrivate: false,
+    sender: 'maya', message: `[sleep] ${msg}`, entropy: 0.1,
+  }).catch(() => {});
   console.log(`[sleep] posted sleep message: "${msg}"`);
 }
 
 async function _exitSleep() {
   _sleeping = false;
   const ist = _nowIST();
-  console.log(`[sleep] Maya waking up at ${ist.toTimeString().slice(0,5)} IST`);
+  const istStr = `${String(ist.getHours()).padStart(2,'0')}:${String(ist.getMinutes()).padStart(2,'0')}`;
+  console.log(`[sleep] Maya waking up at ${istStr} IST`);
 
   if (_sleepLogId) {
     await db.execute(
@@ -157,6 +167,12 @@ async function _exitSleep() {
       [_sleepLogId]
     ).catch(() => {});
     _sleepLogId = null;
+  }
+
+  // Process pending notifications from sleep
+  if (_client) {
+    await processMorningInbox(_client).catch(e => console.error('[sleep] inbox:', e.message));
+    await dismissOldNotifications().catch(() => {});
   }
 
   // Post wake message
@@ -180,7 +196,7 @@ async function _postWakeMessage() {
   const wakeMsgs = [
     'back',
     'morning',
-    'okay Im up',
+    'okay I'm up',
     'ugh morning people',
     'woke up, kya hua',
     'theek hun, good morning I guess',
@@ -366,7 +382,7 @@ Rules:
 - If nothing factual, return {"facts":[],"summary":"","topics":[],"mood":"neutral"}`;
 
     const { data, status } = await axios.post(config.llm.endpoint, {
-      model:       'deepseek/deepseek-chat-v3-0324',
+      model:       config.llm.models.utility,
       messages:    [{ role: 'user', content: prompt }],
       temperature: 0.1,
       max_tokens:  300,
@@ -377,9 +393,25 @@ Rules:
 
     if (status !== 200) return;
 
-    const raw    = data?.choices?.[0]?.message?.content?.trim() || '{}';
-    const clean  = raw.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
-    const result = JSON.parse(clean);
+    const raw = data?.choices?.[0]?.message?.content?.trim() || '{}';
+    // Strip markdown fences (model often returns ```json ... ```)
+    let clean = raw
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```\s*$/i, '')
+      .trim();
+    // If still wrapped (double fences), strip again
+    if (clean.startsWith('`')) clean = clean.replace(/`/g, '');
+    // Extract JSON object if embedded in prose
+    const jsonMatch = clean.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return;
+    clean = jsonMatch[0];
+    let result;
+    try {
+      result = JSON.parse(clean);
+    } catch (parseErr) {
+      console.log(`[sleep] cluster ${discord_user_id}/${day} JSON parse failed: ${parseErr.message}`);
+      return;
+    }
 
     if (!result.facts?.length && !result.summary) return;
 

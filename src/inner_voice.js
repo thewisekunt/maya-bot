@@ -275,14 +275,42 @@ export async function runInnerVoice(input) {
     }
   }
 
+  // ── 13. Psyche nudge — IV signals that should adjust hormones ──────────────
+  // psyche.updateState already ran (before IV), so we return a nudge object
+  // for handler to apply as a lightweight hormone adjustment AFTER IV.
+  // This lets IV-level signals (boundary violation, clarification loop,
+  // high engagement) actually affect Maya's emotional state.
+  const psycheNudge = {};
+
+  if (_boundaryType) {
+    // Boundary violation → cortisol spike + dopamine drop
+    psycheNudge.cortisol = +0.18;
+    psycheNudge.dopamine = -0.08;
+    psycheNudge.reason   = `boundary:${_boundaryType}`;
+  } else if (needsClarification) {
+    // Confusion/ambiguity loop → mild cortisol rise
+    psycheNudge.cortisol = +0.06;
+    psycheNudge.reason   = 'clarification_needed';
+  } else if (smoothedIntent > 0.75) {
+    // High engagement → dopamine + oxytocin boost
+    psycheNudge.dopamine = +0.07;
+    psycheNudge.oxytocin = +0.04;
+    psycheNudge.reason   = 'high_engagement';
+  } else if (smoothedIntent < 0.30) {
+    // Disengaged → slight dopamine dip
+    psycheNudge.dopamine = -0.04;
+    psycheNudge.reason   = 'low_engagement';
+  }
+
   return {
     situation,
     toolPlan,
     intentScore:      smoothedIntent,
     needsClarification,
     deliberation,
-    episodicContext,  // {prevTopic, topicHistory, isEpisodicQuery} — pre-computed for handler
-    habituationNote,  // non-null when Maya is in a repetitive response loop
+    episodicContext,
+    habituationNote,
+    psycheNudge,      // hormone adjustments for handler to apply post-IV
     internalPressure,
     contextForce,
     socialRisk,

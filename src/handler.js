@@ -4,7 +4,7 @@
  */
 
 import { buildContext, saveMessage } from './memory.js';
-import { updateState } from './psyche.js';
+import { updateState, applyPsycheNudge } from './psyche.js';
 import { detectPfpRequest, detectSelfUpdate, describeAndStoreAvatar,
          recallAvatar, updateName, updateAvatar, updateBio } from './selfupdate.js';
 import { openSession, recordSessionMessage, getSessionParticipants } from './stm.js';
@@ -350,6 +350,11 @@ export async function handleMessage({
 
   // ── Intent engine: what should Maya do? ──────────────────────────────────
   const { isSleeping } = await import('./sleep.js');
+  // Apply IV → psyche hormone nudge (boundary, engagement, clarification signals)
+  if (innerCognition?.psycheNudge && Object.keys(innerCognition.psycheNudge).length > 0) {
+    applyPsycheNudge(channelId, innerCognition.psycheNudge);
+  }
+
   const decision = resolveIntent(innerCognition, {
     isMention, isDM, isReply,
     isSleeping: isSleeping(),

@@ -548,3 +548,28 @@ async function _saveSnapshot(sessionId, ch) {
 function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
 function lerp(a, b, t)       { return a + clamp(t, 0, 1) * (b - a); }
 function round(v)             { return Math.round(v * 1000) / 1000; }
+
+// ── IV → Psyche nudge ─────────────────────────────────────────────────────────
+// Called by handler AFTER inner_voice runs.
+// Applies lightweight hormone adjustments without re-running the full pipeline.
+// Delta values are clamped to prevent runaway spikes.
+export function applyPsycheNudge(channelId, nudge) {
+  if (!nudge || !Object.keys(nudge).length) return;
+  const ch = _getChannel(channelId);
+  if (!ch) return;
+
+  const hb   = _hormoneBaseline || { dopamine: 0.5, cortisol: 0.2, oxytocin: 0.5, serotonin: 0.6 };
+  const MAX_DELTA = 0.25;  // cap single-nudge effect
+
+  for (const hormone of ['dopamine', 'cortisol', 'oxytocin', 'serotonin']) {
+    if (nudge[hormone] === undefined) continue;
+    const delta = Math.max(-MAX_DELTA, Math.min(MAX_DELTA, nudge[hormone]));
+    ch.hormones[hormone] = clamp(round(ch.hormones[hormone] + delta), 0, 1);
+  }
+
+  if (nudge.reason) {
+    console.log(`[psyche] iv nudge applied: ${nudge.reason} → ` +
+      `d=${round(ch.hormones.dopamine)} c=${round(ch.hormones.cortisol)} ` +
+      `o=${round(ch.hormones.oxytocin)}`);
+  }
+}
