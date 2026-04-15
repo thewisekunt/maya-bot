@@ -441,22 +441,50 @@ export async function trainNLP() {
       } catch { /* corrupt — fall through to full retrain */ }
     }
 
-    // 3. Cold start — train from hardcoded + ALL DB entries
-    console.log('[nlp] cold start — training from scratch + all DB entries...');
+    // 3. Cold start — train from hardcoded + balanced DB sample
+    // node-nlp keeps all examples in memory during training.
+    // 18k+ rows OOM-kills a 512MB container. Strategy:
+    //   - Take up to MAX_PER_INTENT examples per intent (balanced, highest quality)
+    //   - Filter junk utterances (stop-words only, too short, emoji-only)
+    //   - Cap total at COLD_START_CAP to stay well under memory limit
+    const MAX_PER_INTENT  = 120;   // enough for good accuracy per intent
+    const COLD_START_CAP  = 1500;  // hard total cap — keeps heap under ~150MB
+    const JUNK_RE = /^[\s\p{P}\p{S}\p{Emoji}\u200b-\u200f\uFEFF?!.…,;:_\-]+$/u;
+
+    console.log('[nlp] cold start — training from hardcoded + DB sample...');
     _addTrainingData();
 
-    // Load ALL training entries from DB (not just 200 unprocessed)
     try {
+      // Fetch all, deduplicate and balance per-intent in JS
+      // (cheaper than complex SQL and gives us junk filtering)
       const [rows] = await db.execute(
         `SELECT text, intent FROM maya_nlp_training
-         WHERE LENGTH(text) >= 3 AND LENGTH(text) <= 300
-         ORDER BY created_at ASC`
+         WHERE LENGTH(text) >= 5 AND LENGTH(text) <= 200
+         ORDER BY created_at DESC`   // DESC = prefer recent (higher quality)
       );
-      console.log(`[nlp] loading ${rows.length} DB training examples...`);
+
+      // Filter junk, balance per intent
+      const intentBuckets = {};
+      let totalAdded = 0;
       for (const row of rows) {
-        manager.addDocument('en', row.text.toLowerCase(), row.intent);
+        if (totalAdded >= COLD_START_CAP) break;
+        const t = (row.text || '').trim().toLowerCase();
+        if (!t || JUNK_RE.test(t)) continue;        // skip emoji/punct-only
+        if (t.split(/\s+/).length < 2) continue;   // skip single-word noise
+
+        const bucket = intentBuckets[row.intent] || 0;
+        if (bucket >= MAX_PER_INTENT) continue;     // skip over-represented intent
+
+        manager.addDocument('en', t, row.intent);
+        intentBuckets[row.intent] = bucket + 1;
+        totalAdded++;
       }
-      // Mark all as used since we're training on all of them now
+
+      const intentSummary = Object.entries(intentBuckets)
+        .map(([k,v]) => `${k}:${v}`).join(' ');
+      console.log(`[nlp] loaded ${totalAdded}/${rows.length} DB examples — ${intentSummary}`);
+
+      // Mark loaded batch as used
       await db.execute(`UPDATE maya_nlp_training SET used_in_train = 1`);
     } catch (e) {
       console.warn('[nlp] DB training load failed, using hardcoded only:', e.message);
