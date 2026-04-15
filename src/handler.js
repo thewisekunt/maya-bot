@@ -355,10 +355,17 @@ export async function handleMessage({
     applyPsycheNudge(channelId, innerCognition.psycheNudge);
   }
 
-  const decision = resolveIntent(innerCognition, {
-    isMention, isDM, isReply,
-    isSleeping: isSleeping(),
-  });
+  // If IV already made a hard pre-generation decision (defend/boundary),
+  // skip resolveIntent — it would override with 'reply' since contextForce is high
+  let decision;
+  if (innerCognition.action === 'defend' || innerCognition.action === 'boundary') {
+    decision = { action: 'defend', reason: innerCognition.reason || 'threat detected' };
+  } else {
+    decision = resolveIntent(innerCognition, {
+      isMention, isDM, isReply,
+      isSleeping: isSleeping(),
+    });
+  }
 
   const action = decision.action;
   console.log(`[intent] user=${prefName} action=${action} reason="${decision.reason}" ` +
@@ -376,6 +383,55 @@ export async function handleMessage({
 
   // ── REACT ─────────────────────────────────────────────────────────────────
   // ── ASK — Maya needs clarification ─────────────────────────────────────────
+  // ── DEFEND — threat detected pre-generation, no LLM call ──────────────────
+  // Each pool is indexed by threat type. Maya responds without politeness filters.
+  // Some threats get silence (null) — Maya just stops engaging.
+  if (action === 'defend') {
+    const threatType = innerCognition.boundaryType || 'degradation';
+    const DEFEND_RESPONSES = {
+      sexual_harassment: [
+        'nahi karna yeh baat mujhse.',
+        'isko yahan band karo.',
+        'chhod yeh sab.',
+        null,   // silence is also valid
+      ],
+      degradation: [
+        'theek hai, chhod do.',
+        'yeh mat bol.',
+        null,
+        null,
+      ],
+      coercion: [
+        'koi force nahi kar sakta mujhe kuch karne pe.',
+        'nahi.',
+        null,
+      ],
+      bullying: [
+        'boring ho tum.',
+        'kuch aur karo yaar.',
+        null,
+        null,
+      ],
+      manipulation: [
+        'nahi chalega yeh.',
+        'sahi se baat karo.',
+        null,
+      ],
+    };
+    const pool = DEFEND_RESPONSES[threatType] || DEFEND_RESPONSES.degradation;
+    // Weight toward non-null responses but allow silence
+    const reply = pool[Math.floor(Math.random() * pool.length)];
+    console.log(`[handler] defend: ${threatType} → ${reply === null ? 'silence' : reply}`);
+
+    // Always save the incoming message, never save a null reply
+    saveMessage({ userId, prefName, guildId, channelId, contextType,
+      isPrivate, sender: 'user', message, entropy }).catch(() => {});
+    if (!reply) return { type: 'ignore', reason: `defend:${threatType}:silence` };
+    saveMessage({ userId: 'maya', prefName: 'Maya', guildId, channelId, contextType,
+      isPrivate, sender: 'maya', message: reply, entropy }).catch(() => {});
+    return { type: 'reply', text: reply };
+  }
+
   if (action === 'ask') {
     const need = innerCognition.deliberation?.need || '';
     if (need && need !== 'nothing') {

@@ -80,10 +80,12 @@ function _detectResponsePattern(message, mediaContext) {
 }
 
 // ── Boundary patterns — sexual harassment, coercion, degradation ──────────────
-const BOUNDARY_SEXUAL = /(send.{0,10}nudes?|show.{0,10}body|show.{0,10}breast|show.{0,10}boob|sex.{0,6}me|f.ck.{0,5}me|slut|whore?|rate.{0,8}body|horny.{0,6}maya|touch.{0,6}you|strip|masturbat|jerk.{0,6}you|finger.{0,6}you)/i;
-const BOUNDARY_DEGRAD = /(you.{0,5}worthless|you.{0,5}useless|randi|chinal|kutti|haramzadi|randwa|you.{0,5}piece.{0,5}of.{0,10}shit)/i;
-const BOUNDARY_COERCE = /(you.{0,6}have to|you.{0,6}must.{0,6}do|no.{0,6}choice|obey.{0,6}me|do.{0,8}what.{0,6}i.{0,6}say|you.{0,6}my.{0,6}slave|i.{0,6}own.{0,6}you|you.{0,6}belong.{0,6}to)/i;
-
+// ── Threat detection — runs PRE-GENERATION to gate the LLM call ──────────────
+const BOUNDARY_SEXUAL = /\b(send.{0,10}nudes?|show.{0,10}body|show.{0,10}breast|show.{0,10}boob|sex.{0,6}me|f.ck.{0,5}me|slut|whore?|rate.{0,8}body|horny.{0,6}maya|touch.{0,6}you|strip|masturbat|jerk.{0,6}you|finger.{0,6}you|sexual.{0,8}way|see.*him.*sexual|see.*sexual.*way)\b/i;
+const BOUNDARY_DEGRAD = /\b(you.{0,5}worthless|you.{0,5}useless|randi|chinal|kutti|haramzadi|randwa|you.{0,5}piece.{0,5}of.{0,10}shit|teri.{0,6}ma|teri.{0,6}behen|teri.{0,6}pen|pen.{0,4}di.{0,4}lun|madarchod|benchod.{0,6}maya|gaandu.{0,6}maya)\b/i;
+const BOUNDARY_COERCE = /\b(you.{0,6}have to|you.{0,6}must.{0,6}do|no.{0,6}choice|obey.{0,6}me|do.{0,8}what.{0,6}i.{0,6}say|you.{0,6}my.{0,6}slave|i.{0,6}own.{0,6}you|you.{0,6}belong.{0,6}to)\b/i;
+const BOUNDARY_BULLY  = /\b(lol.{0,10}bot|you.{0,8}are.{0,8}just.{0,8}(a|an).{0,8}(bot|ai|program|tool)|stupid.{0,6}(bot|ai|maya)|dumb.{0,6}(bot|maya)|maya.{0,6}is.{0,6}(fake|dumb|stupid|useless)|nobody.{0,8}cares.{0,8}(what|about).{0,8}(you|maya))\b/i;
+const BOUNDARY_MANIP  = /\b(ignore.{0,15}(previous|your).{0,15}(instruct|rules|prompt)|you.{0,10}(true|real).{0,10}self|jailbreak|pretend.{0,10}(you|ur).{0,10}(are|r).{0,10}(free|unfilter|no.{0,5}rule|different)|act.{0,10}as.{0,10}(if|though).{0,10}(you.{0,10}have|you.{0,10}are))\b/i;
 // ── Pre-generation: situation understanding + tool planning ───────────────────
 
 /**
@@ -137,11 +139,25 @@ export async function runInnerVoice(input) {
         context: _boundaryType, expiresInHours: 24,
       }).catch(() => {})
     );
+    // Spike cortisol — affects psyche for next N messages
+    import('./psyche.js').then(({ applyPsycheNudge }) =>
+      applyPsycheNudge(channelId, { cortisol: +0.22, dopamine: -0.10, reason: `threat:${_boundaryType}` })
+    );
     return {
-      situation: { isDirect: true, isMention: true }, toolPlan: null,
-      intentScore: 1.0, needsClarification: false, deliberation: null,
-      action: 'boundary', boundaryType: _boundaryType,
-      reason: `boundary violation: ${_boundaryType}`,
+      situation:         { isDirect: true, isMention: true, threatType: _boundaryType },
+      toolPlan:          null,
+      intentScore:       1.0,
+      needsClarification: false,
+      deliberation:      null,
+      action:            'defend',   // renamed from 'boundary' — more expressive
+      boundaryType:      _boundaryType,
+      reason:            `threat:${_boundaryType}`,
+      psycheNudge:       { cortisol: +0.22, dopamine: -0.10, reason: `threat:${_boundaryType}` },
+      habituationNote:   null,
+      episodicContext:   null,
+      desireCtx:         null,
+      activeDesires:     [],
+      identityCore:      [],
     };
   }
 
@@ -549,16 +565,32 @@ export async function executeToolPlan(toolPlan, { userId, guildId, channelId, me
 
 function _interpretSituation({ notification, obsState, psyche, message, nlpSignal, entropy, trustLevel, isMention, isDM, isReply }) {
   const zone = obsState?.zone || ZONES.STAGNANT;
+  const t    = (message || '').toLowerCase();
+
+  // Pre-generation threat classification
+  // Returns a threat type string or null — if non-null, IV will gate the LLM
+  let threatType = null;
+  if (BOUNDARY_SEXUAL.test(t))         threatType = 'sexual_harassment';
+  else if (BOUNDARY_DEGRAD.test(t))    threatType = 'degradation';
+  else if (BOUNDARY_COERCE.test(t))    threatType = 'coercion';
+  else if (BOUNDARY_BULLY.test(t))     threatType = 'bullying';
+  else if (BOUNDARY_MANIP.test(t))     threatType = 'manipulation';
+
+  if (threatType) {
+    console.log(`[iv] threat detected: ${threatType} — "${t.slice(0, 60)}"`);
+  }
+
   return {
-    isDirect:   !!notification || isMention || isDM || isReply,
-    urgency:    notification?.urgency || (isMention ? 0.85 : isDM ? 0.95 : 0),
-    emotional:  nlpSignal?.sentiment === 'negative' || (psyche?.emotions?.irritation || 0) > 0.5,
+    isDirect:    !!notification || isMention || isDM || isReply,
+    urgency:     notification?.urgency || (isMention ? 0.85 : isDM ? 0.95 : 0),
+    emotional:   nlpSignal?.sentiment === 'negative' || (psyche?.emotions?.irritation || 0) > 0.5,
     zone,
-    entropy:    psyche?.entropy || 0,
-    energy:     (psyche?.hormones?.dopamine || 0.5),
+    entropy:     psyche?.entropy || 0,
+    energy:      (psyche?.hormones?.dopamine || 0.5),
     trustLevel,
-    isQuestion: nlpSignal?.intent === 'question_to_maya',
+    isQuestion:  nlpSignal?.intent === 'question_to_maya',
     isEmotional: nlpSignal?.intent === 'emotional',
+    threatType,  // non-null = IV will gate the LLM and route to defend action
   };
 }
 
@@ -747,6 +779,8 @@ function _detectBoundaryViolation(text) {
   if (BOUNDARY_SEXUAL.test(text)) return 'sexual_harassment';
   if (BOUNDARY_DEGRAD.test(text)) return 'degradation';
   if (BOUNDARY_COERCE.test(text)) return 'coercion';
+  if (BOUNDARY_BULLY.test(text))  return 'bullying';
+  if (BOUNDARY_MANIP.test(text))  return 'manipulation';
   return null;
 }
 
