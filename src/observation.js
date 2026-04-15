@@ -120,6 +120,64 @@ export function observe(channelId, { userId, username, content, entropy, sentime
  * Get the current observation state for a channel.
  * This is what inner_voice.js reads.
  */
+
+// ── Notification pressure tracker ─────────────────────────────────────────────
+// Tracks how many times Maya has been mentioned/pinged in a rolling window.
+// Used by IV to detect targeted pressure — repeated pings from same user,
+// or multiple users piling on in short succession.
+//
+// Separate from spamguard (which blocks spam before handler).
+// This is about Maya's *awareness* of being targeted — not blocking, but deciding.
+
+const _pressureMap = new Map();  // channelId → { pings: [{userId, ts}] }
+const PRESSURE_WINDOW_MS = 3 * 60 * 1000;  // 3 minute rolling window
+
+export function recordPing(channelId, userId) {
+  if (!_pressureMap.has(channelId)) _pressureMap.set(channelId, { pings: [] });
+  const ch  = _pressureMap.get(channelId);
+  const now = Date.now();
+  ch.pings  = ch.pings.filter(p => now - p.ts < PRESSURE_WINDOW_MS);
+  ch.pings.push({ userId, ts: now });
+}
+
+/**
+ * Returns a pressure snapshot for IV decision-making.
+ * @returns {{
+ *   totalPings:    number,   — total pings to Maya in last 3 min
+ *   uniqueUsers:   number,   — how many distinct users
+ *   topUser:       string|null, — userId pinging most
+ *   topUserCount:  number,
+ *   isTargeted:    boolean,  — same user pinging repeatedly (≥3 in window)
+ *   isSwarmed:     boolean,  — 3+ users pinging in short succession
+ *   heatLevel:     number,   — 0–1 composite pressure score
+ * }}
+ */
+export function getPressureState(channelId) {
+  const ch  = _pressureMap.get(channelId);
+  const now = Date.now();
+  if (!ch) return { totalPings: 0, uniqueUsers: 0, topUser: null, topUserCount: 0, isTargeted: false, isSwarmed: false, heatLevel: 0 };
+
+  const recent = ch.pings.filter(p => now - p.ts < PRESSURE_WINDOW_MS);
+  if (!recent.length) return { totalPings: 0, uniqueUsers: 0, topUser: null, topUserCount: 0, isTargeted: false, isSwarmed: false, heatLevel: 0 };
+
+  const userCounts = {};
+  recent.forEach(p => { userCounts[p.userId] = (userCounts[p.userId] || 0) + 1; });
+  const uniqueUsers  = Object.keys(userCounts).length;
+  const topUser      = Object.entries(userCounts).sort(([,a],[,b]) => b-a)[0];
+  const topUserCount = topUser ? topUser[1] : 0;
+  const topUserId    = topUser ? topUser[0] : null;
+
+  const isTargeted = topUserCount >= 3;
+  const isSwarmed  = uniqueUsers >= 3 && recent.length >= 5;
+
+  // Heat = blend of total volume + concentration
+  const volumeScore      = Math.min(recent.length / 8, 1);
+  const concentrationScore = isTargeted ? 0.6 : (isSwarmed ? 0.4 : 0);
+  const heatLevel        = Math.min(volumeScore * 0.6 + concentrationScore * 0.4, 1);
+
+  return { totalPings: recent.length, uniqueUsers, topUser: topUserId, topUserCount, isTargeted, isSwarmed, heatLevel };
+}
+
 export function getObservationState(channelId) {
   const ch = _channels.get(channelId);
   if (!ch) return { zone: ZONES.STAGNANT, buffer: [], velocity: 0, pullScore: 0, uniqueSpeakers: [] };

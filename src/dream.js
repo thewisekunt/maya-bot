@@ -228,7 +228,23 @@ async function _processSessionInner(sessionId) {
   }
 
   // Maya self-traits extracted from her own replies
+  // Filter maya_traits — reject banter/joke lines misidentified as real self-beliefs
+  const TRAIT_JUNK_PATTERNS = [
+    /my men/i,           // possessive relationship jokes
+    /jappu/i,              // server nicknames
+    /\$\d+/,               // joke price references
+    /capitalist whore/i,   // in-character jokes
+    /botussy/i,            // server meme terms
+    /kms|die/i,    // hyperbolic despair
+    /^maya said/i,         // misattributed speech
+    /lmao|lol|haha/i,      // clear humor markers — not serious facts
+  ];
+
   for (const trait of extracted.maya_traits || []) {
+    if (!trait || TRAIT_JUNK_PATTERNS.some(p => p.test(trait))) {
+      console.log(`[dream] skipping junk maya_trait: "${trait?.slice(0, 60)}"`);
+      continue;
+    }
     try {
       const vec = await embed(`Maya: ${trait}`);
       points.push({
@@ -288,7 +304,7 @@ Extract and return this exact JSON structure:
   "conversation_summary": "<1-2 sentences: what happened in this conversation, who was involved, main topics>",
   "topics": ["<topic1>", "<topic2>"],
   "mood": "<overall mood: positive|negative|neutral|chaotic|deep>",
-  "maya_traits": ["<thing Maya expressed about herself, third person: Maya finds X interesting>"]
+  "maya_traits": ["<genuine stable trait Maya expressed: beliefs, preferences, background — NOT jokes, banter, or in-chat roleplay>"]
 }
 
 Rules:

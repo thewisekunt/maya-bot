@@ -353,18 +353,12 @@ export async function getDesirePressure(userId) {
   return Math.max(-1, Math.min(1, pressure));
 }
 
-/** Called after a positive interaction — fulfills talk_to / resolve desires */
+/** Called after a positive interaction — fulfills existing talk_to / resolve desires only */
 export async function onGoodInteraction(userId, userName) {
-  // Only fulfills existing desires — talk_to creation is in updateDesiresFromOutcome
-  // This prevents double desire fires when handler calls both functions
+  // ONLY fulfills desires — creation handled by handler's updateDesiresFromOutcome call
+  // Double-calling updateDesiresFromOutcome was creating duplicate talk_to desires
   await fulfillDesire('talk_to', userId);
   await fulfillDesire('resolve_conflict', userId);
-  await updateDesiresFromOutcome({
-    userId, userName,
-    outcome: 'positive', sentiment: 'positive',
-    isConflict: false, isHarmony: true,
-    hormones: {}, emotions: {}, trustLevel: 3,
-  });
 }
 
 /** Called after a conflict — creates resolve or avoid desire */

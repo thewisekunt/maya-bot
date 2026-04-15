@@ -18,6 +18,7 @@ import { estimateEntropy, estimateEntropyFast, getEntropyZone, getKnownNames, ge
 import { getMayaReply } from './llm.js';
 import { shouldDeliberate, deliberate, webSearch } from './think.js';
 import { getMomentum, updateMomentum, synthesizeMoment, predictLanding, isReactionMessage, getMomentumZone } from './moment.js';
+import { recordPing, getPressureState } from './observation.js';
 import { getEmojiHint, getReactEmoji } from './emoji.js';
 import { getReferencedContext, getScopedFacts, getUserGenderAndRoles, syncMemberRoles, getEmotionalContext, clearEmotionFor, inferGenderFromText } from './context_enricher.js';
 import { saveNotification, markReplied } from './inbox.js';
@@ -252,6 +253,11 @@ export async function handleMessage({
   // ── Current moment synthesis ─────────────────────────────────────────────
   // Replaces scattered monologue + toneHints with a single coherent paragraph
   // that the LLM can inhabit rather than parse
+  // Record ping for pressure tracking — IV reads this to detect targeting/swarming
+  if (isMention || isDM || isReply) {
+    recordPing(channelId, userId);
+  }
+
   const { zone: mZone } = getMomentumZone(momentum);
   const lastExchangeQuality = isReactive ? 'high' : momentum > 5 ? 'mid' : 'low';
 
@@ -386,6 +392,27 @@ export async function handleMessage({
   // ── DEFEND — threat detected pre-generation, no LLM call ──────────────────
   // Each pool is indexed by threat type. Maya responds without politeness filters.
   // Some threats get silence (null) — Maya just stops engaging.
+  // ── LEAVE — analyzeConvo decided Maya should disengage ───────────────────
+  if (innerCognition?.action === 'leave' || innerCognition?.personalityMode === 'silent') {
+    const leaveLines = [
+      'theek hai bye.',
+      'nikal rahi hun.',
+      'chalo, baat khatam.',
+      null,   // sometimes just silence
+      null,
+    ];
+    const leaveLine = leaveLines[Math.floor(Math.random() * leaveLines.length)];
+    console.log(`[handler] personality:leave → ${leaveLine || 'silence'}`);
+    saveMessage({ userId, prefName, guildId, channelId, contextType,
+      isPrivate, sender: 'user', message, entropy }).catch(() => {});
+    if (leaveLine) {
+      saveMessage({ userId: 'maya', prefName: 'Maya', guildId, channelId, contextType,
+        isPrivate, sender: 'maya', message: leaveLine, entropy }).catch(() => {});
+      return { type: 'reply', text: leaveLine };
+    }
+    return { type: 'ignore', reason: 'personality:leave' };
+  }
+
   if (action === 'defend') {
     const threatType = innerCognition.boundaryType || 'degradation';
     const DEFEND_RESPONSES = {
@@ -463,13 +490,26 @@ export async function handleMessage({
   // ── REPLY — fetch memory + known facts + call LLM ────────────────────────
 
   // Execute tool plan from inner voice — augments context before LLM
-  const toolAdditions = innerCognition.toolPlan?.length
+  const rawToolAdditions = innerCognition.toolPlan?.length
     ? await executeToolPlan(innerCognition.toolPlan, {
         userId, guildId, channelId,
         message: richMessageText, msg,
         botId: msg?.client?.user?.id || null,
       }).catch(() => [])
     : [];
+
+  // Parse IV_DECISION tags from analyzeConvo — upgrade personalityMode if needed
+  const toolAdditions = rawToolAdditions.filter(a => {
+    if (typeof a === 'string' && a.startsWith('[IV_DECISION:')) {
+      const decision = a.match(/\[IV_DECISION:(\w+)\]/)?.[1];
+      if (decision === 'leave')    { innerCognition.personalityMode = 'silent';  innerCognition.action = 'leave'; }
+      if (decision === 'withdraw') innerCognition.personalityMode = 'withdraw';
+      if (decision === 'defense')  innerCognition.personalityMode = 'defense';
+      console.log(`[handler] IV analyzeConvo → ${decision}`);
+      return false;  // strip from context
+    }
+    return true;
+  });
 
   // Fetch Maya's self-traits now (only if we're actually replying)
   const selfTraits = await getMayaSelfTraits().catch(() => []);
@@ -634,8 +674,9 @@ export async function handleMessage({
     lastExchangeQuality,
     refContext,
     emojiHint,
-    desireCtx:      innerCognition.desireCtx || null,
+    desireCtx:       innerCognition.desireCtx || null,
     innerCognition,
+    personalityMode: innerCognition?.personalityMode || 'normal',
   });
 
   // Meta layer may have suppressed the response
@@ -661,8 +702,11 @@ export async function handleMessage({
   // or contains confrontational patterns
   // Conflict: negative sentiment OR high entropy with irritation
   // Lower threshold than before — conflict should register more readily
-  const isConflict = (nlpSignal?.sentiment === 'negative' && nlpSignal?.sentimentScore < -0.3) ||
-    (entropy > 0.6 && (psycheState?.emotions?.irritation || 0) > 0.5);
+  // isConflict requires BOTH negative NLP signal AND emotional irritation
+  // Pure entropy spikes from a lively conversation should NOT trigger conflict desires
+  const isConflict = nlpSignal?.sentiment === 'negative'
+    && nlpSignal?.sentimentScore < -0.3
+    && (psycheState?.emotions?.irritation || 0) > 0.45;
 
   // Harmony: positive interaction — don't require high trust to register
   const isHarmony  = nlpSignal?.sentiment === 'positive' && nlpSignal?.sentimentScore > 0.3;

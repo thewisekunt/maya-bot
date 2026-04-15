@@ -30,6 +30,8 @@
 
 import { getChannelState } from './psyche.js';
 import { getMomentum }      from './moment.js';
+import { getPressureState } from './observation.js';
+import { PERSONALITY_MODE, MODE_THRESHOLDS } from './personality_modes.js';
 import { getObservationState, ZONES } from './observation.js';
 import { getDesires, getDesirePressure, getDesireContext, fulfillDesire, onGoodInteraction, onConflict } from './desires.js';
 import { getIdentityCore } from './meta.js';
@@ -277,7 +279,44 @@ export async function runInnerVoice(input) {
     && !situation.isDirect
     && (deliberation?.need && deliberation.need !== 'nothing');
 
-  // ── 12. Behavioral pattern check ──────────────────────────────────────────
+  // ── 12. Personality mode decision ────────────────────────────────────────
+  // Reads pressure state (ping rate, targeting) + psyche cortisol to decide
+  // if Maya should shift out of normal mode. This is NOT a hard block — it's
+  // a signal that goes to the LLM via the system prompt.
+  //
+  // Modes: normal → defense → withdraw → silent
+  // silent is set by IV tool (analyzeConvo) only — never by threshold alone
+
+  let personalityMode = PERSONALITY_MODE.NORMAL;
+  let personalityReason = null;
+
+  try {
+    const pressure = getPressureState(channelId);
+    const cortisol = (psyche?.hormones?.cortisol || 0);
+
+    if (pressure.heatLevel > MODE_THRESHOLDS.WITHDRAW_HEAT && cortisol > MODE_THRESHOLDS.WITHDRAW_CORTISOL) {
+      personalityMode   = PERSONALITY_MODE.WITHDRAW;
+      personalityReason = `heat=${pressure.heatLevel.toFixed(2)} cortisol=${cortisol.toFixed(2)} — withdrawing`;
+      // Trigger analyzeConvo tool for deeper read — should she leave?
+      if (!toolPlan.includes('analyzeConvo')) toolPlan.push('analyzeConvo');
+    } else if (
+      (pressure.heatLevel > MODE_THRESHOLDS.DEFENSE_HEAT || cortisol > MODE_THRESHOLDS.DEFENSE_CORTISOL)
+      && !isDM   // DMs don't trigger defense mode — too blunt for 1:1
+    ) {
+      personalityMode   = PERSONALITY_MODE.DEFENSE;
+      personalityReason = `heat=${pressure.heatLevel.toFixed(2)} cortisol=${cortisol.toFixed(2)} targeted=${pressure.isTargeted} swarmed=${pressure.isSwarmed}`;
+    }
+
+    if (personalityMode !== PERSONALITY_MODE.NORMAL) {
+      console.log(`[iv] personality mode: ${personalityMode} — ${personalityReason}`);
+      // Psyche feedback — defense mode means she's aware of the pressure
+      if (personalityMode === PERSONALITY_MODE.DEFENSE) {
+        applyPsycheNudge(channelId, { cortisol: +0.05, dopamine: -0.03, reason: 'defense_mode_active' });
+      }
+    }
+  } catch { /* non-fatal — default to normal */ }
+
+  // ── 13. Behavioral pattern check ──────────────────────────────────────────
   // If Maya is about to produce the same category of response repeatedly,
   // flag it so the LLM prompt gets a note to vary the response.
   const detectedPattern = _detectResponsePattern(message, input.mediaContext || '');
@@ -308,9 +347,11 @@ export async function runInnerVoice(input) {
     psycheNudge.cortisol = +0.06;
     psycheNudge.reason   = 'clarification_needed';
   } else if (smoothedIntent > 0.75) {
-    // High engagement → dopamine + oxytocin boost
-    psycheNudge.dopamine = +0.07;
-    psycheNudge.oxytocin = +0.04;
+    // High engagement → dopamine + oxytocin boost only — NO cortisol effect
+    // Cortisol from engagement was causing false conflict detections downstream
+    psycheNudge.dopamine = +0.06;
+    psycheNudge.oxytocin = +0.05;
+    // cortisol intentionally NOT set here
     psycheNudge.reason   = 'high_engagement';
   } else if (smoothedIntent < 0.30) {
     // Disengaged → slight dopamine dip
@@ -327,6 +368,8 @@ export async function runInnerVoice(input) {
     episodicContext,
     habituationNote,
     psycheNudge,      // hormone adjustments for handler to apply post-IV
+    personalityMode,  // NORMAL | DEFENSE | WITHDRAW | SILENT — LLM prompt injection
+    personalityReason,
     internalPressure,
     contextForce,
     socialRisk,
@@ -444,8 +487,25 @@ Rules:
     if (status !== 200) return _approve(primaryReply);
 
     const raw    = data?.choices?.[0]?.message?.content?.trim() || '{}';
-    const clean  = raw.replace(/^```json\s*/i,'').replace(/```\s*$/i,'').trim();
-    const result = JSON.parse(clean);
+    // Strip markdown fences
+    let clean = raw.replace(/^```json\s*/i,'').replace(/```\s*$/i,'').trim();
+    // If model returned prose (not JSON), try to extract embedded JSON object
+    if (!clean.startsWith('{')) {
+      const jsonMatch = clean.match(/\{[\s\S]*?\}/);
+      if (jsonMatch) {
+        clean = jsonMatch[0];
+      } else {
+        // Model returned pure prose — approve with no modification
+        console.log('[iv] evaluation: model returned prose, approving');
+        return _approve(primaryReply, 'prose response');
+      }
+    }
+    let result;
+    try {
+      result = JSON.parse(clean);
+    } catch {
+      return _approve(primaryReply, 'json parse failed');
+    }
 
     const decision = result.decision || 'approve';
     const reason   = result.reason   || '';
@@ -541,13 +601,81 @@ export async function executeToolPlan(toolPlan, { userId, guildId, channelId, me
           const { fetchChannelByName, fetchChannelContext } = await import('./roam.js');
           const client = (await import('./index.js').catch(() => null))?.client;
           if (client && guildId) {
-            // Detect channel reference in message
             const chanMatch = message.match(/#([a-z0-9-]+)/i);
             let ctx = null;
             if (chanMatch) {
               ctx = await fetchChannelByName(client, guildId, chanMatch[1], 8).catch(() => null);
             }
             if (ctx) additions.push(ctx);
+          }
+          break;
+        }
+
+        case 'analyzeConvo': {
+          // Deep read of channel situation — used when IV is in WITHDRAW mode
+          // or when sustained pressure is detected. Decides: stay | defense | withdraw | leave
+          // Returns a decision tag that IV stores and uses to upgrade/downgrade personality mode
+          try {
+            const { getPressureState: ps } = await import('./observation.js');
+            const { getChannelState }        = await import('./psyche.js');
+            const pressure  = ps(channelId);
+            const psycheCh  = getChannelState(channelId) || {};
+            const cortisol  = psycheCh?.hormones?.cortisol || 0;
+            const obs       = getObservationState(channelId);
+
+            // Build a brief situation summary for the LLM
+            const recentMsgs = (obs?.buffer || [])
+              .slice(-8)
+              .map(m => `${m.username || m.userId}: ${(m.content || '').slice(0, 80)}`)
+              .join(' | ');
+
+            const situationPrompt = `You are Maya's inner voice making a social decision.
+
+Recent channel activity (last ~8 messages):
+${recentMsgs || '(no recent messages)'}
+
+Current message: "${message}"
+Pressure: ${pressure.totalPings} pings in 3 min | targeted=${pressure.isTargeted} | swarmed=${pressure.isSwarmed} | heatLevel=${pressure.heatLevel.toFixed(2)}
+Cortisol: ${cortisol.toFixed(2)} | Trust with sender: ${trustLevel}/5
+
+Decide what Maya should do. Return ONLY one of these exact strings:
+- "stay" — situation is manageable, reply normally
+- "defense" — stay but activate sharp/dominant personality mode
+- "withdraw" — stay but go very terse/cold, minimal engagement
+- "leave" — disengage completely, send a brief exit line and stop replying
+
+Respond with one word only.`;
+
+            const { data, status } = await axios.post(config.llm.endpoint, {
+              model:       config.llm.models.utility,
+              messages:    [{ role: 'user', content: situationPrompt }],
+              temperature: 0.2,
+              max_tokens:  10,
+            }, {
+              headers: {
+                'Content-Type':  'application/json',
+                'Authorization': `Bearer ${config.llm.apiKey}`,
+                'HTTP-Referer':  'https://chatmasala.fun',
+              },
+              timeout: 8000,
+              validateStatus: () => true,
+            });
+
+            if (status === 200) {
+              const decision = data?.choices?.[0]?.message?.content?.trim().toLowerCase();
+              console.log(`[iv] analyzeConvo decision: "${decision}"`);
+
+              if (decision === 'leave') {
+                additions.push('[IV_DECISION:leave]');
+              } else if (decision === 'withdraw') {
+                additions.push('[IV_DECISION:withdraw]');
+              } else if (decision === 'defense') {
+                additions.push('[IV_DECISION:defense]');
+              }
+              // 'stay' → no tag, keep current mode
+            }
+          } catch (e) {
+            console.warn('[iv] analyzeConvo failed:', e.message);
           }
           break;
         }
