@@ -196,7 +196,7 @@ async function _postWakeMessage() {
   const wakeMsgs = [
     'back',
     'morning',
-    'okay I'm up',
+    "okay I'm up",
     'ugh morning people',
     'woke up, kya hua',
     'theek hun, good morning I guess',
