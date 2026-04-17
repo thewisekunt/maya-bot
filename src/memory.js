@@ -28,8 +28,9 @@ const VEC_LIMIT  = 6;  // user facts
 //   0.45–0.60: moderate (semantically related)
 //   0.60–0.80: strong (same idea, different words)
 //   0.80+:     near-identical
-const THRESHOLD_FACT = 0.50;  // user facts — need real semantic match
-const THRESHOLD_CONV = 0.42;  // conversation — somewhat looser
+const THRESHOLD_FACT        = 0.52;  // user facts — real semantic match needed
+const THRESHOLD_CONV        = 0.45;  // userId-scoped conversation memories
+const THRESHOLD_CONV_GUILD  = 0.62;  // guild-wide cross-user results — much stricter
 const THRESHOLD_SELF = 0.45;  // Maya self-traits
 
 // Schema cache
@@ -240,19 +241,25 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
       { key: 'memory_type', match: { value: 'maya_self' } },
     ]};
 
-    const [embeddedFacts, rawMessages, convMems, selfTraitsVec] = await Promise.all([
+    const [embeddedFacts, rawMessages, convMems, selfTraitsVec, guildConvMems] = await Promise.all([
       // Embedded user_facts — highest priority, strong threshold
       searchMemories(queryVec, userFactFilter, 6, THRESHOLD_FACT)
         .catch(e => { console.error('[memory] user_fact search:', e.message); return []; }),
       // Raw user messages — moderate threshold
       searchMemories(queryVec, userRawFilter, VEC_LIMIT, THRESHOLD_CONV)
         .catch(e => { console.error('[memory] raw search:', e.message); return []; }),
-      // Conversation context — full guild scope
-      searchMemories(queryVec, activeConvFilter, 5, THRESHOLD_CONV)
-        .catch(e => { console.error('[memory] conv search:', e.message); return []; }),
+      // Conversation context — userId-scoped first (threshold), guild wide at stricter threshold
+      // Two separate searches merged: ensures current user's memories dominate
+      searchMemories(queryVec, userRawFilter, 3, THRESHOLD_CONV)
+        .catch(e => { console.error('[memory] conv-user search:', e.message); return []; }),
       // Maya self-traits
       searchMemories(queryVec, selfFilter, 3, THRESHOLD_SELF)
         .catch(e => { console.error('[memory] self search:', e.message); return []; }),
+      // Guild-wide conv — stricter threshold to prevent cross-user bleed
+      guildId ? searchMemories(queryVec, { must: [
+          { key: 'memory_type', match: { value: 'raw_message' } },
+          { key: 'guild_id',    match: { value: String(guildId) } },
+        ]}, 3, THRESHOLD_CONV_GUILD).catch(() => []) : Promise.resolve([]),
     ]);
 
     // Merge user signals — embedded facts first (higher quality), then raw messages
@@ -265,9 +272,17 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
     );
     const userFacts = [...embeddedFacts, ...uniqueRaw.slice(0, 3)];
 
-    // Deduplicate conv against user signals
-    const userMsgSet = new Set(userFacts.map(f => f.payload?.mysql_id));
-    const dedupedConv = convMems.filter(r => !userMsgSet.has(r.payload?.mysql_id));
+    // Deduplicate conv — user-scoped first, then guild-wide (with cross-user label)
+    const userMsgSet  = new Set(userFacts.map(f => f.payload?.mysql_id));
+    const rawConvSet  = new Set(convMems.map(f => f.payload?.mysql_id));
+    // Tag guild-wide results with the actual speaker name so LLM knows whose memory
+    const labelledGuild = (guildConvMems || [])
+      .filter(r => !userMsgSet.has(r.payload?.mysql_id) && !rawConvSet.has(r.payload?.mysql_id))
+      .map(r => ({ ...r, _crossUser: true }));
+    const dedupedConv = [
+      ...convMems.filter(r => !userMsgSet.has(r.payload?.mysql_id)),
+      ...labelledGuild.slice(0, 2),   // at most 2 cross-user results
+    ];
 
     console.log(`[memory] vector recall: facts=${embeddedFacts.length} raw=${uniqueRaw.length} conv=${dedupedConv.length} self=${selfTraitsVec.length} thresholds=fact:${THRESHOLD_FACT}/conv:${THRESHOLD_CONV}`);
 
@@ -313,18 +328,17 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
         if (isDreamOrSummary) {
           parts.push(`• ${mem.message}${tsTag}`);
         } else {
-          // Add speaker attribution if not already present
-          // Raw memories stored as "message text" need context of who said what
           const sender   = mem.payload?.sender;
           const userName = mem.payload?.user_name || mem.payload?.user_id;
           let msgText    = mem.message || '';
-          // Only prefix if not already attributed (doesn't start with a name: pattern)
           const alreadyAttributed = /^[A-Za-zऀ-ॿ].{0,30}:/.test(msgText);
           if (!alreadyAttributed && sender) {
-            const label = sender === 'maya' ? 'Maya' : (userName || 'them');
-            msgText = `${label}: ${msgText}`;
+            const speakerLabel = sender === 'maya' ? 'Maya' : (userName || 'them');
+            msgText = `${speakerLabel}: ${msgText}`;
           }
-          parts.push(`  ${msgText}${tsTag}  (score: ${mem.score.toFixed(2)})`);
+          // Cross-user results get a clear attribution prefix so Maya doesn't confuse speakers
+          const crossNote = mem._crossUser ? ' [other user]' : '';
+          parts.push(`  ${msgText}${tsTag}${crossNote}  (score: ${mem.score.toFixed(2)})`);
         }
       });
       parts.push('');

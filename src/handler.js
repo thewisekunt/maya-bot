@@ -19,6 +19,7 @@ import { getMayaReply } from './llm.js';
 import { shouldDeliberate, deliberate, webSearch } from './think.js';
 import { getMomentum, updateMomentum, synthesizeMoment, predictLanding, isReactionMessage, getMomentumZone } from './moment.js';
 import { recordPing, getPressureState } from './observation.js';
+import { getUserState, recordContact, escalateUser, resetUser, stateToPersonalityMode, USER_STATES } from './user_state.js';
 import { getEmojiHint, getReactEmoji } from './emoji.js';
 import { getReferencedContext, getScopedFacts, getUserGenderAndRoles, syncMemberRoles, getEmotionalContext, clearEmotionFor, inferGenderFromText } from './context_enricher.js';
 import { saveNotification, markReplied } from './inbox.js';
@@ -256,6 +257,15 @@ export async function handleMessage({
   // Record ping for pressure tracking — IV reads this to detect targeting/swarming
   if (isMention || isDM || isReply) {
     recordPing(channelId, userId);
+  }
+  recordContact(channelId, userId);
+
+  // ── Per-user state gate — check before any processing ────────────────────
+  const userEngState = getUserState(channelId, userId);
+  if (userEngState === USER_STATES.BLOCKED) {
+    // Maya is not engaging with this user at all right now
+    console.log(`[handler] user_state:blocked — ignoring ${prefName}`);
+    return { type: 'ignore', reason: 'user_blocked' };
   }
 
   const { zone: mZone } = getMomentumZone(momentum);
@@ -502,9 +512,16 @@ export async function handleMessage({
   const toolAdditions = rawToolAdditions.filter(a => {
     if (typeof a === 'string' && a.startsWith('[IV_DECISION:')) {
       const decision = a.match(/\[IV_DECISION:(\w+)\]/)?.[1];
-      if (decision === 'leave')    { innerCognition.personalityMode = 'silent';  innerCognition.action = 'leave'; }
-      if (decision === 'withdraw') innerCognition.personalityMode = 'withdraw';
-      if (decision === 'defense')  innerCognition.personalityMode = 'defense';
+      if (decision === 'leave') {
+        innerCognition.personalityMode = 'silent';
+        innerCognition.action = 'leave';
+        escalateUser(channelId, userId, 'analyzeConvo:leave');
+      }
+      if (decision === 'withdraw') {
+        innerCognition.personalityMode = 'withdraw';
+        escalateUser(channelId, userId, 'analyzeConvo:withdraw');
+      }
+      if (decision === 'defense') innerCognition.personalityMode = 'defense';
       console.log(`[handler] IV analyzeConvo → ${decision}`);
       return false;  // strip from context
     }
@@ -676,7 +693,14 @@ export async function handleMessage({
     emojiHint,
     desireCtx:       innerCognition.desireCtx || null,
     innerCognition,
-    personalityMode: innerCognition?.personalityMode || 'normal',
+    // User state takes priority over IV threshold personality mode
+    personalityMode: (() => {
+      const stateMode = stateToPersonalityMode(userEngState);
+      const ivMode    = innerCognition?.personalityMode || 'normal';
+      // Escalation path: pick whichever is more escalated
+      const PATH = ['normal', 'defense', 'withdraw', 'silent'];
+      return PATH[Math.max(PATH.indexOf(stateMode), PATH.indexOf(ivMode))] || 'normal';
+    })(),
   });
 
   // Meta layer may have suppressed the response
@@ -713,7 +737,10 @@ export async function handleMessage({
   const signalType = isConflict ? 'conflict' : isHarmony ? 'harmony' : 'neutral';
   updateRelationshipSignals(userId, entropy, signalType).catch(() => {});
   // Update desires based on interaction quality
-  if (isHarmony) onGoodInteraction(userId, prefName).catch(() => {});
+  if (isHarmony) {
+    onGoodInteraction(userId, prefName).catch(() => {});
+    resetUser(channelId, userId);  // positive interaction walks back withdrawal state
+  }
   if (isConflict) onConflict(userId, prefName).catch(() => {});
   // Update attachment score from ongoing interaction quality
   const { updateAttachment, checkInitiationReply } = await import('./initiate.js');

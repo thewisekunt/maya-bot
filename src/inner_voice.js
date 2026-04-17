@@ -300,7 +300,12 @@ export async function runInnerVoice(input) {
       // Trigger analyzeConvo tool for deeper read — should she leave?
       if (!toolPlan.includes('analyzeConvo')) toolPlan.push('analyzeConvo');
     } else if (
-      (pressure.heatLevel > MODE_THRESHOLDS.DEFENSE_HEAT || cortisol > MODE_THRESHOLDS.DEFENSE_CORTISOL)
+      // Defense requires BOTH real ping pressure AND elevated cortisol
+      // OR being actively targeted (same user ≥3 pings) with any cortisol
+      // This prevents normal busy conversations from triggering defense mode
+      (pressure.heatLevel > MODE_THRESHOLDS.DEFENSE_HEAT && cortisol > MODE_THRESHOLDS.DEFENSE_CORTISOL)
+      || (pressure.isTargeted && cortisol > 0.40)
+      || (pressure.isSwarmed && cortisol > 0.35)
       && !isDM   // DMs don't trigger defense mode — too blunt for 1:1
     ) {
       personalityMode   = PERSONALITY_MODE.DEFENSE;

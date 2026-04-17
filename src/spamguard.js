@@ -149,6 +149,11 @@ export function checkSpam(channelId, userId, text, isMention = false, isDM = fal
     state.coolingUntil = now + COOLING_DURATION_MS;
     console.log(`[spamguard] ${userId} → cooling ${COOLING_DURATION_MS/1000}s (penalty=${state.penalty})`);
 
+    // Escalate user interaction state — repeated spam raises Maya's withdrawal level
+    import('./user_state.js').then(({ escalateUser }) => {
+      escalateUser(channelId, userId, `spamguard:penalty=${state.penalty}`);
+    }).catch(() => {});
+
     // Log spam examples to NLP training (fire and forget)
     _logSpamToNLP(state.spamTexts).catch(() => {});
     state.spamTexts = [];   // clear after logging

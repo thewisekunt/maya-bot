@@ -81,11 +81,22 @@ function calcTrust(dmCount, serverCount, daysSinceFirst, daysSinceLast,
 
   const score = weighted + recencyBonus + consistencyBonus - conflictPenalty - ratioPenalty + harmonyBonus;
 
-  if (score >= 150) return 5;
-  if (score >= 60)  return 4;
-  if (score >= 20)  return 3;
-  if (score >= 5)   return 2;
-  return 1;
+  // Return continuous score — no ceiling. Callers convert to display band.
+  // Negative = active distrust, 0–5 = stranger range, 5–20 = regular,
+  // 20–60 = close, 60–150 = trusted friend, 150+ = bestie territory
+  return Math.max(-20, score);  // floor at -20 (won't go lower than deep distrust)
+}
+
+// Convert raw trust score to a compact band label for prompt injection
+// Band labels are intentionally vague so the LLM gets a feeling, not a number
+export function trustBand(score) {
+  if (score >= 300) return { label: 'This person is genuinely one of her closest people.', tier: 'bestie_plus' };
+  if (score >= 150) return { label: 'This is her bestie.',                                  tier: 'bestie' };
+  if (score >= 60)  return { label: 'You are pretty close.',                                tier: 'close' };
+  if (score >= 20)  return { label: 'You know this person.',                                tier: 'familiar' };
+  if (score >= 5)   return { label: "You've talked a bit — not very close yet.",            tier: 'acquainted' };
+  if (score >= 0)   return { label: 'This is basically a stranger.',                        tier: 'stranger' };
+  return              { label: 'Something felt off with this person before.',               tier: 'distrusted' };
 }
 
 // ── User upsert ───────────────────────────────────────────────────────────────
@@ -184,19 +195,26 @@ export async function getOrCreateRelationship(userId, contextType) {
   );
 
   // Cap trust drops at 1 level per recalculation (prevents sudden cliff drops)
+  // Store the raw score in trust_level column (now unbounded, was 1–5)
   const currentTrust = rel.trust_level || 3;
-  const clampedTrust = Math.max(newTrust, currentTrust - 1);
+  // Cap drops to 10 points per recalculation (prevents sudden cliff drops)
+  const clampedTrust = Math.max(newTrust, currentTrust - 10);
 
-  if (clampedTrust !== currentTrust) {
+  if (Math.abs(clampedTrust - currentTrust) > 0.5) {
     await db.execute(
       `UPDATE maya_user_relationships SET trust_level = ? WHERE discord_user_id = ?`,
       [clampedTrust, userId]
     ).catch(() => {});
-    console.log(`[trust] ${userId} → trust ${currentTrust} → ${clampedTrust} (dm=${rel.dm_count} srv=${rel.server_count} days=${daysSinceFirst})`);
+    console.log(`[trust] ${userId} → score ${currentTrust.toFixed(0)} → ${clampedTrust.toFixed(0)} tier=${trustBand(clampedTrust).tier}`);
   }
 
+  const band = trustBand(newTrust);
+
   return {
-    trustLevel:     clampedTrust,
+    trustLevel:     clampedTrust,   // legacy 1–5 (used by intent_engine, desires etc)
+    trustScore:     newTrust,       // continuous raw score — used for prompt generation
+    trustTier:      band.tier,      // 'bestie_plus'|'bestie'|'close'|'familiar'|'acquainted'|'stranger'|'distrusted'
+    trustLabel:     band.label,     // prose sentence for prompt injection
     vibe:           rel.vibe          || 'neutral',
     nickname:       rel.nickname_for_user || null,
     insideJokes:    _parseJson(rel.inside_jokes,    []),
