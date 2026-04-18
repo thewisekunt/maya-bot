@@ -28,6 +28,7 @@
  */
 
 import db from './db.js';
+import { p as param } from './params.js';
 
 // ── Cache ────────────────────────────────────────────────────────────────────
 // Desires are read every message — cache aggressively
@@ -256,7 +257,7 @@ export async function updateDesiresFromOutcome({ userId, userName, outcome, sent
       strength: 0.25 + af * 0.15,
       source: 'harmony',
       context: 'positive interaction',
-      expiresInHours: 48,
+      expiresInHours: await param('desire_talk_ttl_hours').catch(() => 48) || 48,
     });
   }
 
@@ -278,7 +279,7 @@ export async function updateDesiresFromOutcome({ userId, userName, outcome, sent
         strength: 0.35,
         source: 'conflict',
         context: 'conflict with trusted person',
-        expiresInHours: 72,
+        expiresInHours: await param('desire_conflict_ttl_hours').catch(() => 72) || 72,
       });
     }
   }

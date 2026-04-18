@@ -1,191 +1,189 @@
 /**
- * salience.js — Environmental Salience Filter
+ * salience.js — Fast-path memory capture
  *
- * Gate before LLM. Returns:
- *   { action: 'ignore' }
- *   { action: 'react',  emoji }
- *   { action: 'reply' }
+ * Runs after every reply. Computes a salience score from IV signals
+ * and psyche state delta. If score exceeds Maya's learned threshold,
+ * immediately embeds the exchange into Qdrant as a salient_moment.
  *
- * LURK philosophy:
- * Maya lurks like a person — she's paying attention but not spamming
- * reactions to every message. She only engages when:
- *   - something is addressed to her (name, topic she knows)
- *   - someone she knows well says something interesting
- *   - a question is asked to the group
- *   - something genuinely funny/interesting happens
- * Random group chatter → IGNORE even during lurk.
+ * This is the "trauma-equivalent" fast path — high-intensity experiences
+ * don't wait for the dream cycle. They write now.
+ *
+ * The threshold itself is a learned parameter in maya_params.
+ * Maya adjusts it based on whether captured moments actually help future recall.
+ *
+ * Signals that contribute to salience score:
+ *   hormone_delta    — large state change in any hormone (0.35 weight)
+ *   sentiment_flip   — negative→positive or reverse in 2 turns (0.30)
+ *   belief_conflict  — IV detected a belief clash (0.25)
+ *   clarification    — Maya was confused, user explained (0.25)
+ *   boundary_fired   — defend action triggered (0.40 — always high)
+ *   curiosity_fired  — think.js curiosity trigger (0.20)
+ *   trust_shift      — trust score changed this session (0.20)
+ *   analyzeConvo     — IV tool returned non-stay (0.35)
+ *
+ * These weights are fixed. The threshold is learned.
  */
 
-const MIN_WORDS_FOR_REPLY = 3;
+import db from './db.js';
+import { embed } from './embedder.js';
+import { upsertBatch } from './vector.js';
+import { p } from './params.js';
+import { getActiveSession } from './stm.js';
 
-const IGNORE_PATTERNS = [
-  /^(ok|okay|k|kk|noted|sure|yep|nope|nah|mhm|hmm+|uh+|ah+|oh+)\.?$/i,
-  /^(lol|lmao|lmfao|haha|hehe|heh)\.?$/i,
-  /^(same|mood|facts|true|real|based|valid|fair|gg|brb|gtg|afk|omg)\.?$/i,
-  /^(bye|cya|ttyl|gn|goodnight|good night|night night)\.?$/i,
-  /^(thanks|thank you|ty|thx|tysm)\.?$/i,
-  /^(wow|whoa|damn|dang|oof|bruh|bro|sis|yikes)\.?$/i,
-  /^\.+$|^\?+$|^!+$/,
-  /^[😂💀👀🔥😭🙏👍👎❤️🤣😍🫶✨]+$/u,   // emoji-only
-];
-
-const REACT_PATTERNS = [
-  /^(nice|cool|sick|fire|lit|dope|epic|pog)\.?$/i,
-  /^(rip|f$|press f)\.?$/i,
-  /^(gg|wp)\.?$/i,
-  /^(fr|no cap|deadass)\.?$/i,
-];
-
-const FORCE_REPLY_PATTERNS = [
-  /\?/,
-  /\bmaya\b/i,
-  /\bhelp\b|\badvice\b|\bwhat do (you|u) think\b/i,
-  /\btell me\b|\bexplain\b|\bwhy\b|\bhow\b/i,
-  /\bremember\b|\byou said\b|\bdidn't you\b/i,
-  /\bi (love|hate|miss|need|want|feel)\b/i,
-  /\bwhat('s| is| are| do)\b/i,
-  /\bcan you\b|\bwill you\b|\bwould you\b/i,
-];
-
-const REACT_EMOJIS = {
-  positive: ['❤️', '🔥', '💯', '✨', '🫶'],
-  neutral:  ['👀', '💀', '😌', '🤝', '🫡'],
-  hype:     ['🔥', '💥', '⚡'],
+// ── Signal weights ─────────────────────────────────────────────────────────────
+const SIGNAL_WEIGHTS = {
+  hormone_delta:    0.35,
+  sentiment_flip:   0.30,
+  belief_conflict:  0.25,
+  clarification:    0.25,
+  boundary_fired:   0.40,
+  curiosity_fired:  0.20,
+  trust_shift:      0.20,
+  analyze_convo:    0.35,
 };
 
-/**
- * @param {string}   text
- * @param {boolean}  isMention
- * @param {boolean}  isDM
- * @param {boolean}  isReply
- * @param {boolean}  hasMedia
- * @param {boolean}  isLurking
- * @param {number}   lurkDepth
- * @param {number}   trustLevel      1–5
- * @param {number}   entropy         0–1
- * @param {string[]} knownNames      names/aliases Maya knows in this server
- */
-export function checkSalience({
-  text,
-  isMention  = false,
-  isDM       = false,
-  isReply    = false,
-  hasMedia   = false,
-  isLurking  = false,
-  lurkDepth  = 0,
-  trustLevel = 3,
-  entropy    = 0.4,
-  knownNames = [],    // names of people Maya knows — for name-reference detection
-}) {
-  const words     = text.trim().split(/\s+/).filter(Boolean);
-  const wordCount = words.length;
-
-  // ── RULE 0: Direct address — always reply ─────────────────────────────────
-  if (isMention || isDM || isReply) {
-    return reply(isMention ? 'direct mention' : isDM ? 'DM' : 'reply to Maya');
-  }
-
-  // ── RULE 1: Force-reply patterns ──────────────────────────────────────────
-  for (const pat of FORCE_REPLY_PATTERNS) {
-    if (pat.test(text)) return reply(`force: ${pat.source.slice(0,25)}`);
-  }
-
-  // ── RULE 2: Hard ignore ───────────────────────────────────────────────────
-  for (const pat of IGNORE_PATTERNS) {
-    if (pat.test(text.trim())) return ignore('ignore pattern');
-  }
-
-  // ── RULE 3: Lurk mode ────────────────────────────────────────────────────
-  if (isLurking) {
-    return evaluateLurk({ text, words, wordCount, entropy, trustLevel,
-                          lurkDepth, hasMedia, knownNames });
-  }
-
-  // ── RULE 4: React patterns ────────────────────────────────────────────────
-  for (const pat of REACT_PATTERNS) {
-    if (pat.test(text.trim())) return react(pickEmoji('neutral'), 'react pattern');
-  }
-
-  // ── RULE 5: Short + low energy ────────────────────────────────────────────
-  if (wordCount < MIN_WORDS_FOR_REPLY && entropy < 0.35) {
-    return ignore('short + low entropy');
-  }
-
-  // ── RULE 6: High energy ───────────────────────────────────────────────────
-  if (entropy > 0.65) return reply('high entropy');
-
-  // ── RULE 7: Trusted + substantial ────────────────────────────────────────
-  if (trustLevel >= 4 && wordCount >= 4) return reply('trusted + substantial');
-
-  // ── Default ───────────────────────────────────────────────────────────────
-  if (wordCount >= 7) return reply('enough words');
-  return ignore('default: not enough signal');
-}
+// Hormone delta threshold — movement above this in one exchange is significant
+const HORMONE_DELTA_THRESHOLD = 0.12;
 
 /**
- * Lurk evaluation — Maya is watching but should NOT spam reactions.
+ * Main entry point. Call fire-and-forget after every reply.
  *
- * She engages only when:
- * 1. A question is asked to the group (she might know the answer)
- * 2. A known friend's name is mentioned (she notices)
- * 3. Something is emotionally charged or very high energy
- * 4. A close friend (trust 4+) says something substantial
- *
- * She does NOT react to every 3-word message.
+ * @param {object} ctx
+ *   userId, channelId, guildId
+ *   prevPsyche    — psyche state BEFORE this exchange
+ *   currPsyche    — psyche state AFTER this exchange
+ *   innerCognition — IV output
+ *   prevSentiment  — sentiment of the previous message
+ *   currSentiment  — sentiment of the current message
+ *   userMessage    — what the user said
+ *   mayaReply      — what Maya replied
+ *   sessionId      — current session ID
  */
-function evaluateLurk({ text, words, wordCount, entropy, trustLevel,
-                        lurkDepth, hasMedia, knownNames }) {
+export async function checkSalience(ctx) {
+  try {
+    const {
+      userId, channelId, guildId,
+      prevPsyche, currPsyche,
+      innerCognition,
+      prevSentiment = 'neutral',
+      currSentiment = 'neutral',
+      userMessage   = '',
+      mayaReply     = '',
+      sessionId     = null,
+    } = ctx;
 
-  // Expired window — ignore
-  if (lurkDepth >= 10) return ignore('lurk: window expired');
+    // ── Compute salience score ───────────────────────────────────────────────
+    const signals = {};
+    let score     = 0;
 
-  // ── Always ignore these even in lurk ──────────────────────────────────────
-  for (const pat of IGNORE_PATTERNS) {
-    if (pat.test(text.trim())) return ignore('lurk: ignore pattern');
-  }
-
-  // ── Questions to the group — Maya might have something to add ─────────────
-  // Only if it's a real question (not just "ok?")
-  if (/\?/.test(text) && wordCount >= 4 && lurkDepth <= 6) {
-    // React only, don't jump in with a reply unless it's very early
-    if (lurkDepth <= 2 && trustLevel >= 3) return reply(`lurk: group question, fresh`);
-    if (lurkDepth <= 4) return react(pickEmoji('neutral'), 'lurk: group question, mid');
-    return ignore('lurk: question but too deep');
-  }
-
-  // ── Known name mentioned — she notices ────────────────────────────────────
-  if (knownNames.length > 0) {
-    const lowerText = text.toLowerCase();
-    const mentioned = knownNames.find(n => {
-      const nl = n.toLowerCase();
-      return nl.length >= 3 && lowerText.includes(nl);
-    });
-    if (mentioned && lurkDepth <= 5) {
-      // Someone mentioned a person she knows — she's paying attention
-      if (wordCount >= 5) return react(pickEmoji('neutral'), `lurk: known name "${mentioned}"`);
+    // 1. Hormone delta — did this exchange move Maya's state significantly?
+    if (prevPsyche && currPsyche) {
+      const prev = prevPsyche.hormones || {};
+      const curr = currPsyche.hormones || {};
+      const maxDelta = Math.max(
+        Math.abs((curr.dopamine  || 0) - (prev.dopamine  || 0)),
+        Math.abs((curr.cortisol  || 0) - (prev.cortisol  || 0)),
+        Math.abs((curr.oxytocin  || 0) - (prev.oxytocin  || 0)),
+        Math.abs((curr.serotonin || 0) - (prev.serotonin || 0)),
+      );
+      if (maxDelta > HORMONE_DELTA_THRESHOLD) {
+        signals.hormone_delta = maxDelta;
+        score += SIGNAL_WEIGHTS.hormone_delta * Math.min(maxDelta / 0.3, 1);
+      }
     }
+
+    // 2. Sentiment flip — negative→positive or positive→negative
+    const sentFlip = (
+      (prevSentiment === 'negative' && currSentiment === 'positive') ||
+      (prevSentiment === 'positive' && currSentiment === 'negative')
+    );
+    if (sentFlip) {
+      signals.sentiment_flip = true;
+      score += SIGNAL_WEIGHTS.sentiment_flip;
+    }
+
+    // 3. Belief conflict from IV
+    if (innerCognition?.beliefConflict) {
+      signals.belief_conflict = true;
+      score += SIGNAL_WEIGHTS.belief_conflict;
+    }
+
+    // 4. Maya was confused (needsClarification fired) — user likely explained
+    if (innerCognition?.needsClarification) {
+      signals.clarification = true;
+      score += SIGNAL_WEIGHTS.clarification;
+    }
+
+    // 5. Boundary/defend action — always high salience
+    if (innerCognition?.action === 'defend' || innerCognition?.boundaryType) {
+      signals.boundary_fired = innerCognition.boundaryType || true;
+      score += SIGNAL_WEIGHTS.boundary_fired;
+    }
+
+    // 6. Curiosity trigger fired in deliberation
+    if (innerCognition?.deliberation?.trigger === 'curiosity_trigger') {
+      signals.curiosity_fired = true;
+      score += SIGNAL_WEIGHTS.curiosity_fired;
+    }
+
+    // 7. analyzeConvo returned non-stay (IV was stressed enough to analyze)
+    if (innerCognition?.personalityMode && innerCognition.personalityMode !== 'normal') {
+      signals.analyze_convo = innerCognition.personalityMode;
+      score += SIGNAL_WEIGHTS.analyze_convo;
+    }
+
+    score = Math.min(score, 1.0);
+
+    // ── Check against learned threshold ─────────────────────────────────────
+    const threshold = await p('salience_threshold') ?? 0.35;
+
+    if (score < threshold) return;  // below threshold — slow path only
+
+    console.log(`[salience] score=${score.toFixed(2)} threshold=${threshold.toFixed(2)} signals=${Object.keys(signals).join(',')}`);
+
+    // ── Embed and store the exchange ─────────────────────────────────────────
+    const exchangeText = `${userMessage}\nMaya: ${mayaReply}`.slice(0, 600);
+    const vec = await embed(exchangeText).catch(() => null);
+    if (!vec) return;
+
+    const qdrantId = `sal_${channelId}_${userId}_${Date.now()}`;
+    await upsertBatch([{
+      id:     qdrantId,
+      vector: vec,
+      payload: {
+        memory_type:     'salient_moment',
+        discord_user_id: userId,
+        guild_id:        guildId || null,
+        channel_id:      channelId,
+        session_id:      sessionId,
+        message:         exchangeText,
+        salience_score:  score,
+        signals_fired:   Object.keys(signals),
+        threshold_used:  threshold,
+        weight:          2.5,   // higher than facts (1.8) and summaries (1.5)
+        created_at:      new Date().toISOString(),
+      },
+    }]);
+
+    // ── Log to DB for outcome tracking (dream cycle reads this) ───────────────
+    await db.execute(
+      `INSERT INTO maya_salience_log
+         (session_id, channel_id, user_id, salience_score, threshold_used,
+          signals_fired, exchange_text, qdrant_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        sessionId,
+        channelId,
+        userId,
+        score,
+        threshold,
+        JSON.stringify(Object.keys(signals)),
+        exchangeText.slice(0, 500),
+        qdrantId,
+      ]
+    ).catch(() => {});
+
+  } catch (e) {
+    console.warn('[salience] check failed:', e.message);
   }
-
-  // ── Close friend says something substantial ────────────────────────────────
-  if (trustLevel >= 4 && wordCount >= 6 && entropy > 0.3 && lurkDepth <= 4) {
-    return react(pickEmoji('neutral'), 'lurk: trusted user, substantial');
-  }
-
-  // ── Very high energy — something interesting is happening ─────────────────
-  if (entropy > 0.75 && wordCount >= 5 && lurkDepth <= 3) {
-    return react(pickEmoji('hype'), 'lurk: high energy');
-  }
-
-  // ── Default: ignore — she's watching, not reacting to everything ──────────
-  return ignore(`lurk: depth ${lurkDepth}, not enough signal`);
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function reply(reason)        { return { action: 'reply',  reason }; }
-function ignore(reason)       { return { action: 'ignore', reason }; }
-function react(emoji, reason) { return { action: 'react',  emoji,  reason }; }
-
-function pickEmoji(mood = 'neutral') {
-  const pool = REACT_EMOJIS[mood] || REACT_EMOJIS.neutral;
-  return pool[Math.floor(Math.random() * pool.length)];
 }

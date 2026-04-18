@@ -1,5 +1,6 @@
 import { evaluateReply, runInnerVoice } from './inner_voice.js';
 import { PERSONALITY_BLOCKS } from './personality_modes.js';
+import { p as param } from './params.js';
 import { getBeliefs, detectBeliefConflict, logMetaDecision } from './meta.js';
 import axios from 'axios';
 import { config } from './config.js';
@@ -101,13 +102,23 @@ export async function getMayaReply({
   parts.push('');
 
   // ── IV-controlled personality mode ───────────────────────────────────────
-  // Only injected when IV detects pressure/targeting. Never hardcoded.
   if (personalityMode && personalityMode !== 'normal' && PERSONALITY_BLOCKS[personalityMode]) {
     parts.push('');
     parts.push(PERSONALITY_BLOCKS[personalityMode]);
     parts.push('');
     console.log(`[llm] personality block injected: ${personalityMode}`);
   }
+
+  // ── Dynamic response length hint ──────────────────────────────────────────
+  // Maya's learned preference for reply length — adjusts based on outcomes
+  try {
+    const lenTarget = await param('response_length_target');
+    if (lenTarget && Math.abs(lenTarget - 1.5) > 0.2) {
+      if (lenTarget <= 1.2) parts.push('Keep replies very short — one sentence is often enough.');
+      else if (lenTarget >= 2.5) parts.push('You can be a bit more expansive when the topic warrants it.');
+      // Near default (1.5) — no hint needed, base prompt handles it
+    }
+  } catch { /* non-fatal */ }
 
   if (contextLine) parts.push(contextLine);
 

@@ -15,6 +15,7 @@
  */
 
 import db from './db.js';
+import { p as param } from './params.js';
 import { embed } from './embedder.js';
 import { searchMemories, isConfigured } from './vector.js';
 import { notifyNewMessage } from './dream.js';
@@ -28,10 +29,10 @@ const VEC_LIMIT  = 6;  // user facts
 //   0.45–0.60: moderate (semantically related)
 //   0.60–0.80: strong (same idea, different words)
 //   0.80+:     near-identical
-const THRESHOLD_FACT        = 0.52;  // user facts — real semantic match needed
-const THRESHOLD_CONV        = 0.45;  // userId-scoped conversation memories
-const THRESHOLD_CONV_GUILD  = 0.62;  // guild-wide cross-user results — much stricter
-const THRESHOLD_SELF = 0.45;  // Maya self-traits
+// Base thresholds — overridden by Maya's learned params at query time
+const THRESHOLD_FACT        = 0.52;
+const THRESHOLD_SELF        = 0.45;
+// THRESHOLD_CONV and THRESHOLD_CONV_GUILD are loaded from params.js per-call
 
 // Schema cache
 let _newSchema = null;
@@ -241,7 +242,21 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
       { key: 'memory_type', match: { value: 'maya_self' } },
     ]};
 
-    const [embeddedFacts, rawMessages, convMems, selfTraitsVec, guildConvMems] = await Promise.all([
+    // Same-session salient moments get priority — high-intensity exchanges from THIS conversation
+    const salientFilter = { must: [
+      { key: 'memory_type',     match: { value: 'salient_moment' } },
+      { key: 'discord_user_id', match: { value: String(userId) } },
+    ]};
+
+    // Load Maya's learned memory thresholds
+    const [_convT, _guildT] = await Promise.all([
+      param('memory_conv_threshold').catch(() => 0.45),
+      param('memory_guild_threshold').catch(() => 0.62),
+    ]);
+    const THRESHOLD_CONV       = _convT  ?? 0.45;
+    const THRESHOLD_CONV_GUILD = _guildT ?? 0.62;
+
+    const [embeddedFacts, rawMessages, convMems, selfTraitsVec, guildConvMems, salientMems] = await Promise.all([
       // Embedded user_facts — highest priority, strong threshold
       searchMemories(queryVec, userFactFilter, 6, THRESHOLD_FACT)
         .catch(e => { console.error('[memory] user_fact search:', e.message); return []; }),
@@ -260,6 +275,9 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
           { key: 'memory_type', match: { value: 'raw_message' } },
           { key: 'guild_id',    match: { value: String(guildId) } },
         ]}, 3, THRESHOLD_CONV_GUILD).catch(() => []) : Promise.resolve([]),
+      // Salient moments — high-intensity past exchanges, always surface first
+      searchMemories(queryVec, salientFilter, 3, 0.35)
+        .catch(() => []),
     ]);
 
     // Merge user signals — embedded facts first (higher quality), then raw messages
@@ -312,6 +330,18 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
     if (selfTraitsVec.length > 0) {
       parts.push('--- Maya\'s own traits (be consistent) ---');
       selfTraitsVec.forEach(t => parts.push(`• ${t.payload?.fact_text || t.message}`));
+      parts.push('');
+    }
+
+    // Surface salient moments first — these are high-intensity exchanges Maya shouldn't forget
+    if (salientMems && salientMems.length > 0) {
+      parts.push('--- High-importance past moments (remember these) ---');
+      salientMems.forEach(mem => {
+        const ts = mem.payload?.created_at
+          ? _relativeTime(new Date(mem.payload.created_at)) : '';
+        const tsTag = ts ? ` [${ts}]` : '';
+        parts.push(`• ${(mem.message || '').slice(0, 200)}${tsTag}`);
+      });
       parts.push('');
     }
 

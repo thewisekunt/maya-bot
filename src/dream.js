@@ -24,6 +24,8 @@ import { runLearningCycle } from './learn.js';
 
 import db from './db.js';
 import { retrainFromDB } from './nlp.js';
+import { adjust as adjustParam, invalidateCache as invalidateParamCache, getAll as getAllParams } from './params.js';
+import { computeReward } from './learn.js';
 import { updateSlowDrift } from './psyche.js';
 import { embed, embedBatch } from './embedder.js';
 import { upsertMemory, upsertBatch, isConfigured } from './vector.js';
@@ -275,6 +277,175 @@ async function _processSessionInner(sessionId) {
   }
 }
 
+
+// ── Parameter self-adjustment (dream cycle) ───────────────────────────────────
+// Reads outcomes from recent decisions and salience events.
+// Adjusts Maya's self-owned parameters toward configurations that produced
+// better reward signals.
+
+async function _adjustParameters() {
+  console.log("[dream] adjusting parameters...");
+  let adjustments = 0;
+
+  // ── 1. Salience threshold adjustment ────────────────────────────────────────
+  // Target: 5-10% of exchanges captured. Too many = noise. Too few = missing signal.
+  try {
+    const [[salienceStats]] = await db.execute(`
+      SELECT
+        COUNT(*) as total_captures,
+        AVG(salience_score) as avg_score,
+        AVG(CASE WHEN outcome_reward IS NOT NULL THEN outcome_reward ELSE NULL END) as avg_outcome,
+        COUNT(CASE WHEN retrieved_count > 0 THEN 1 END) as retrieved_count,
+        COUNT(CASE WHEN outcome_reward IS NOT NULL THEN 1 END) as resolved_count
+      FROM maya_salience_log
+      WHERE created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
+    `);
+
+    if (salienceStats && salienceStats.resolved_count > 5) {
+      const avgOutcome  = parseFloat(salienceStats.avg_outcome || 0);
+      const retrievalRate = salienceStats.total_captures > 0
+        ? salienceStats.retrieved_count / salienceStats.total_captures
+        : 0;
+
+      let delta = 0;
+      let reason = '';
+
+      if (avgOutcome < 0.1 && salienceStats.total_captures > 20) {
+        // Capturing too much noise — raise threshold
+        delta  = +0.02;
+        reason = `avg_outcome=${avgOutcome.toFixed(2)} too low, threshold too permissive`;
+      } else if (retrievalRate < 0.15 && avgOutcome > 0.3) {
+        // Good quality captures but not being retrieved — threshold may be too high
+        // (good moments are being missed, what we captured is valuable but rare)
+        delta  = -0.01;
+        reason = `retrieval_rate=${retrievalRate.toFixed(2)} low, potentially missing signal`;
+      } else if (avgOutcome > 0.4 && retrievalRate > 0.4) {
+        // Captures are highly useful and frequently retrieved — keep or lower slightly
+        delta  = -0.005;
+        reason = `high utility (outcome=${avgOutcome.toFixed(2)}, retrieval=${retrievalRate.toFixed(2)})`;
+      }
+
+      if (Math.abs(delta) > 0) {
+        await adjustParam('salience_threshold', delta, avgOutcome, reason);
+        adjustments++;
+      }
+    }
+  } catch (e) { console.warn('[dream/params] salience adj failed:', e.message); }
+
+  // ── 2. Intent thresholds adjustment ─────────────────────────────────────────
+  // Signal: average reward from 'presence' subsystem decisions
+  try {
+    const [[intentStats]] = await db.execute(`
+      SELECT
+        AVG(reward) as avg_reward,
+        COUNT(*) as n,
+        AVG(CASE WHEN JSON_EXTRACT(context, '$.intent') = 'group_chatter' THEN reward END) as chatter_reward,
+        AVG(CASE WHEN JSON_EXTRACT(context, '$.intent') = 'question_to_maya' THEN reward END) as question_reward
+      FROM maya_decision_log
+      WHERE subsystem = 'presence'
+        AND resolved_at IS NOT NULL
+        AND resolved_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
+    `);
+
+    if (intentStats && intentStats.n > 10) {
+      const avgReward = parseFloat(intentStats.avg_reward || 0);
+
+      if (avgReward < -0.1) {
+        // Replying too much when shouldn't — raise reply threshold (more selective)
+        await adjustParam('intent_reply_threshold', +0.015, avgReward, 'low presence reward → raise reply threshold');
+        adjustments++;
+      } else if (avgReward > 0.3 && intentStats.n > 20) {
+        // Engagement is working well — can afford to lower threshold slightly
+        await adjustParam('intent_reply_threshold', -0.008, avgReward, 'high presence reward → lower reply threshold');
+        adjustments++;
+      }
+    }
+  } catch (e) { console.warn('[dream/params] intent adj failed:', e.message); }
+
+  // ── 3. Memory threshold adjustment ──────────────────────────────────────────
+  // Signal: session quality in conversations where memories were retrieved
+  // Proxy: if Maya's confusion signals (needsClarification) are high despite memory retrieval,
+  // the retrieved memories are wrong (threshold too low = cross-user bleed)
+  try {
+    const [[confusionStats]] = await db.execute(`
+      SELECT
+        AVG(intent_score) as avg_intent,
+        COUNT(*) as n
+      FROM maya_inner_voice_log
+      WHERE created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
+        AND situation_json LIKE '%"isQuestion":true%'
+    `);
+
+    if (confusionStats && confusionStats.n > 15) {
+      const avgIntent = parseFloat(confusionStats.avg_intent || 0.5);
+      // Low intent on questions = confusion. Tighten memory threshold.
+      if (avgIntent < 0.40) {
+        await adjustParam('memory_conv_threshold', +0.015, avgIntent, 'low intent on questions → tighten memory threshold');
+        await adjustParam('memory_guild_threshold', +0.010, avgIntent, 'low intent on questions → tighten guild threshold');
+        adjustments++;
+      }
+    }
+  } catch (e) { console.warn('[dream/params] memory adj failed:', e.message); }
+
+  // ── 4. Defense thresholds adjustment ────────────────────────────────────────
+  // Signal: cortisol levels after defense mode sessions vs normal sessions
+  // If defense mode is triggering on normal conversations, cortisol won't be elevated
+  // beforehand — meaning the threshold is too sensitive
+  try {
+    const [[defenseStats]] = await db.execute(`
+      SELECT
+        AVG(reward) as avg_reward,
+        COUNT(*) as n
+      FROM maya_decision_log
+      WHERE subsystem = 'presence'
+        AND JSON_EXTRACT(context, '$.sentiment') = 'positive'
+        AND reward < -0.1
+        AND resolved_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
+    `);
+
+    if (defenseStats && defenseStats.n > 5) {
+      // Positive sentiment sessions with bad outcomes — defense over-triggering
+      await adjustParam('defense_heat_threshold', +0.02, parseFloat(defenseStats.avg_reward), 'defense over-triggering on positive sessions');
+      await adjustParam('defense_cortisol_threshold', +0.02, parseFloat(defenseStats.avg_reward), 'defense over-triggering on positive sessions');
+      adjustments++;
+    }
+  } catch (e) { console.warn('[dream/params] defense adj failed:', e.message); }
+
+  // ── 5. Meta-learning rate adjustment ────────────────────────────────────────
+  // If parameter adjustments are consistently improving outcomes → can increase rate
+  // If they're oscillating (frequent adjustments in both directions) → decrease rate
+  try {
+    const [[metaStats]] = await db.execute(`
+      SELECT
+        COUNT(*) as adj_count,
+        AVG(avg_reward_when_adjusted) as avg_reward_at_adj
+      FROM maya_params
+      WHERE last_adjusted > DATE_SUB(NOW(), INTERVAL 7 DAY)
+    `);
+
+    if (metaStats && metaStats.adj_count > 3) {
+      const avgRewardAtAdj = parseFloat(metaStats.avg_reward_at_adj || 0);
+      if (avgRewardAtAdj > 0.2 && metaStats.adj_count < 5) {
+        // Adjustments working, not oscillating — can move a bit faster
+        await adjustParam('learning_meta_rate', +0.001, avgRewardAtAdj, 'stable positive adjustments → increase rate');
+      } else if (metaStats.adj_count > 10) {
+        // Too many adjustments — oscillating — slow down
+        await adjustParam('learning_meta_rate', -0.002, avgRewardAtAdj, 'high adjustment frequency → decrease rate');
+      }
+    }
+  } catch (e) { console.warn('[dream/params] meta adj failed:', e.message); }
+
+  // Invalidate param cache so next requests pick up new values
+  invalidateParamCache();
+
+  if (adjustments > 0) {
+    const allParams = await getAllParams().catch(() => ({}));
+    console.log(`[dream] ${adjustments} parameter adjustments. Current: ${JSON.stringify(allParams)}`);
+  } else {
+    console.log('[dream] parameters stable — no adjustments needed');
+  }
+}
+
 // ── LLM fact extraction ───────────────────────────────────────────────────────
 
 async function _extractFacts(transcript, msgs, guildId) {
@@ -431,6 +602,9 @@ async function _dreamCycle() {
 
     // Phase 4e: housekeeping — prune stale notifications and orphaned evidence
     await _housekeeping().catch(e => console.error('[dream] housekeeping:', e.message));
+
+    // Phase 4f: parameter self-adjustment — Maya updates her own thresholds
+    await _adjustParameters().catch(e => console.error('[dream] param adjustment:', e.message));
 
     // Phase 4d: stale fact decay
     await _decayStateFacts().catch(e => console.error('[dream] fact decay:', e.message));

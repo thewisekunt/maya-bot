@@ -34,6 +34,9 @@ import { ZONES } from './observation.js';
  * @returns {{ action, reason, emoji? }}
  */
 export function resolveIntent(inner, opts = {}) {
+  // opts.params can carry learned thresholds from params.js
+  const replyThreshold = opts.replyThreshold ?? 0.50;
+  const reactThreshold = opts.reactThreshold ?? 0.28;
   const {
     intentScore,
     contextForce,
@@ -101,7 +104,7 @@ export function resolveIntent(inner, opts = {}) {
   }
 
   // ── Below engagement threshold — silence ──────────────────────────────────
-  if (intentScore < 0.28) {
+  if (intentScore < reactThreshold) {
     // In evolving zone, maybe lurk instead of full ignore
     if (obsState?.zone === ZONES.EVOLVING && obsState.pullScore > 0.3) {
       return { action: 'lurk', reason: 'low intent but channel is interesting' };
@@ -125,7 +128,7 @@ export function resolveIntent(inner, opts = {}) {
   }
 
   // ── Mid-range intent — react or reply based on score ──────────────────────
-  if (intentScore < 0.50) {
+  if (intentScore < replyThreshold) {
     // Low-mid: react
     return {
       action:  'react',

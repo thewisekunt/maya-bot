@@ -19,6 +19,11 @@ import { getMayaReply } from './llm.js';
 import { shouldDeliberate, deliberate, webSearch } from './think.js';
 import { getMomentum, updateMomentum, synthesizeMoment, predictLanding, isReactionMessage, getMomentumZone } from './moment.js';
 import { recordPing, getPressureState } from './observation.js';
+import { checkSalience } from './salience.js';
+
+// Per-channel previous sentiment for salience delta
+const _prevSentimentStore = new Map();
+import { p as param } from './params.js';
 import { getUserState, recordContact, escalateUser, resetUser, stateToPersonalityMode, USER_STATES } from './user_state.js';
 import { getEmojiHint, getReactEmoji } from './emoji.js';
 import { getReferencedContext, getScopedFacts, getUserGenderAndRoles, syncMemberRoles, getEmotionalContext, clearEmotionFor, inferGenderFromText } from './context_enricher.js';
@@ -238,6 +243,10 @@ export async function handleMessage({
   // Pull active session ID from STM so psyche can write mood snapshots
   const { getActiveSession } = await import('./stm.js');
   const activeSessionId = getActiveSession(channelId) || null;
+
+  // Snapshot state BEFORE this exchange for salience delta computation
+  const { getChannelState: _getChState } = await import('./psyche.js');
+  const prevPsycheSnap = JSON.parse(JSON.stringify(_getChState(channelId) || {}));
 
   const psycheState = await updateState({
     channelId,
@@ -812,6 +821,25 @@ export async function handleMessage({
   // Extract self-traits from Maya's own reply (fire and forget)
   if (result.type === 'reply') {
     extractMayaTrait(result.text).catch(() => {});
+  }
+
+  // ── Fast-path salience capture ─────────────────────────────────────────────
+  // Fire-and-forget — doesn't block reply
+  if (result?.type === 'reply' || result?.type === 'react') {
+    const { getChannelState: _getCh2 } = await import('./psyche.js');
+    checkSalience({
+      userId, channelId, guildId,
+      prevPsyche:     prevPsycheSnap,
+      currPsyche:     _getCh2(channelId) || {},
+      innerCognition,
+      prevSentiment:  _prevSentimentStore.get(channelId) || 'neutral',
+      currSentiment:  nlpSignal?.sentiment || 'neutral',
+      userMessage:    richMessageText,
+      mayaReply:      result.text || '',
+      sessionId:      activeSessionId,
+    }).catch(() => {});
+    // Store current sentiment for next exchange delta
+    _prevSentimentStore.set(channelId, nlpSignal?.sentiment || 'neutral');
   }
 
   return result;

@@ -41,6 +41,7 @@
  */
 
 import db from './db.js';
+import { p as param } from './params.js';
 
 // ── In-memory state (per channel, fast layer) ─────────────────────────────────
 // channelId → ChannelPsyche
@@ -49,6 +50,17 @@ const _channels = new Map();
 // ── Cached slow layers ────────────────────────────────────────────────────────
 let _coreTraits        = null;
 let _hormoneBaseline   = null;
+let _cortisolRecovery  = 0.08;  // from params, refreshed periodically
+let _recoveryLastFetch = 0;
+
+async function _refreshRecoveryRate() {
+  if (Date.now() - _recoveryLastFetch < 5 * 60 * 1000) return;  // 5 min cache
+  try {
+    const v = await param('cortisol_recovery_rate');
+    if (v !== null) _cortisolRecovery = v;
+    _recoveryLastFetch = Date.now();
+  } catch { /* use cached */ }
+}
 let _slowLoaded        = false;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -152,6 +164,7 @@ export async function updateState(signals) {
   } = signals;
 
   await _loadSlowLayers();
+  _refreshRecoveryRate().catch(() => {});  // async param refresh
   const ch     = _getChannel(channelId);
   const traits = _coreTraits;
   const hb     = _hormoneBaseline;
@@ -174,7 +187,8 @@ export async function updateState(signals) {
   // ── Hormone fast decay toward baseline (every message) ───────────────────
   // Fast layer decays 8% per message toward baseline
   for (const h of ['dopamine', 'cortisol', 'oxytocin', 'serotonin']) {
-    ch.hormones[h] = lerp(ch.hormones[h], hb[h], 0.08);
+    const decayRate = h === 'cortisol' ? _cortisolRecovery : 0.08;
+    ch.hormones[h] = lerp(ch.hormones[h], hb[h], decayRate);
     ch.hormones[h] = round(clamp(ch.hormones[h], 0, 1));
   }
 
