@@ -43,7 +43,7 @@ const SIGNAL_WEIGHTS = {
 };
 
 // Hormone delta threshold — movement above this in one exchange is significant
-const HORMONE_DELTA_THRESHOLD = 0.12;
+const HORMONE_DELTA_THRESHOLD = 0.20;  // raised from 0.12 — was firing on every exchange
 
 /**
  * Main entry point. Call fire-and-forget after every reply.

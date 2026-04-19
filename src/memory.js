@@ -343,6 +343,18 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
         parts.push(`• ${(mem.message || '').slice(0, 200)}${tsTag}`);
       });
       parts.push('');
+
+      // Increment retrieved_count for the outcome feedback loop (fire and forget)
+      const qdrantIds = salientMems
+        .map(m => m.payload?.qdrant_id || m.id)
+        .filter(Boolean);
+      if (qdrantIds.length) {
+        db.execute(
+          `UPDATE maya_salience_log SET retrieved_count = retrieved_count + 1
+           WHERE qdrant_id IN (${qdrantIds.map(() => '?').join(',')})`,
+          qdrantIds
+        ).catch(() => {});
+      }
     }
 
     if (convMemsFinal.length > 0) {

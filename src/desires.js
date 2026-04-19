@@ -318,7 +318,7 @@ export async function getDesireContext() {
       explore_topic:   `curious about ${d.target_label || 'something'}`,
       resolve_conflict:`feels something is unresolved${target}`,
       seek_validation: `wants to feel seen`,
-      create_distance: `emotionally withdrawing${target}`,
+      create_distance: `keeping some distance${target ? ' from someone who crossed a line' : ''}`,
     }[d.type] || d.type;
     return desc;
   });

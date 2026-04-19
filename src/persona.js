@@ -31,6 +31,7 @@ import { upsertMemory } from './vector.js';
  */
 
 import db from './db.js';
+import { p as param } from './params.js';
 
 // ── Trust thresholds ──────────────────────────────────────────────────────────
 /**
@@ -182,7 +183,15 @@ export async function getOrCreateRelationship(userId, contextType) {
   const firstMs       = new Date(rel.created_at).getTime();
   const lastMs        = new Date(rel.last_interaction).getTime();
   const daysSinceFirst = Math.floor((now - firstMs) / 86400000);
-  const daysSinceLast  = Math.floor((now - lastMs)  / 86400000);
+  const daysSinceLastRaw  = Math.floor((now - lastMs)  / 86400000);
+
+  // Apply learned decay rate — higher rate = trust fades faster with silence
+  // Default 0.85 means days are "worth" slightly more than face value
+  // Higher (→1.0) = faster decay. Lower (→0.5) = slower decay.
+  const decayRate = await param('trust_decay_rate').catch(() => 0.85) || 0.85;
+  // Map 0.5–0.99 → 0.5x–2x multiplier on days (so 1 day feels like 0.5–2 days)
+  const decayMult = 0.5 + (decayRate - 0.5) * 3.0;
+  const daysSinceLast = Math.round(daysSinceLastRaw * decayMult);
 
   const newTrust = calcTrust(
     rel.dm_count      || 0,

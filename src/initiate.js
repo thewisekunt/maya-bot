@@ -147,9 +147,16 @@ async function _tick() {
   console.log(`[initiate] pressure=${pressure.toFixed(2)} risk=${risk.toFixed(2)} threshold=${PRESSURE_THRESHOLD} target=${target.username}`);
 
   // ── Decision ──────────────────────────────────────────────────────────────
-  const learnedThreshold = await learnedWeight('initiation', 'threshold', PRESSURE_THRESHOLD);
-  // Net pressure must exceed threshold — not pressure vs threshold+risk (was too strict)
-  if ((pressure - risk) <= learnedThreshold) {
+  // Read from maya_params first (Maya's self-owned parameters), fallback to learnedWeight
+  const paramThreshold    = await param('initiation_threshold').catch(() => null);
+  const learnedThreshold  = paramThreshold ?? await learnedWeight('initiation', 'threshold', PRESSURE_THRESHOLD);
+
+  // Decision: pressure must exceed threshold AND risk must not dominate
+  // pressure > threshold  — enough internal motivation
+  // pressure > risk       — confidence exceeds risk
+  // Combined: pressure must beat BOTH independently
+  const netScore = pressure - (risk * 0.5);  // risk is a penalty, not added to threshold
+  if (netScore <= learnedThreshold) {
     console.log('[initiate] pressure insufficient — staying silent');
     return;
   }

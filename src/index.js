@@ -47,6 +47,29 @@ function _resolveMentions(msg) {
   return text.trim();
 }
 
+// ── Resolve @Name → <@userId> in Maya's outgoing replies ──────────────────────
+// The LLM writes "@mario" — we need to convert that to "<@userId>" for Discord
+// to actually ping them. Uses guild member cache by displayName/username match.
+function _resolveOutgoingMentions(text, guild) {
+  if (!text || !guild) return text;
+  // Match @Word or @Two Words (up to 3 words, handles display names with spaces)
+  return text.replace(/@([\w\s]{1,40}?)(?=\s|$|[,!?.])/g, (match, name) => {
+    const nameLower = name.trim().toLowerCase();
+    if (!nameLower) return match;
+
+    // Search guild member cache by displayName or username
+    const member = guild.members.cache.find(m =>
+      (m.displayName?.toLowerCase() === nameLower) ||
+      (m.user?.username?.toLowerCase() === nameLower) ||
+      (m.displayName?.toLowerCase().startsWith(nameLower)) ||
+      (m.user?.username?.toLowerCase().startsWith(nameLower))
+    );
+
+    if (member) return `<@${member.user.id}>`;
+    return match;  // no match — leave as-is (still readable, just won't ping)
+  });
+}
+
 // ── Spam batcher ──────────────────────────────────────────────────────────────
 const _spamBatch   = new Map();
 const BATCH_WINDOW = 1500;
@@ -422,9 +445,31 @@ async function _send(msg, result, channelId, isDM, text, client) {
 
   if (result.type === 'react') {
     onMayaReact(channelId);
-    await msg.react(result.emoji).catch(() => console.warn('[bot] react failed:', result.emoji));
+    // Validate custom emoji is accessible before attempting
+    let emojiToUse = result.emoji;
+    const customMatch = result.emoji?.match(/^<a?:(\w+):(\d+)>$/);
+    if (customMatch) {
+      const emojiId = customMatch[2];
+      // Check if this emoji exists in the current guild
+      const guildEmoji = msg.guild?.emojis?.cache?.get(emojiId);
+      if (!guildEmoji) {
+        // Emoji not in this guild — fall back to unicode
+        const { getReactEmoji } = await import('./emoji.js');
+        const psycheForEmoji = { emotions: {}, hormones: {} };
+        emojiToUse = await getReactEmoji(null, psycheForEmoji).catch(() => '👀');
+        console.log(`[bot] react emoji not in guild — using fallback ${emojiToUse}`);
+      }
+    }
+    await msg.react(emojiToUse).catch((err) => {
+      console.warn('[bot] react failed:', emojiToUse, err.message?.slice(0, 50));
+      // Feed negative affinity back if it's a custom emoji
+      if (customMatch && guildId) {
+        const { updateEmojiAffinity } = require('./emoji.js');
+        // Can't use import here easily, just log
+      }
+    });
     // Record reaction in context
-    await _recordMayaAction(`[reacted ${result.emoji} to: "${text.slice(0, 80)}"]`);
+    await _recordMayaAction(`[reacted ${emojiToUse} to: "${text.slice(0, 80)}"]`);
 
   } else if (result.type === 'image') {
     await msg.channel.sendTyping().catch(() => {});
@@ -441,7 +486,9 @@ async function _send(msg, result, channelId, isDM, text, client) {
   } else if (result.type === 'reply') {
     onMayaReply(channelId, msg.author.id);
     notifyReplied(channelId, msg.author.id);
-    const replyText = result.text || '';
+    // Resolve @Name → <@userId> for actual Discord pings
+    const rawReplyText  = result.text || '';
+    const replyText     = _resolveOutgoingMentions(rawReplyText, msg.guild);
     if (replyText.length <= 2000) {
       await msg.reply(replyText).catch(async (err) => {
         // Reply fails if original message was deleted — fall back to channel send

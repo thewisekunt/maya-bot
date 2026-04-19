@@ -4,7 +4,7 @@
  */
 
 import { buildContext, saveMessage } from './memory.js';
-import { updateState, applyPsycheNudge } from './psyche.js';
+import { updateState, applyPsycheNudge, getChannelState } from './psyche.js';
 import { detectPfpRequest, detectSelfUpdate, describeAndStoreAvatar,
          recallAvatar, updateName, updateAvatar, updateBio } from './selfupdate.js';
 import { openSession, recordSessionMessage, getSessionParticipants } from './stm.js';
@@ -245,8 +245,7 @@ export async function handleMessage({
   const activeSessionId = getActiveSession(channelId) || null;
 
   // Snapshot state BEFORE this exchange for salience delta computation
-  const { getChannelState: _getChState } = await import('./psyche.js');
-  const prevPsycheSnap = JSON.parse(JSON.stringify(_getChState(channelId) || {}));
+  const prevPsycheSnap = JSON.parse(JSON.stringify(getChannelState(channelId) || {}));
 
   const psycheState = await updateState({
     channelId,
@@ -371,6 +370,7 @@ export async function handleMessage({
     mediaEmotionScore:   media?.emotionScore   || 0,
     mediaEmotionValence: media?.emotionValence || 'neutral',
     mediaContext:        mediaContext || '',
+    _existingContext:    context || '',   // for deepMemoryRecall deduplication
   });
 
   // ── Intent engine: what should Maya do? ──────────────────────────────────
@@ -385,6 +385,9 @@ export async function handleMessage({
   let decision;
   if (innerCognition.action === 'defend' || innerCognition.action === 'boundary') {
     decision = { action: 'defend', reason: innerCognition.reason || 'threat detected' };
+    // Maya defended herself — fulfill the create_distance desire so it clears from the prompt
+    const { fulfillDesire: _fDes } = await import('./desires.js');
+    _fDes('create_distance', userId).catch(() => {});
   } else {
     decision = resolveIntent(innerCognition, {
       isMention, isDM, isReply,
@@ -826,11 +829,10 @@ export async function handleMessage({
   // ── Fast-path salience capture ─────────────────────────────────────────────
   // Fire-and-forget — doesn't block reply
   if (result?.type === 'reply' || result?.type === 'react') {
-    const { getChannelState: _getCh2 } = await import('./psyche.js');
     checkSalience({
       userId, channelId, guildId,
       prevPsyche:     prevPsycheSnap,
-      currPsyche:     _getCh2(channelId) || {},
+      currPsyche:     getChannelState(channelId) || {},
       innerCognition,
       prevSentiment:  _prevSentimentStore.get(channelId) || 'neutral',
       currSentiment:  nlpSignal?.sentiment || 'neutral',

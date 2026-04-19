@@ -138,7 +138,7 @@ export async function runInnerVoice(input) {
       upsertDesire({
         type: 'create_distance', targetId: userId, targetLabel: 'boundary violator',
         strength: 0.85, source: 'boundary_defense',
-        context: _boundaryType, expiresInHours: 24,
+        context: _boundaryType, expiresInHours: 4,  // short TTL — cleared once Maya responds
       }).catch(() => {})
     );
     // Spike cortisol — affects psyche for next N messages
@@ -547,9 +547,25 @@ export async function executeToolPlan(toolPlan, { userId, guildId, channelId, me
 
         case 'deepMemoryRecall': {
           // Pull extended Qdrant results — more than the standard 5
+          // Deduplicate against context already in the prompt to avoid repetition
           const { buildContext } = await import('./memory.js');
           const deep = await buildContext(userId, null, 'server', guildId, message, channelId, 12);
-          if (deep) additions.push(`[Extended memory context: ${deep.slice(0, 400)}]`);
+          if (deep) {
+            // Split into lines, filter out any line already substantially present in _existingContext
+            const existingCtx = input._existingContext || '';
+            const deduped = deep.split('\n')
+              .filter(line => {
+                if (!line.trim() || line.startsWith('---')) return true;  // keep headers
+                // Drop if >60% of words already appear in existing context
+                const words  = line.toLowerCase().split(/\W+/).filter(w => w.length > 4);
+                if (!words.length) return true;
+                const hits = words.filter(w => existingCtx.includes(w)).length;
+                return (hits / words.length) < 0.6;
+              })
+              .join('\n')
+              .trim();
+            if (deduped) additions.push(`[Extended memory context: ${deduped.slice(0, 500)}]`);
+          }
           break;
         }
 
