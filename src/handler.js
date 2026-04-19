@@ -370,7 +370,7 @@ export async function handleMessage({
     mediaEmotionScore:   media?.emotionScore   || 0,
     mediaEmotionValence: media?.emotionValence || 'neutral',
     mediaContext:        mediaContext || '',
-    _existingContext:    context || '',   // for deepMemoryRecall deduplication
+    _existingContext:    '',   // context not yet available at IV stage — dedup passive
   });
 
   // ── Intent engine: what should Maya do? ──────────────────────────────────

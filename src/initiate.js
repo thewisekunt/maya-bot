@@ -1,4 +1,5 @@
 import { w as learnedWeight, logDecision, resolveDecision, updatePatternMemory, recallPattern, computeReward } from './learn.js';
+import { p as param } from './params.js';
 /**
  * initiate.js — Maya's Proactive Initiation Engine
  *
