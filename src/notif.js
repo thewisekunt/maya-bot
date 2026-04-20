@@ -196,6 +196,7 @@ function _nlpToAction(intent, triggerType, score, threadTarget) {
     case 'random_mention':    return 'lurk';
     case 'directed_at_other': return 'ignore';
     case 'group_chatter':     return 'ignore';
+    case 'bot_command':       return 'ignore';  // human sending bot command
     default:                  return 'lurk';
   }
 }
@@ -226,7 +227,7 @@ Respond with ONLY: one word (REPLY/REACT/LURK/IGNORE), then a newline, then one 
   try {
     const { data, status } = await axios.post(
       config.llm.endpoint,
-      { model: config.llm.model, messages: [{ role: 'user', content: prompt }], temperature: 0.1, max_tokens: 60 },
+      { model: config.llm.models.utility, messages: [{ role: 'user', content: prompt }], temperature: 0.1, max_tokens: 60 },
       {
         headers: {
           'Content-Type': 'application/json', 'Authorization': `Bearer ${config.llm.apiKey}`,

@@ -16,6 +16,7 @@ import { generateImage } from './imagegen.js';
 import { refreshAliases } from './scanner.js';
 import { parseNotification, resolveReplyNotif } from './notification.js';
 import { observe, shouldTriggerObservation, resetPull, getObservationState } from './observation.js';
+import { processBotMessage, recordBotEvent, looksLikeBotCommand } from './botregistry.js';
 import { checkSpam, notifyReplied } from './spamguard.js';
 import db from './db.js';
 import { evaluate } from './notif.js';
@@ -129,8 +130,26 @@ client.once('ready', async () => {
 client.on('messageCreate', async (msg) => {
   // Selfbot: ignore own messages
   if (msg.author.id === client.user.id) return;
-  // Ignore other bots/webhooks
-  if (msg.author.bot || msg.webhookId) return;
+  // Webhooks: always ignore
+  if (msg.webhookId) return;
+
+  // Bot messages: route through bot awareness system instead of hard-ignoring
+  if (msg.author.bot) {
+    // Only process bots in allowed channels (same gate as human messages)
+    const _allowed = config.discord.allowedChannels;
+    const _chanId  = msg.channel?.id;
+    const _guildId = msg.guild?.id || null;
+    if (_allowed.length > 0 && msg.guild && !_allowed.includes(_chanId)) return;
+
+    // Process through bot registry — fire and forget
+    processBotMessage(msg).then(event => {
+      if (event) {
+        recordBotEvent(_chanId, event);
+        console.log(`[bot] tracked ${event.botName} (${event.category}) in ${_chanId}`);
+      }
+    }).catch(() => {});
+    return;
+  }
 
   // ── Sleep gate ────────────────────────────────────────────────────────────
   if (isSleeping()) {
@@ -164,6 +183,10 @@ client.on('messageCreate', async (msg) => {
     observeMessage(channelId, msg.author.id, false, msgEnt);
     notifyUserSpoke(msg.author.id, channelId);
   }
+
+  // ── Bot command filter — human sending a bot command, skip NLP routing ───
+  // Don't let "$dep all" or "owo hunt" go through notification pipeline
+  if (!isDM && looksLikeBotCommand(content)) return;
 
   // ── PATH 1: Engaged continuation ─────────────────────────────────────────
   const engagedWith = isDM ? null : getEngagedUser(channelId);

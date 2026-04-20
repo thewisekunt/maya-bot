@@ -387,6 +387,17 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
     }
   }
 
+  // ── Bot activity context ───────────────────────────────────────────────────
+  // Append recent bot events from the channel — gives Maya awareness of what's
+  // been happening (OwO battles, economy transactions, etc.) without LLM calls
+  if (channelId) {
+    const botCtx = getBotContext(channelId);
+    if (botCtx) {
+      parts.push('');
+      parts.push(botCtx);
+    }
+  }
+
   return parts.join('\n').trim();
 }
 

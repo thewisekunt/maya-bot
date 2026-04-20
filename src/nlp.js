@@ -349,6 +349,20 @@ function _addTrainingData() {
     'gn sab',
   ];
   gc.forEach(u => manager.addDocument('en', u, 'group_chatter'));
+
+  // ── bot_command ─────────────────────────────────────────────────────────────
+  // Human sending a command to a bot — Maya should NOT engage
+  const bc = [
+    '$dep all', '$dep', '$with', '$pay', '$bal', '$work', '$crime', '$rob',
+    '$slots', '$bj all', '$bj', '$cf all', '$cf', '$scratch', '$share', '$give',
+    'owo hunt', 'owo battle', 'owo catch', 'owo sell', 'owo buy',
+    'owo cf', 'owo slots', 'owo pray', 'owo curse',
+    'o hunt', 'o battle', 'o cf', 'o sell', 'o buy',
+    '!play', '!skip', '!queue', '!stop', '!pause', '!np',
+    'pls dep', 'pls with', 'pls hunt', 'pls battle',
+    '-play', '-skip', '.play', '.skip',
+  ];
+  bc.forEach(u => manager.addDocument('en', u, 'bot_command'));
 }
 
 import db from './db.js';
