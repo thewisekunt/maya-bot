@@ -805,16 +805,17 @@ async function _updateBeliefs() {
      LIMIT 20`
   ).catch(() => [[]]);
 
+  // NOTE: NLP reward signals are intentionally NOT stored as beliefs.
+  // These are internal ML metrics, not observations about a person.
+  // Previously this created noisy belief rows like "conversation quality signal: avg_reward=0.99"
+  // The reward signal is only used for pattern memory (learn.js), not for user beliefs.
   for (const r of rewarded || []) {
     if (!r.discord_user_id) continue;
     const avgReward = parseFloat(r.avg_reward || 0);
-    if (Math.abs(avgReward - 0.5) < 0.1) continue; // too neutral to matter
-    await updateUserBelief(
-      r.discord_user_id,
-      `conversation quality signal: avg_reward=${avgReward.toFixed(2)}`,
-      avgReward > 0.5 ? 'positive' : 'negative',
-      (avgReward - 0.5) * 2
-    );
+    if (Math.abs(avgReward - 0.5) < 0.1) continue;
+    // Only use reward signal to update learn.js pattern memory — not beliefs
+    // await updateUserBelief(...) — REMOVED: was polluting maya_beliefs table
+    void r;  // suppress unused var warning
   }
 
   if ((users || []).length > 0) {

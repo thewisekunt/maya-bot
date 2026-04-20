@@ -1,5 +1,6 @@
 import { w as learnedWeight, logDecision, resolveDecision, updatePatternMemory, recallPattern, computeReward } from './learn.js';
 import { p as param } from './params.js';
+import { mayaSpeak } from './index.js';
 /**
  * initiate.js — Maya's Proactive Initiation Engine
  *
@@ -174,12 +175,26 @@ async function _tick() {
   }
 
 
-  // ── Generate message ──────────────────────────────────────────────────────
-  const message = await _generateMessage(trigger, internalState, target);
-  if (!message) return;
+  // ── Build context for pipeline ────────────────────────────────────────────
+  // Instead of generating a hardcoded message, tell the full pipeline WHY Maya
+  // is reaching out — the handler + IV + LLM will determine what she actually says
+  const triggerContext = {
+    missing_user:       `Maya misses ${target.username} — they haven't been around for ${Math.round(target.hoursSince || 2)} hours and she wants to reconnect.`,
+    emotional_overflow: `Maya has some unresolved emotional tension she needs to express. She wants to reach out to ${target.username}.`,
+    curiosity:          `Maya is curious and wants to start a conversation with ${target.username}.`,
+    ambient:            `Maya feels like talking to ${target.username} — no strong reason, just wants to connect.`,
+  }[trigger] || `Maya wants to initiate a conversation with ${target.username}.`;
 
-  // ── Send ──────────────────────────────────────────────────────────────────
-  const sent = await _sendMessage(target.channelId, target.userId, message, target.isDM);
+  // ── Send via unified pipeline ──────────────────────────────────────────────
+  const sent = await mayaSpeak({
+    channelId: target.isDM ? null : target.channelId,
+    userId:    target.userId,
+    guildId:   target.guildId || null,
+    isDM:      target.isDM || false,
+    trigger:   'initiation',
+    context:   triggerContext,
+    client:    _client,
+  });
   if (!sent) return;
 
   _lastSent = Date.now();

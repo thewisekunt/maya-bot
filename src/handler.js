@@ -47,7 +47,11 @@ export async function handleMessage({
   message, guildId, msg,
   isMention, isReply,
   hasMedia   = false,
-}) {
+  _proactive = false,   // true when Maya is speaking first (commitment/sleep/initiation)
+  _trigger   = null,    // 'commitment' | 'sleep' | 'wake' | 'initiation' | null
+} = {}) {
+  // Build opts object for downstream proactive guards
+  const opts = { _proactive, _trigger };
   // ── 1. Context ────────────────────────────────────────────────────────────
   const isDM        = !msg.guild;
   const contextType = isDM ? 'dm' : 'server';
@@ -97,30 +101,33 @@ export async function handleMessage({
   // ── 5. Trust — compute dynamically from interaction history ───────────────
   let trustLevel = 3;
   let attachmentScore = 0.3;  // pulled from DB below
-  try {
-    // First upsert the relationship row
-    const counterCol = contextType === 'dm' ? 'dm_count' : 'server_count';
-    await db.execute(
-      `INSERT INTO maya_user_relationships
-         (discord_user_id, total_messages, ${counterCol}, last_interaction)
-       VALUES (?, 1, 1, NOW())
-       ON DUPLICATE KEY UPDATE
-         total_messages   = total_messages + 1,
-         ${counterCol}    = ${counterCol} + 1,
-         last_interaction = NOW()`,
-      [userId]
-    );
-    // Then recalculate trust + fetch attachment from the updated stats
-    const rel = await getOrCreateRelationship(userId, contextType);
-    trustLevel = rel.trustLevel;
-    // Pull attachment_score directly — not returned by getOrCreateRelationship
-    const [[relRow]] = await db.execute(
-      `SELECT attachment_score FROM maya_user_relationships WHERE discord_user_id=? LIMIT 1`,
-      [userId]
-    ).catch(() => [[{ attachment_score: 0.3 }]]);
-    attachmentScore = parseFloat(relRow?.attachment_score || 0.3);
-  } catch (e) {
-    console.error('[handler] trust update:', e.message);
+  // Skip DB user lookups for proactive channel messages with no specific target
+  if (userId && userId !== 'system') {
+    try {
+      // First upsert the relationship row
+      const counterCol = contextType === 'dm' ? 'dm_count' : 'server_count';
+      await db.execute(
+        `INSERT INTO maya_user_relationships
+           (discord_user_id, total_messages, ${counterCol}, last_interaction)
+         VALUES (?, 1, 1, NOW())
+         ON DUPLICATE KEY UPDATE
+           total_messages   = total_messages + 1,
+           ${counterCol}    = ${counterCol} + 1,
+           last_interaction = NOW()`,
+        [userId]
+      );
+      // Then recalculate trust + fetch attachment from the updated stats
+      const rel = await getOrCreateRelationship(userId, contextType);
+      trustLevel = rel.trustLevel;
+      // Pull attachment_score directly — not returned by getOrCreateRelationship
+      const [[relRow]] = await db.execute(
+        `SELECT attachment_score FROM maya_user_relationships WHERE discord_user_id=? LIMIT 1`,
+        [userId]
+      ).catch(() => [[{ attachment_score: 0.3 }]]);
+      attachmentScore = parseFloat(relRow?.attachment_score || 0.3);
+    } catch (e) {
+      console.error('[handler] trust update:', e.message);
+    }
   }
 
   // ── 6. Known names in guild (for lurk friend-awareness) ──────────────────
@@ -687,9 +694,14 @@ export async function handleMessage({
     ? await getEmojiHint(guildId, dominantMood, userId).catch(() => null)
     : null;
 
+  // For proactive triggers, prepend the trigger context so LLM knows WHY Maya is speaking
+  const proactiveNote = _proactive && message.startsWith('[')
+    ? message.replace(/^\[\w+\]\s*/, '')  // strip trigger tag, use raw context
+    : null;
+
   const result = await getMayaReply({
     prefName,
-    context: [context, thirdPartyContext, thoughtContext, entityContext].filter(Boolean).join('\n\n'),  // refContext + emotionalCtx passed separately
+    context: [proactiveNote, context, thirdPartyContext, thoughtContext, entityContext].filter(Boolean).join('\n\n'),  // refContext + emotionalCtx passed separately
     message: finalMessage, entropy, zone, zoneLine,
     contextLine, knownFacts, selfTraits, relationship: { trustLevel },
     frequentFriends: [], forceVerbal,
@@ -819,10 +831,15 @@ export async function handleMessage({
   }
 
   // Extract facts from user message (fire and forget)
-  extractAndStoreFact(userId, message).catch(() => {});
+  // Skip for proactive triggers — the "message" is a synthetic context string, not real user content
+  if (!opts._proactive) {
+    extractAndStoreFact(userId, message).catch(() => {});
+  }
 
   // Extract self-traits from Maya's own reply (fire and forget)
-  if (result.type === 'reply') {
+  // Skip for synthetic messages — traits extracted from sleep/commitment/initiation messages
+  // tend to be context-specific noise rather than stable identity traits
+  if (result.type === 'reply' && !opts._proactive) {
     extractMayaTrait(result.text).catch(() => {});
   }
 

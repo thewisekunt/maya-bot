@@ -123,6 +123,7 @@ client.once('ready', async () => {
   startCommitmentEngine(client);
   startSleepEngine(client);
   console.log('[initiate] engine started');
+  setGlobalClient(client);  // make client available to mayaSpeak
 });
 
 // ── Message handler ───────────────────────────────────────────────────────────
@@ -529,6 +530,154 @@ async function _send(msg, result, channelId, isDM, text, client) {
     _scheduleImplicitReward(msg.author.id, channelId, 90_000);
   }
 }
+
+
+// ── mayaSpeak() — unified proactive send pipeline ─────────────────────────────
+//
+// Everything Maya says proactively (commitments, sleep/wake, initiation)
+// must go through this function. It routes through the full handler pipeline:
+//   context → IV → psyche → LLM → send
+// so Maya's voice, memory, and state all apply — no more hardcoded arrays.
+//
+// @param {object} opts
+//   channelId   — where to send (null = use DM)
+//   userId      — who Maya is talking to (for context + trust)
+//   guildId     — guild context (null for DMs)
+//   isDM        — whether to open a DM channel instead
+//   trigger     — 'commitment' | 'wake' | 'sleep' | 'initiation'
+//   context     — free-form context string injected into Maya's system prompt
+//                 e.g. "Maya made a commitment to follow up about X"
+//   client      — Discord client instance
+//
+export async function mayaSpeak({ channelId, userId, guildId, isDM = false, trigger, context: speakContext, client: speakClient }) {
+  const _cli = speakClient || _globalClient;
+  if (!_cli?.isReady()) return false;
+
+  try {
+    // ── Resolve channel ────────────────────────────────────────────────────
+    let channel;
+    if (isDM && userId) {
+      const user = await _cli.users.fetch(userId).catch(() => null);
+      if (!user) return false;
+      channel = await user.createDM().catch(() => null);
+    } else if (channelId) {
+      channel = await _cli.channels.fetch(channelId).catch(() => null);
+    }
+    if (!channel) return false;
+
+    // ── Look up user info ──────────────────────────────────────────────────
+    let displayName = 'there';
+    let username    = 'user';
+    let avatarUrl   = null;
+    if (userId) {
+      try {
+        const member = channel.guild?.members?.cache?.get(userId)
+          || await channel.guild?.members?.fetch(userId).catch(() => null);
+        displayName = member?.displayName || (await _cli.users.fetch(userId).catch(() => null))?.username || 'there';
+        username    = displayName;
+        avatarUrl   = member?.user?.displayAvatarURL({ size: 64 }) || null;
+      } catch { /* non-fatal */ }
+    }
+
+    // ── Build synthetic message for handler ───────────────────────────────
+    // We inject the trigger context as the "message" Maya is responding to.
+    // The handler sees this as if a virtual notification arrived.
+    const syntheticMessage = `[${trigger}] ${speakContext || ''}`.trim();
+
+    // ── Run through full handler pipeline ─────────────────────────────────
+    console.log(`[mayaSpeak] trigger=${trigger} → ${isDM ? 'DM' : channelId} (${displayName})`);
+
+    const result = await handleMessage({
+      userId:      userId || 'system',
+      username,
+      displayName,
+      avatarUrl,
+      message:     syntheticMessage,
+      guildId:     isDM ? null : (guildId || channel.guild?.id || null),
+      msg:         _makeSyntheticMsg(channel, userId, syntheticMessage, _cli),
+      isMention:   true,   // treat as direct — Maya is speaking TO this person
+      isReply:     false,
+      hasMedia:    false,
+      _proactive:  true,   // flag so handler knows this is Maya initiating
+      _trigger:    trigger,
+    });
+
+    if (!result || result.type === 'ignore') {
+      console.log(`[mayaSpeak] handler returned ${result?.type || 'null'} — staying silent`);
+      return false;
+    }
+
+    // ── Send the result ────────────────────────────────────────────────────
+    if (result.type === 'reply' && result.text) {
+      const replyText = result.text.trim();
+      if (!replyText) return false;
+
+      await channel.sendTyping().catch(() => {});
+      await new Promise(r => setTimeout(r, 800 + Math.random() * 1200));
+
+      const mentions = userId && !isDM ? `<@${userId}> ` : '';
+      const content  = isDM ? replyText : `${mentions}${replyText}`;
+
+      await channel.send(content.slice(0, 2000)).catch(e => {
+        console.error('[mayaSpeak] send failed:', e.message);
+      });
+
+      // Record in memory
+      const { saveMessage: _saveFn } = await import('./memory.js');
+      const cId = channel.id;
+      const gId = isDM ? null : (guildId || channel.guild?.id || null);
+      recordSessionMessage(cId, { userId: 'maya', userName: 'Maya', sender: 'maya', message: replyText }).catch(() => {});
+      _saveFn({ userId: 'maya', prefName: 'Maya', guildId: gId, channelId: cId,
+        contextType: isDM ? 'dm' : 'server', isPrivate: isDM,
+        sender: 'maya', message: `[${trigger}] ${replyText}`, entropy: 0.2 }).catch(() => {});
+
+      console.log(`[mayaSpeak] sent: "${replyText.slice(0, 80)}"`);
+      return true;
+    }
+
+    return false;
+  } catch (e) {
+    console.error('[mayaSpeak] error:', e.message);
+    return false;
+  }
+}
+
+// ── Synthetic message object for handler ──────────────────────────────────────
+// handler.js expects a Discord.js Message object for certain lookups.
+// We create a minimal proxy that satisfies what handler actually reads.
+function _makeSyntheticMsg(channel, userId, content, client) {
+  return {
+    id:        `synthetic_${Date.now()}`,
+    content,
+    channel,
+    guild:     channel.guild || null,
+    author:    { id: userId || 'system', username: 'system', bot: false,
+                 displayAvatarURL: () => null },
+    member:    channel.guild?.members?.cache?.get(userId) || null,
+    mentions:  { has: () => true, users: new Map() },
+    reference: null,
+    attachments: new Map(),
+    embeds:    [],
+    stickers:  new Map(),
+    createdTimestamp: Date.now(),
+    reply:     (content) => channel.send(content),
+    react:     () => Promise.resolve(),
+    _synthetic: true,
+    _notification: {
+      triggerType: 'proactive',
+      triggerWord: 'proactive',
+      userId: userId || 'system',
+      channelId: channel.id,
+      guildId: channel.guild?.id || null,
+      isDM: !channel.guild,
+      type: 'proactive',
+    },
+  };
+}
+
+// Store client reference for mayaSpeak
+let _globalClient = null;
+export function setGlobalClient(c) { _globalClient = c; }
 
 // ── Implicit reward ───────────────────────────────────────────────────────────
 const _rewardTimers = new Map();

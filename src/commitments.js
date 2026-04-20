@@ -15,9 +15,8 @@
  * Maya fires the commitment later proactively via initiate.js style send.
  */
 
-import axios  from 'axios';
-import db     from './db.js';
-import { config } from './config.js';
+import db           from './db.js';
+import { mayaSpeak } from './index.js';
 
 const CHECK_INTERVAL_MS = 5 * 60_000;  // check every 5 min
 let _client = null;
@@ -56,7 +55,7 @@ If no commitment, respond with:
 Only respond with valid JSON, no explanation.`;
 
     const { data, status } = await axios.post(config.llm.endpoint, {
-      model:       'deepseek/deepseek-chat-v3-0324',
+      model:       config.llm.models.utility,
       messages:    [{ role: 'user', content: prompt }],
       temperature: 0.0,
       max_tokens:  100,
@@ -112,49 +111,38 @@ async function _checkCommitments() {
 
 async function _fireCommitment(commitment) {
   try {
-    // Generate a natural follow-up message
-    const prompt = `Maya made a commitment: "${commitment.commitment_text}"
-She's now following through. Write a SHORT (1 line) natural Discord message to the user.
-- Don't explain yourself
-- Be casual, nonchalant — like she just remembered
-- Example tone: "oi, baat karni thi na", "ayo what did you want to say", "free hun btw"
-Output ONLY the message.`;
+    // Build context for handler — tells Maya what she committed to
+    // The full pipeline (IV → psyche → memory → LLM) will generate the actual message
+    const speakContext = `Maya made a commitment earlier: "${commitment.commitment_text}". She is now following through on it. Reach out naturally — casual, nonchalant, like she just remembered.`;
 
-    const { data } = await axios.post(config.llm.endpoint, {
-      model: 'deepseek/deepseek-chat-v3-0324',
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.9, max_tokens: 60,
-    }, {
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${config.llm.apiKey}` },
-      timeout: 8000, validateStatus: () => true,
+    // Try DM first (more personal for commitment follow-ups), then channel
+    const isDM = !commitment.channel_id;
+
+    const sent = await mayaSpeak({
+      channelId: commitment.channel_id || null,
+      userId:    commitment.discord_user_id,
+      guildId:   commitment.guild_id || null,
+      isDM:      isDM || false,
+      trigger:   'commitment',
+      context:   speakContext,
+      client:    _client,
     });
 
-    const msg = data?.choices?.[0]?.message?.content?.trim();
-    if (!msg) return;
-
-    // Try DM first, then channel
-    let sent = false;
-    try {
-      const user    = await _client.users.fetch(commitment.discord_user_id);
-      const dmChan  = await user.createDM();
-      await dmChan.send(msg);
-      sent = true;
-    } catch {
-      if (commitment.channel_id) {
-        try {
-          const chan = await _client.channels.fetch(commitment.channel_id);
-          await chan.send(`<@${commitment.discord_user_id}> ${msg}`);
-          sent = true;
-        } catch { /* give up */ }
-      }
-    }
-
+    // If channel send worked or DM worked, mark fired
     if (sent) {
       await db.execute(
         `UPDATE maya_commitments SET status='fired', fired_at=NOW() WHERE id=?`,
         [commitment.id]
       );
-      console.log(`[commit] fired: "${commitment.commitment_text}" → ${commitment.discord_user_id}`);
+      console.log(`[commit] fired via pipeline: "${commitment.commitment_text}" → ${commitment.discord_user_id}`);
+    } else {
+      // mayaSpeak returned false — pipeline chose silence or channel unavailable
+      // Mark as expired rather than pending so it doesn't keep retrying
+      await db.execute(
+        `UPDATE maya_commitments SET status='expired' WHERE id=?`,
+        [commitment.id]
+      );
+      console.log(`[commit] pipeline chose silence for commitment → ${commitment.discord_user_id}`);
     }
   } catch (e) {
     console.error('[commit] fire failed:', e.message);

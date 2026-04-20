@@ -522,9 +522,10 @@ or []`;
       if (/this guy|this person|someone|something/.test(factLower)) continue;
 
       // Reject temporal/negation garbage — the #1 source of noise
-      if (/right now|currently|today|this moment/.test(factLower)) continue;
-      if (/feeling (really|so|very|a bit)/.test(factLower)) continue;
-      if (/ is not | are not | isn't | aren't | doesn't | don't /.test(fact)) continue;
+      if (/\bright now\b|\bcurrently\b|\btoday\b|\bthis moment\b|\bthis week\b/.test(factLower)) continue;
+      if (/\bfeeling (really|so|very|a bit)\b/.test(factLower)) continue;
+      if (/ is not | are not | isn't | aren't | doesn't | don't | won't | can't /i.test(fact)) continue;
+      if (/\bnot (a |an |the |really |even |just )/i.test(factLower)) continue;
 
       // Reject facts directed at Maya
       if (/loves you|hates you|needs you|needs maya/.test(factLower)) continue;
@@ -665,9 +666,17 @@ async function _storeFact(userId, userName, fact, category, initialScore, source
   );
 
   // ── Step 2: Exact/near-dupe → REINFORCE, not create new ──────────────────
-  const dupeRow = existing.find(r =>
-    r.fact.toLowerCase().slice(0, 40) === fact.toLowerCase().slice(0, 40)
-  );
+  // Extended dedup: check first 40 chars OR 3+ significant word overlap
+  const STOP = new Set(['the','a','an','is','are','was','were','has','have','had','and','or','but','to','of','in','at','for','with','on','by','from','that','this','it','he','she','they','we']);
+  const factWords = fact.toLowerCase().split(/\W+/).filter(w => w.length > 3 && !STOP.has(w));
+  const dupeRow = existing.find(r => {
+    // Prefix match
+    if (r.fact.toLowerCase().slice(0, 40) === fact.toLowerCase().slice(0, 40)) return true;
+    // Semantic overlap — 3+ significant words in common
+    const existWords = r.fact.toLowerCase().split(/\W+/).filter(w => w.length > 3 && !STOP.has(w));
+    const overlap = factWords.filter(w => existWords.includes(w)).length;
+    return overlap >= 3 && factWords.length >= 3;
+  });
   if (dupeRow) {
     // Reinforce existing fact instead of creating duplicate
     const newConf = Math.min(0.99, parseFloat(dupeRow.memory_strength || 0.5) + 0.08);
@@ -692,6 +701,11 @@ async function _storeFact(userId, userName, fact, category, initialScore, source
 
   // ── Step 3: LLM conflict + confidence scoring ─────────────────────────────
   // Only run if there are existing facts to compare against
+  // Enforce valid category — never store empty string
+  if (!category || !['identity','preference','belief','relationship','objective','other','occupation'].includes(category)) {
+    category = 'other';
+  }
+
   let confidence = 0.7;   // default when no existing facts
   let conflictScore = initialScore;
   let conflictIds = [];   // IDs of facts this new one contradicts
@@ -916,13 +930,32 @@ export async function getMayaSelfTraits(limit = 8) {
  */
 export async function extractMayaTrait(replyText) {
   if (!replyText || replyText.startsWith('*reacted')) return;
-  // Strict quality gates — only store meaningful self-statements
-  if (replyText.length < 20) return;
-  if (replyText.split(/\s+/).length < 5) return;   // minimum 5 words
-  // Skip pure acknowledgements
-  if (/^(ok|okay|yeah|yep|nope|lol|haha|sure|k|hmm|oh|ah|nice|cool|wow)[.!?\s]?$/i.test(replyText.trim())) return;
-  // Skip replies that are primarily about what the USER said — not about Maya
-  if (/^(that'?s|it'?s|this|you|your|they|he|she)/i.test(replyText.trim())) return;
+
+  // ── Hard gates — skip immediately ────────────────────────────────────────
+  if (replyText.length < 30) return;
+  const wordCount = replyText.split(/\s+/).filter(Boolean).length;
+  if (wordCount < 6) return;
+
+  // Skip pure acknowledgements and reactions
+  if (/^(ok|okay|yeah|yep|nope|lol|lmao|haha|sure|k|hmm|oh|ah|nice|cool|wow|oof|bruh|fr|same|damn)[.!?\s]?$/i.test(replyText.trim())) return;
+
+  // Skip replies primarily about the user / directed at someone
+  if (/^(that'?s|it'?s|this|you|your|they|he|she|bro|yaar|arre)/i.test(replyText.trim())) return;
+
+  // Skip negation statements — "I'm not X" is situational deflection, not a stable trait
+  if (/\bi(?:'m| am) not\b|\bi don't\b|\bi can'?t\b|\bi won'?t\b/i.test(replyText)) return;
+
+  // Skip sarcasm/joke markers
+  if (/lmao|lol|💀|😂|jk|just kidding|obviously not|good luck with that/i.test(replyText)) return;
+
+  // Skip situation-specific statements (right now, currently, today, tonight)
+  if (/\bright now\b|\bcurrently\b|\btoday\b|\btonight\b|\bthis moment\b|\bthis week\b/i.test(replyText)) return;
+
+  // Skip if it's directed AT someone (contains "you" prominently)
+  if (/^.{0,20}\byou\b/i.test(replyText)) return;
+
+  // Skip rhetorical / reaction phrases
+  if (/^(wait|okay so|actually|honestly|look|listen|nah|nope|yikes|okay wait)/i.test(replyText.trim())) return;
 
   for (const { re, cat, score } of FACT_PATTERNS) {
     const m = replyText.match(re);

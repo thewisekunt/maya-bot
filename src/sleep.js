@@ -1,5 +1,6 @@
 import { processMorningInbox, dismissOldNotifications } from './inbox.js';
 import { saveMessage } from './memory.js';
+import { mayaSpeak } from './index.js';
 /**
  * sleep.js — Maya's nightly sleep cycle
  *
@@ -121,7 +122,6 @@ async function _enterSleep() {
 async function _postSleepMessage() {
   if (!_client?.isReady()) return;
 
-  // Find most active channel in last 6h
   const [[ch]] = await db.execute(
     `SELECT channel_id FROM maya_memory
      WHERE context_type='server' AND channel_id IS NOT NULL
@@ -131,28 +131,17 @@ async function _postSleepMessage() {
 
   if (!ch?.channel_id) return;
 
-  const channel = await _client.channels.fetch(ch.channel_id).catch(() => null);
-  if (!channel) return;
-
-  // Dyno's AFK command is /afk — but we just send the message as Maya
-  // Dyno will pick up the AFK keyword automatically if configured
-  const sleepMsgs = [
-    'afk sleeping, baad mein',
-    'sone ja rahi hun, gn',
-    'afk — so rahi hun',
-    'okay going to sleep now, afk',
-    'raat ho gayi, afk sleeping',
-    'nikal rahi hun — afk',
-  ];
-  const msg = sleepMsgs[Math.floor(Math.random() * sleepMsgs.length)];
-
-  await channel.send(msg).catch(() => {});
-  saveMessage({
-    userId: 'maya', prefName: 'Maya', guildId: channel.guild?.id || null,
-    channelId: ch.channel_id, contextType: 'server', isPrivate: false,
-    sender: 'maya', message: `[sleep] ${msg}`, entropy: 0.1,
+  // Route through full pipeline — Maya says goodnight in her own voice
+  await mayaSpeak({
+    channelId: ch.channel_id,
+    userId:    null,
+    guildId:   null,
+    isDM:      false,
+    trigger:   'sleep',
+    context:   'Maya is going to sleep now. Say goodnight to the channel in her own casual Hinglish way — short, natural, no drama. Something like "afk sone ja rahi hun" or "gn log". One line only.',
+    client:    _client,
   }).catch(() => {});
-  console.log(`[sleep] posted sleep message: "${msg}"`);
+  console.log('[sleep] posted sleep message via pipeline');
 }
 
 async function _exitSleep() {
@@ -190,20 +179,18 @@ async function _postWakeMessage() {
   ).catch(() => [[null]]);
 
   if (!ch?.channel_id) return;
-  const channel = await _client.channels.fetch(ch.channel_id).catch(() => null);
-  if (!channel) return;
 
-  const wakeMsgs = [
-    'back',
-    'morning',
-    "okay I'm up",
-    'ugh morning people',
-    'woke up, kya hua',
-    'theek hun, good morning I guess',
-  ];
-  const msg = wakeMsgs[Math.floor(Math.random() * wakeMsgs.length)];
-  await channel.send(msg).catch(() => {});
-  console.log(`[sleep] posted wake message: "${msg}"`);
+  // Route through full pipeline — Maya wakes up in her own voice
+  await mayaSpeak({
+    channelId: ch.channel_id,
+    userId:    null,
+    guildId:   null,
+    isDM:      false,
+    trigger:   'wake',
+    context:   'Maya just woke up. Say good morning or announce she is back in her own casual Hinglish way — short, grumpy, nonchalant. Something like "woke up" or "ugh morning" or "kya hua sone ke baad". One line only.',
+    client:    _client,
+  }).catch(() => {});
+  console.log('[sleep] posted wake message via pipeline');
 }
 
 // ── Deep consolidation pipeline ───────────────────────────────────────────────
