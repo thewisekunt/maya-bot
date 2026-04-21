@@ -580,12 +580,13 @@ async function _dreamCycle() {
       await _runEmbedPass('cycle');
     }
 
-    // Phase 2: retrain NLP (only if new examples accumulated)
+    // Phase 2: NLP retrain DISABLED during dream cycle
+    // node-nlp manager.train() spikes memory ~600MB+ on 512MB Koyeb — kills the instance
+    // New examples in maya_nlp_training are picked up on next cold start (trainNLP())
+    // The persisted model loaded from MySQL at startup already includes all prior training
     if (pendingNLP.n >= 5) {
-      const newExamples = await retrainFromDB();
-      if (newExamples > 0) {
-        console.log(`[dream] NLP retrained with ${newExamples} new examples`);
-      }
+      console.log(`[dream] NLP retrain skipped (${pendingNLP.n} pending) — will apply on next restart`);
+      // Just mark examples as queued so we know count, but don't train yet
     }
 
     // Phase 3: personality drift (lightweight, always run if anything ran)

@@ -310,7 +310,7 @@ export async function getDesireContext() {
   const desires = await getActiveDesires();
   if (!desires.length) return null;
 
-  const top = desires.slice(0, 3).map(d => {
+  const top = desires.slice(0, 5).map(d => {
     const target = d.target_label ? ` (${d.target_label})` : '';
     const desc = {
       talk_to:         `wants to connect${target}`,
@@ -318,12 +318,21 @@ export async function getDesireContext() {
       explore_topic:   `curious about ${d.target_label || 'something'}`,
       resolve_conflict:`feels something is unresolved${target}`,
       seek_validation: `wants to feel seen`,
-      create_distance: `keeping some distance${target ? ' from someone who crossed a line' : ''}`,
+      create_distance: `keeping some distance from someone who crossed a line`,
     }[d.type] || d.type;
     return desc;
   });
 
-  return `[Maya's current desires: ${top.join('; ')}]`;
+  // Deduplicate — same description shouldn't appear twice
+  const seen = new Set();
+  const deduped = top.filter(desc => {
+    if (seen.has(desc)) return false;
+    seen.add(desc);
+    return true;
+  });
+
+  if (!deduped.length) return null;
+  return `[Maya's current desires: ${deduped.join('; ')}]`;
 }
 
 // ── Aliases for inner_voice.js compatibility ─────────────────────────────────

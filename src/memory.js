@@ -15,6 +15,7 @@
  */
 
 import db from './db.js';
+import { getBotContext } from './botregistry.js';
 import { p as param } from './params.js';
 import { embed } from './embedder.js';
 import { searchMemories, isConfigured } from './vector.js';

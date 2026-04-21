@@ -557,8 +557,9 @@ async function _pruneNoise(stats) {
 
 // Phase 5: run standard dream tasks
 async function _runDreamTasks() {
-  console.log('[sleep] phase 5: dream tasks (NLP, drift, learning)');
-  await retrainFromDB().catch(e => console.error('[sleep] NLP retrain:', e.message));
+  console.log('[sleep] phase 5: dream tasks (drift, learning) — NLP retrain skipped (OOM risk)');
+  // retrainFromDB() disabled — spikes memory above 512MB Koyeb limit and kills instance
+  // New training examples are applied on next cold start via trainNLP()
   await updateSlowDrift().catch(e => console.error('[sleep] drift:', e.message));
   await runLearningCycle().catch(e => console.error('[sleep] learning:', e.message));
 }

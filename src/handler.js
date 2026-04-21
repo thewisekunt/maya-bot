@@ -701,6 +701,7 @@ export async function handleMessage({
 
   const result = await getMayaReply({
     prefName,
+    botUsername: msg?.client?.user?.username || null,  // Maya's own Discord username for self-recognition
     context: [proactiveNote, context, thirdPartyContext, thoughtContext, entityContext].filter(Boolean).join('\n\n'),  // refContext + emotionalCtx passed separately
     message: finalMessage, entropy, zone, zoneLine,
     contextLine, knownFacts, selfTraits, relationship: { trustLevel },

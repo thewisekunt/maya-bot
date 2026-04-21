@@ -110,6 +110,8 @@ function _batch(key, item, onFlush) {
 
 client.once('ready', async () => {
   console.log(`[bot] Logged in as ${client.user.username} ✓`);
+  _botUsername = client.user.username;
+  _botDisplayName = client.user.globalName || client.user.username;
   // Update bio with a dynamically generated one based on Maya's current mood
   // Bio update disabled — Discord blocks selfbot profile edits with captcha
   const { ensureCollection } = await import('./vector.js');
@@ -677,7 +679,11 @@ function _makeSyntheticMsg(channel, userId, content, client) {
 
 // Store client reference for mayaSpeak
 let _globalClient = null;
+let _botUsername = null;
+let _botDisplayName = null;
 export function setGlobalClient(c) { _globalClient = c; }
+export function getBotUsername() { return _botUsername || 'harikakdi'; }
+export function getBotDisplayName() { return _botDisplayName || 'Maya'; }
 
 // ── Implicit reward ───────────────────────────────────────────────────────────
 const _rewardTimers = new Map();
