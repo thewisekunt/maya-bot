@@ -291,6 +291,17 @@ export async function getMayaReply({
       ivParts.push(`Before this, she was talking about: ${innerCognition.episodicContext.prevTopic.topic}.`);
     }
 
+    // Active behavioral signal — cooling_off reaches LLM (others are gated)
+    // For cooling_off: Maya knows the user wanted space but came back
+    // This tells her to be warm but not overwhelming
+    if (innerCognition.activeSignal) {
+      const sigMap = {
+        cooling_off: "This person seemed to want a bit of space earlier. Be warm but don't overdo it — let them lead.",
+      };
+      const sigNote = sigMap[innerCognition.activeSignal];
+      if (sigNote) ivParts.push(sigNote);
+    }
+
     // Boundary: already caught at IV layer, but reinforce in prompt
     if (innerCognition.boundaryType) {
       const bd = {
@@ -524,7 +535,17 @@ export async function getMayaReply({
         // Fall through with primary reply — meta is never blocking
       }
 
-      return { type: 'reply', text: finalText };
+      // ── Signal attacher ─────────────────────────────────────────────────
+      // If Maya's reply contains disengagement language, attach a behavioral
+      // signal so the next message's decoder knows to give the user space.
+      // This fixes NLP misses — even if notif didn't catch it, the LLM's
+      // own words are the most reliable indicator of what was communicated.
+      const attachedSignal = _detectOutgoingSignal(finalText, message);
+      if (attachedSignal) {
+        console.log(`[llm] signal attached: ${attachedSignal.type} from reply text`);
+      }
+
+      return { type: 'reply', text: finalText, attachedSignal };
 
     } catch (err) {
       console.error(`[llm] error attempt ${attempt + 1}:`, err.message);
@@ -552,4 +573,67 @@ export function replyDelay(messageLength = 20) {
   const typingMs    = 300 + Math.random() * 500;
 
   return Math.round(readingMs + thinkingMs + typingMs);
+}
+
+
+// ── Signal detector ───────────────────────────────────────────────────────────
+// Scans Maya's outgoing reply for disengagement language.
+// Returns a signal descriptor or null.
+// This is the catch-all layer — fires even when NLP missed the user's intent.
+
+function _detectOutgoingSignal(replyText, incomingMessage) {
+  if (!replyText) return null;
+  const r = replyText.toLowerCase();
+  const m = (incomingMessage || '').toLowerCase();
+
+  // go_offline — explicit offline request was made and Maya acknowledged it
+  const goOfflineReply = [
+    /i'?ll go offline/i,
+    /going offline/i,
+    /okay.{0,10}offline/i,
+    /sure.{0,10}offline/i,
+    /offline ho (jaati|jati|rahi)/i,
+  ];
+  const goOfflineMsg = [
+    /go offline/i, /go invisible/i, /offline ho/i, /offline ja/i,
+  ];
+  if (goOfflineReply.some(p => p.test(r)) || (goOfflineMsg.some(p => p.test(m)) && /okay|sure|haan|theek/i.test(r))) {
+    return { type: 'go_offline', duration: 30 * 60 * 1000, source: 'llm_reply' };
+  }
+
+  // disengage — Maya said she'll leave the user alone
+  const disengagePatterns = [
+    /i'?ll leave you alone/i,
+    /i'?ll back off/i,
+    /i'?ll (be|stay) quiet/i,
+    /i'?ll stop/i,
+    /okay.{0,12}(space|alone)/i,
+    /sure.{0,12}space/i,
+    /won'?t bother/i,
+    /chali\s*(jaati|jati)\s*(hun|hoon)/i,
+    /theek hai bye/i,
+    /nikal rahi hun/i,
+    /baat khatam/i,
+    /leave you be/i,
+    /give you space/i,
+    /understood.{0,20}(quiet|space|alone)/i,
+  ];
+  if (disengagePatterns.some(p => p.test(r))) {
+    return { type: 'disengage', duration: 20 * 60 * 1000, source: 'llm_reply' };
+  }
+
+  // cooling_off — Maya acknowledged the user is frustrated or needs a break
+  const coolingOffPatterns = [
+    /need.{0,10}space/i,
+    /take.{0,10}(break|minute)/i,
+    /later then/i,
+    /talk later/i,
+    /baad mein/i,
+    /you seem.{0,15}(tired|frustrated|annoyed)/i,
+  ];
+  if (coolingOffPatterns.some(p => p.test(r))) {
+    return { type: 'cooling_off', duration: 10 * 60 * 1000, source: 'llm_reply' };
+  }
+
+  return null;
 }

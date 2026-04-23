@@ -25,6 +25,7 @@ import { checkSalience } from './salience.js';
 const _prevSentimentStore = new Map();
 import { p as param } from './params.js';
 import { getUserState, recordContact, escalateUser, resetUser, stateToPersonalityMode, USER_STATES } from './user_state.js';
+import { getDisengageSignal, hasSignal, attachSignal, clearSignal, weakenSignal, describeSignals } from './signals.js';
 import { getEmojiHint, getReactEmoji } from './emoji.js';
 import { getReferencedContext, getScopedFacts, getUserGenderAndRoles, syncMemberRoles, getEmotionalContext, clearEmotionFor, inferGenderFromText } from './context_enricher.js';
 import { saveNotification, markReplied } from './inbox.js';
@@ -62,6 +63,10 @@ export async function handleMessage({
   const guildName   = msg.guild?.name    || null;
   const topic       = msg.channel?.topic || null;
   const contextLine = buildContextLine(contextType, channelName, guildName, topic);
+
+  // Signal context — inject cooling_off awareness into LLM prompt
+  // (go_offline/disengage are blocked at the top gate before reaching here)
+  const signalDesc = describeSignals(userId, channelId);
 
   // ── Update guild + channel whereabouts records ────────────────────────────
   upsertGuild(msg.guild).catch(() => {});
@@ -281,6 +286,40 @@ export async function handleMessage({
     // Maya is not engaging with this user at all right now
     console.log(`[handler] user_state:blocked — ignoring ${prefName}`);
     return { type: 'ignore', reason: 'user_blocked' };
+  }
+
+  // ── Signal decoder ──────────────────────────────────────────────────────
+  // Check active behavioral signals BEFORE further processing.
+  // Maya's acknowledgment ("okay I'll leave you alone") attaches a signal.
+  // The NEXT message hits this gate and honors what Maya already said.
+  const activeDisengage = getDisengageSignal(userId, channelId);
+  {
+    if (activeDisengage) {
+      const isDirectPing = isMention || isDM || isReply;
+
+      if (activeDisengage.type === 'go_offline') {
+        if (!isDirectPing) {
+          console.log('[signal] go_offline active for ' + prefName + ' — ignoring');
+          return { type: 'ignore', reason: 'signal:go_offline' };
+        } else {
+          clearSignal(userId, channelId, 'go_offline');
+          console.log('[signal] go_offline cleared — ' + prefName + ' pinged Maya');
+        }
+      } else if (activeDisengage.type === 'disengage') {
+        if (!isDirectPing) {
+          console.log('[signal] disengage active for ' + prefName + ' — ignoring');
+          return { type: 'ignore', reason: 'signal:disengage' };
+        } else if (isReply && !isMention && !isDM) {
+          weakenSignal(userId, channelId, 'disengage', 0.6);
+          console.log('[signal] disengage weakened — ' + prefName + ' replied to Maya');
+        } else {
+          clearSignal(userId, channelId, 'disengage');
+          console.log('[signal] disengage cleared — ' + prefName + ' directly engaged');
+        }
+      } else if (activeDisengage.type === 'cooling_off') {
+        console.log('[signal] cooling_off active for ' + prefName + ' — proceeding softly');
+      }
+    }
   }
 
   const { zone: mZone } = getMomentumZone(momentum);
@@ -702,7 +741,7 @@ export async function handleMessage({
   const result = await getMayaReply({
     prefName,
     botUsername: msg?.client?.user?.username || null,  // Maya's own Discord username for self-recognition
-    context: [proactiveNote, context, thirdPartyContext, thoughtContext, entityContext].filter(Boolean).join('\n\n'),  // refContext + emotionalCtx passed separately
+    context: [proactiveNote, context, thirdPartyContext, thoughtContext, entityContext, signalDesc ? '[Behavioral note: ' + signalDesc + ']' : null].filter(Boolean).join('\n\n'),  // refContext + emotionalCtx passed separately
     message: finalMessage, entropy, zone, zoneLine,
     contextLine, knownFacts, selfTraits, relationship: { trustLevel },
     frequentFriends: [], forceVerbal,
@@ -717,7 +756,10 @@ export async function handleMessage({
     refContext,
     emojiHint,
     desireCtx:       innerCognition.desireCtx || null,
-    innerCognition,
+    innerCognition: {
+      ...innerCognition,
+      activeSignal: activeDisengage?.type || null,
+    },
     // User state takes priority over IV threshold personality mode
     personalityMode: (() => {
       const stateMode = stateToPersonalityMode(userEngState);
@@ -734,6 +776,25 @@ export async function handleMessage({
     saveMessage({ userId, prefName, guildId, channelId, contextType,
       isPrivate, sender: 'user', message, entropy }).catch(() => {});
     return { type: 'ignore', reason: `meta_suppress: ${result.reason}` };
+  }
+
+  // ── Signal writer ─────────────────────────────────────────────────────────
+  // If the LLM's reply contained disengagement language, the signal detector
+  // in llm.js attached a signal descriptor. Store it now.
+  // This is the bridge between words and behavior — Maya said it, now she means it.
+  if (result?.attachedSignal) {
+    const sig = result.attachedSignal;
+    // Also check if the notif fast-path flagged this as want_out
+    const wantOutFlag = msg?._wantOut;
+    // Upgrade to go_offline if NLP detected explicit offline request
+    const finalType = wantOutFlag && sig.type === 'disengage' ? 'go_offline' : sig.type;
+    attachSignal(userId, channelId, finalType, { source: sig.source, duration: sig.duration });
+    console.log('[signal] writer: stored ' + finalType + ' signal for ' + prefName);
+  } else if (msg?._wantOut && result?.type === 'reply') {
+    // NLP caught want_out but LLM reply didn't trigger signal attacher
+    // Still attach a disengage signal — the intent was clear
+    attachSignal(userId, channelId, 'disengage', { source: 'nlp_want_out', duration: 15 * 60 * 1000 });
+    console.log('[signal] writer: nlp want_out fallback signal for ' + prefName);
   }
 
   const savedReply = result.type === 'react'

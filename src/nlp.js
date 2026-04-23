@@ -350,6 +350,39 @@ function _addTrainingData() {
   ];
   gc.forEach(u => manager.addDocument('en', u, 'group_chatter'));
 
+  // ── want_out ─────────────────────────────────────────────────────────────────
+  // User is telling Maya to stop / reduce engagement
+  // These are often misclassified by NLP as group_chatter or emotional —
+  // having an explicit intent here gives the signal system a clean trigger
+  const wo = [
+    // Explicit offline requests
+    'can you go offline', 'please go offline', 'go offline', 'go offline please',
+    'just go offline', 'go invisible', 'can you go invisible',
+    // Stop talking
+    'stop talking', 'stop replying', 'stop responding', 'please stop',
+    'stop it maya', 'maya stop', 'okay stop', 'just stop',
+    'stfu', 'stfu maya', 'shut up', 'shut up maya',
+    'be quiet', 'be quiet maya', 'quiet please',
+    // Leave me alone
+    'leave me alone', 'leave me alone please', 'please leave me alone',
+    'i need space', 'give me space', 'need some space',
+    'not now', 'not now maya', 'later maya', 'maybe later',
+    'i want to be alone', 'i want some peace',
+    // Hinglish
+    'chup reh', 'chup ho ja', 'chup', 'bas kar',
+    'mat bol', 'mat baat kar', 'baat mat kar',
+    'ruk ja', 'ruk', 'ek second ruk',
+    'band kar', 'band karo', 'please band kar',
+    'offline ho ja', 'offline ho jao', 'jao offline',
+    'akela chhodh do', 'mujhe akela chhod', 'thoda space do',
+    'abhi nahi', 'baad mein baat karte hain', 'baad mein',
+    'chalo bye maya', 'okay bye maya',
+    // Soft dismissal
+    'okay i get it', 'i got it thanks', 'okay thank you bye',
+    'i will talk later', 'talk later', 'ttyl',
+  ];
+  wo.forEach(u => manager.addDocument('en', u, 'want_out'));
+
   // ── bot_command ─────────────────────────────────────────────────────────────
   // Human sending a command to a bot — Maya should NOT engage
   const bc = [

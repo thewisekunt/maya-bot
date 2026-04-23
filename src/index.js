@@ -20,6 +20,7 @@ import { processBotMessage, recordBotEvent, looksLikeBotCommand } from './botreg
 import { checkSpam, notifyReplied } from './spamguard.js';
 import db from './db.js';
 import { evaluate } from './notif.js';
+import { loadSignalsFromDB } from './signals.js';
 import { saveNotification, markSeen, processMorningInbox, dismissOldNotifications } from './inbox.js';
 import { markMissing } from './context_enricher.js';
 import { observeEmojis, observeReactionEmoji, getEmojiHint, logReactionReceived } from './emoji.js';
@@ -126,6 +127,7 @@ client.once('ready', async () => {
   startSleepEngine(client);
   console.log('[initiate] engine started');
   setGlobalClient(client);  // make client available to mayaSpeak
+  loadSignalsFromDB().catch(() => {});  // restore behavioral signals from DB
 });
 
 // ── Message handler ───────────────────────────────────────────────────────────
@@ -397,6 +399,9 @@ async function _processNotification(messages, triggerNotif, client) {
     }
 
     const isMention = msg.mentions.has(client.user);
+    // Pass want_out flag from notif evaluation to handler via msg metadata
+    if (evaluation.wantOut) msg._wantOut = true;
+
     const result = await handleMessage({
       userId: msg.author.id, username: msg.author.username,
       displayName: msg.member?.displayName || msg.author.username,
@@ -467,6 +472,21 @@ async function _send(msg, result, channelId, isDM, text, client) {
     const delayMs = replyDelay(text.length);
     await msg.channel.sendTyping().catch(() => {});
     await new Promise(r => setTimeout(r, delayMs));
+  }
+
+  // ── Go offline if signal demands it ───────────────────────────────────────
+  // The signal attacher in llm.js detected that Maya said she'd go offline.
+  // Honor it: actually set Discord presence to invisible.
+  if (result.attachedSignal?.type === 'go_offline' || result.attachedSignal?.type === 'disengage') {
+    const presenceStatus = result.attachedSignal.type === 'go_offline' ? 'invisible' : 'idle';
+    client.user?.setPresence({ status: presenceStatus }).catch(() => {});
+    console.log('[signal] presence set to ' + presenceStatus + ' for ' + (result.attachedSignal.type));
+    // Auto-restore after signal duration
+    const restoreAfter = result.attachedSignal.duration || 20 * 60 * 1000;
+    setTimeout(() => {
+      client.user?.setPresence({ status: 'online' }).catch(() => {});
+      console.log('[signal] presence restored to online after timeout');
+    }, restoreAfter);
   }
 
   if (result.type === 'react') {

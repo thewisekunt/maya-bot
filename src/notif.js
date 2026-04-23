@@ -35,6 +35,17 @@ export async function evaluate(notif, botId) {
 
   if (isDM) return { action: 'reply', reason: 'DM', confidence: 1.0, context: [] };
 
+  // ── Fast-path: want_out detection before context fetch ───────────────────
+  // Check NLP first so disengagement signals fire even before full context load
+  const quickNlp = await classify(msg.content || '').catch(() => null);
+  if (quickNlp?.intent === 'want_out' && quickNlp.score > 0.55) {
+    // Still reply (Maya needs to acknowledge she's backing off),
+    // but flag this as want_out so signal gets attached after reply
+    console.log('[notif] fast-path want_out detected — flagging for signal attachment');
+    const context = await _fetchContext(msg, 5).catch(() => []);
+    return { action: 'reply', reason: 'want_out', confidence: quickNlp.score, context, wantOut: true };
+  }
+
   // ── Fetch context with threading metadata ─────────────────────────────────
   const context = await _fetchContext(msg, CONTEXT_WINDOW);
 
@@ -196,6 +207,7 @@ function _nlpToAction(intent, triggerType, score, threadTarget) {
     case 'random_mention':    return 'lurk';
     case 'directed_at_other': return 'ignore';
     case 'group_chatter':     return 'ignore';
+    case 'want_out':          return 'reply';    // let Maya reply (acknowledge), signal handles behavior
     case 'bot_command':       return 'ignore';  // human sending bot command
     default:                  return 'lurk';
   }
