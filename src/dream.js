@@ -29,6 +29,7 @@ import { computeReward } from './learn.js';
 import { updateSlowDrift } from './psyche.js';
 import { embed, embedBatch } from './embedder.js';
 import { upsertMemory, upsertBatch, isConfigured } from './vector.js';
+import { getUsersNeedingRefresh, refreshModel } from './mental_model.js';
 import axios from 'axios';
 
 // ── Session processing queue ──────────────────────────────────────────────────
@@ -566,6 +567,25 @@ async function _dreamCycle() {
     await _applyReactionFeedback().catch(e => console.error('[dream] reaction feedback:', e.message));
     await _updateBeliefs().catch(e => console.error('[dream] belief update:', e.message));
     await _formSelfBeliefs().catch(e => console.error('[dream] self-belief:', e.message));
+
+    // Mental model refresh — rewrite structured user models for active users
+    // Max 3 users per cycle (each is one LLM call), staggered to avoid burst
+    try {
+      const [[guildRow]] = await db.execute(
+        'SELECT DISTINCT guild_id FROM maya_memory WHERE guild_id IS NOT NULL ORDER BY created_at DESC LIMIT 1'
+      ).catch(() => [[null]]);
+      const activeGuild = guildRow?.guild_id || null;
+      if (activeGuild) {
+        const toRefresh = await getUsersNeedingRefresh(activeGuild);
+        for (const user of toRefresh.slice(0, 3)) {
+          await refreshModel(user.user_id, user.guild_id, user.user_name || 'them').catch(() => {});
+          await new Promise(r => setTimeout(r, 1200));
+        }
+        if (toRefresh.length) console.log('[dream] mental models refreshed: ' + toRefresh.length + ' users');
+      }
+    } catch (e) {
+      console.warn('[dream] mental model refresh:', e.message);
+    }
 
     if (!hasWork) {
       console.log('[dream] cycle skipped (embed/NLP/decisions) — beliefs still ran');

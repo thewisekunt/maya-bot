@@ -25,6 +25,8 @@
  */
 
 import axios from 'axios';
+import { enrichPayload, enrichBatch } from './enrich.js';
+import { updateCentroid } from './centroid.js';
 
 const QDRANT_URL        = process.env.QDRANT_URL;
 const QDRANT_API_KEY    = process.env.QDRANT_API_KEY;
@@ -130,11 +132,19 @@ export async function ensureCollection() {
  * @param {object} payload   — metadata
  */
 export async function upsertMemory(pointId, vector, payload) {
+  // Enrich payload with emotion, valence, arousal, topic_tags
+  const enriched = enrichPayload({ ...payload });
   const res = await q.put(`/collections/${COLLECTION}/points`, {
-    points: [{ id: _toUuid(pointId), vector, payload }],
+    points: [{ id: _toUuid(pointId), vector, payload: enriched }],
   });
   if (res.status !== 200) {
     throw new Error(`upsertMemory HTTP ${res.status}: ${JSON.stringify(res.data).slice(0,200)}`);
+  }
+  // Async centroid update — non-blocking, never throws
+  const _uid = enriched.discord_user_id;
+  const _gid = enriched.guild_id;
+  if (_uid && _uid !== 'maya') {
+    updateCentroid(_uid, _gid).catch(() => {});
   }
 }
 
@@ -143,15 +153,30 @@ export async function upsertMemory(pointId, vector, payload) {
  */
 export async function upsertBatch(points) {
   if (!points.length) return;
+  // Enrich all payloads before upsert — adds emotion, valence, arousal, topic_tags
+  const enrichedPayloads = enrichBatch(points.map(p => ({ ...p.payload })));
   const res = await q.put(`/collections/${COLLECTION}/points`, {
-    points: points.map(p => ({
+    points: points.map((p, i) => ({
       id:      _toUuid(p.id),
       vector:  p.vector,
-      payload: p.payload,
+      payload: enrichedPayloads[i],
     })),
   });
   if (res.status !== 200) {
     throw new Error(`upsertBatch HTTP ${res.status}: ${JSON.stringify(res.data).slice(0,200)}`);
+  }
+  // Async centroid update for each unique user in this batch — non-blocking
+  const _seen = new Set();
+  for (const ep of enrichedPayloads) {
+    const uid = ep.discord_user_id;
+    const gid = ep.guild_id;
+    if (uid && uid !== 'maya') {
+      const k = uid + ':' + (gid || 'dm');
+      if (!_seen.has(k)) {
+        _seen.add(k);
+        updateCentroid(uid, gid).catch(() => {});
+      }
+    }
   }
 }
 

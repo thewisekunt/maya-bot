@@ -19,6 +19,7 @@ import { getBotContext } from './botregistry.js';
 import { p as param } from './params.js';
 import { embed } from './embedder.js';
 import { searchMemories, isConfigured } from './vector.js';
+import { reconstruct, formatReconstructedMemories } from './memory_reconstruction.js';
 import { notifyNewMessage } from './dream.js';
 import { getSessionContext } from './stm.js';
 
@@ -306,6 +307,36 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
     console.log(`[memory] vector recall: facts=${embeddedFacts.length} raw=${uniqueRaw.length} conv=${dedupedConv.length} self=${selfTraitsVec.length} thresholds=fact:${THRESHOLD_FACT}/conv:${THRESHOLD_CONV}`);
 
     const convMemsFinal = dedupedConv;
+
+    // ── Memory reconstruction ─────────────────────────────────────────────
+    // Run spreading activation on top of the flat retrieval results.
+    // Adds: cascade expansion, mental model, anomaly detection, emotional blend.
+    const seedMemories = [...embeddedFacts, ...uniqueRaw, ...salientMems, ...convMemsFinal];
+    let reconstructed = null;
+    try {
+      reconstructed = await reconstruct({
+        userId, guildId, prefName,
+        queryVector:  queryVec,
+        seedMemories,
+        psycheState:  {},  // psyche state injected from handler if available
+        isDM,
+      });
+
+      // Use reconstructed memories if we got a useful result
+      if (reconstructed && (reconstructed.mentalModel || reconstructed.note || reconstructed.cascadeDepth > 0)) {
+        const reconLines = formatReconstructedMemories(reconstructed, prefName);
+        if (reconLines.length > 0) {
+          parts.push(...reconLines);
+          // Skip the individual memory injection blocks below — reconstruction handles them
+          // (fall through to bot context)
+          const botCtx2 = channelId ? (await import('./botregistry.js').then(b => b.getBotContext(channelId)).catch(() => null)) : null;
+          if (botCtx2) { parts.push(''); parts.push(botCtx2); }
+          return parts.join('\n').trim();
+        }
+      }
+    } catch (e) {
+      console.warn('[memory] reconstruction failed, using flat retrieval:', e.message);
+    }
 
     if (userFacts.length > 0) {
       const cleanFacts = userFacts.filter(f => {
