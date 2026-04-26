@@ -16,6 +16,7 @@ import { estimateEntropy, estimateEntropyFast, getEntropyZone, getKnownNames, ge
          getOrCreateRelationship, recordUserInteraction,
          upsertUser, detectNameSet, getFrequentInteractors } from './persona.js';
 import { getMayaReply } from './llm.js';
+import { extractNarrativeMemory } from './narrative_memory.js';
 import { shouldDeliberate, deliberate, webSearch } from './think.js';
 import { getMomentum, updateMomentum, synthesizeMoment, predictLanding, isReactionMessage, getMomentumZone } from './moment.js';
 import { recordPing, getPressureState } from './observation.js';
@@ -892,10 +893,23 @@ export async function handleMessage({
     }
   }
 
-  // Extract facts from user message (fire and forget)
-  // Skip for proactive triggers — the "message" is a synthetic context string, not real user content
+  // Extract narrative memory from user message (fire and forget)
+  // Uses memory palace model — narrative nodes with edges — instead of flat facts.
+  // extractAndStoreFact still runs for Maya self-traits (below).
+  // Skip for proactive triggers — synthetic context string, not real user content.
   if (!opts._proactive) {
-    extractAndStoreFact(userId, message).catch(() => {});
+    const _narSessionId = getActiveSession ? getActiveSession(channelId) : (activeSessionId || null);
+    extractNarrativeMemory(
+      userId, prefName, message,
+      result?.text || '',
+      _narSessionId,
+      {
+        guildId,
+        emotion:  innerCognition?.emotionalState || 'neutral',
+        entropy:  entropy || 0.4,
+        valence:  (innerCognition?.dopamine || 0.5) - 0.5,
+      }
+    ).catch(() => {});
   }
 
   // Extract self-traits from Maya's own reply (fire and forget)

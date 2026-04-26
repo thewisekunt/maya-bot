@@ -134,7 +134,7 @@ export async function getSessionContext(channelId, limit = 15) {
     // This is critical: Maya needs to see the full group conversation to know
     // who is talking to whom. Without this she misattributes messages.
     // Maya's own replies always included (they're part of the thread she's in).
-    const safeLimit = Math.min(limit, 20);
+    const safeLimit = Math.min(limit, 30);  // expanded for full group context
     const [rows] = await db.execute(
       `SELECT discord_user_id, user_name, sender, message, created_at
        FROM maya_session_messages

@@ -20,6 +20,7 @@ import { p as param } from './params.js';
 import { embed } from './embedder.js';
 import { searchMemories, isConfigured } from './vector.js';
 import { reconstruct, formatReconstructedMemories } from './memory_reconstruction.js';
+import { getNarrativeContext } from './narrative_memory.js';
 import { notifyNewMessage } from './dream.js';
 import { getSessionContext } from './stm.js';
 
@@ -59,7 +60,7 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
 
   // ── Layer 1: Session STM (current conversation) ───────────────────────────
   if (channelId) {
-    const sessionMsgs = await getSessionContext(channelId, 12).catch(() => []);
+    const sessionMsgs = await getSessionContext(channelId, 25).catch(() => []);
     if (sessionMsgs.length > 0) {
       if (contextType === 'dm') {
         parts.push('--- Private DM (only this conversation) ---');
@@ -184,6 +185,18 @@ export async function buildContext(userId, prefName, contextType, guildId, curre
       });
       parts.push('');
     }
+  }
+
+  // ── Layer 1b: Narrative memory palace ───────────────────────────────────────
+  // Pull narrative nodes for this user — context-rich story fragments with edges.
+  // These replace the flat fact list in the prompt and provide much richer context.
+  const narrativeCtx = await getNarrativeContext(userId, prefName, guildId, {
+    currentEmotion: null,   // psyche state injected by handler if available
+    limit: 6,
+  }).catch(() => null);
+
+  if (narrativeCtx) {
+    parts.push(narrativeCtx);
   }
 
   // ── Semantic layers (only if Qdrant configured and have a query) ──────────

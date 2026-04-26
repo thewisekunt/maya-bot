@@ -11,7 +11,7 @@ import { startSleepEngine, isSleeping } from './sleep.js';
 import { initPsyche } from './psyche.js';
 import { trainNLP } from './nlp.js';
 import { replyDelay } from './llm.js';
-import { startSTM, openSession, recordSessionMessage } from './stm.js';
+import { startSTM, openSession, recordSessionMessage, getActiveSession } from './stm.js';
 import { generateImage } from './imagegen.js';
 import { refreshAliases } from './scanner.js';
 import { parseNotification, resolveReplyNotif } from './notification.js';
@@ -187,6 +187,22 @@ client.on('messageCreate', async (msg) => {
     const msgEnt = estEnt(content || '');
     observeMessage(channelId, msg.author.id, false, msgEnt);
     notifyUserSpoke(msg.author.id, channelId);
+  }
+
+  // ── Record ALL messages to session for group context ────────────────────
+  // Critical: Maya needs to see EVERYONE talking, not just her target.
+  // Without this, she only sees the engaged user and herself — others vanish.
+  // This runs for every message before routing decisions.
+  if (!isDM && content) {
+    const activeSess = getActiveSession(channelId);
+    if (activeSess) {
+      recordSessionMessage(channelId, {
+        userId:   msg.author.id,
+        userName: msg.member?.displayName || msg.author.username,
+        sender:   'user',
+        message:  content.slice(0, 500),
+      }).catch(() => {});
+    }
   }
 
   // ── Bot command filter — human sending a bot command, skip NLP routing ───
