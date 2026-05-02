@@ -231,9 +231,10 @@ async function _hop1Expansion(seeds, userId, guildId, isDM) {
   const topics   = _extractPayloadField(seeds, 'topic_tags').flat().filter(Boolean);
   const topTopics = [...new Set(topics)].slice(0, 3);
 
-  // Find memories from this user with matching emotion
+  // Find memories from this user with matching emotion — via SQL (Qdrant payload
+  // index for 'emotion' may not exist yet; SQL is safer until index is created)
   if (emotions.length > 0) {
-    const emoMems = await _fetchByPayloadField(userId, guildId, 'emotion', emotions[0], 4, isDM);
+    const emoMems = await _fetchByEmotionSQL(userId, guildId, emotions[0], 4, isDM).catch(() => []);
     results.push(...emoMems.map(m => ({ ...m, _hop: 'emotion' })));
   }
 
@@ -332,6 +333,53 @@ function _extractPayloadField(memories, field) {
   return memories
     .map(m => m.payload?.[field])
     .filter(Boolean);
+}
+
+async function _fetchByEmotionSQL(userId, guildId, emotion, limit, isDM) {
+  // SQL-based emotion fetch — safer than Qdrant payload filter which requires an index
+  // Once the Qdrant payload index for 'emotion' is created, this can migrate to vector search
+  const [rows] = await db.execute(
+    `SELECT id, sender, user_name, message, created_at
+     FROM maya_memory
+     WHERE discord_user_id = ?
+       AND sender = 'user'
+       AND message IS NOT NULL
+       ${guildId && !isDM ? 'AND guild_id = ?' : ''}
+     ORDER BY created_at DESC
+     LIMIT ?`,
+    [userId, ...(guildId && !isDM ? [guildId] : []), limit * 3]  // fetch more, filter below
+  ).catch(() => [[]]);
+
+  // Simple emotion match against message text using enrich heuristics
+  const emotionKeywords = {
+    joy:        ['love', 'amazing', 'excited', 'yay', 'happy', 'great', 'lol', 'haha'],
+    sadness:    ['sad', 'upset', 'cry', 'hurt', 'miss', 'lonely', 'depressed'],
+    anger:      ['angry', 'mad', 'hate', 'annoyed', 'stfu', 'wtf', 'pissed'],
+    anxiety:    ['worried', 'scared', 'nervous', 'stress', 'panic', 'anxious'],
+    playful:    ['lol', 'lmao', 'joke', 'funny', 'haha', 'rofl', 'tease'],
+    affection:  ['miss', 'care', 'sweet', 'hug', 'heart', 'dil', 'pyaar'],
+    content:    ['okay', 'fine', 'chill', 'good', 'nice', 'comfortable'],
+  };
+  const keywords = emotionKeywords[emotion] || [];
+  const matched = (rows || []).filter(r => {
+    const text = (r.message || '').toLowerCase();
+    return keywords.some(k => text.includes(k));
+  });
+
+  return matched.slice(0, limit).map(row => ({
+    message: row.message,
+    score:   0.52,
+    payload: {
+      mysql_id:        row.id,
+      memory_type:     'raw_message',
+      sender:          row.sender,
+      user_name:       row.user_name,
+      discord_user_id: userId,
+      guild_id:        guildId,
+      created_at:      row.created_at,
+      emotion,
+    },
+  }));
 }
 
 async function _fetchByPayloadField(userId, guildId, field, value, limit, isDM) {

@@ -75,6 +75,20 @@ export async function ensureCollection() {
       console.log(`[vector] Collection "${COLLECTION}" ready ✓ (added indexes: ${missing.map(f => f.field_name).join(', ')})`);
     } else {
       console.log(`[vector] Collection "${COLLECTION}" ready ✓`);
+
+  // Ensure payload indexes exist for emotion and topic_tags
+  // Required for Qdrant payload filtering — creates silently if already exists
+  const indexFields = [
+    { field_name: 'emotion',     field_schema: 'keyword' },
+    { field_name: 'topic_tags',  field_schema: 'keyword[]' },
+    { field_name: 'discord_user_id', field_schema: 'keyword' },
+    { field_name: 'sender',      field_schema: 'keyword' },
+    { field_name: 'guild_id',    field_schema: 'keyword' },
+  ];
+  for (const idx of indexFields) {
+    await q.put(`/collections/${COLLECTION}/index`, idx).catch(() => {});
+  }
+  console.log('[vector] Payload indexes verified ✓');
     }
     return true;
   }

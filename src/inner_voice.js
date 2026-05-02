@@ -552,7 +552,7 @@ export async function executeToolPlan(toolPlan, { userId, guildId, channelId, me
           const deep = await buildContext(userId, null, 'server', guildId, message, channelId, 12);
           if (deep) {
             // Split into lines, filter out any line already substantially present in _existingContext
-            const existingCtx = input._existingContext || '';
+            const existingCtx = '';  // _existingContext not available at tool stage — dedup is passive
             const deduped = deep.split('\n')
               .filter(line => {
                 if (!line.trim() || line.startsWith('---')) return true;  // keep headers
