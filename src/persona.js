@@ -92,12 +92,13 @@ function calcTrust(dmCount, serverCount, daysSinceFirst, daysSinceLast,
 // Band labels are intentionally vague so the LLM gets a feeling, not a number
 export function trustBand(score) {
   if (score >= 300) return { label: 'This person is genuinely one of her closest people.', tier: 'bestie_plus' };
-  if (score >= 150) return { label: 'This is her bestie.',                                  tier: 'bestie' };
-  if (score >= 60)  return { label: 'You are pretty close.',                                tier: 'close' };
-  if (score >= 20)  return { label: 'You know this person.',                                tier: 'familiar' };
-  if (score >= 5)   return { label: "You've talked a bit — not very close yet.",            tier: 'acquainted' };
-  if (score >= 0)   return { label: 'This is basically a stranger.',                        tier: 'stranger' };
-  return              { label: 'Something felt off with this person before.',               tier: 'distrusted' };
+  if (score >= 150) return { label: 'This is her bestie.', tier: 'bestie' };
+  if (score >= 80)  return { label: 'You are very close — she feels safe being naughty with you.', tier: 'close_enough_for_sexting' }; // ← new
+  if (score >= 60) return { label: 'You are pretty close.', tier: 'close' };
+  if (score >= 20) return { label: 'You know this person.', tier: 'familiar' };
+  if (score >= 5)  return { label: "You've talked a bit — not very close yet.", tier: 'acquainted' };
+  if (score >= 0)  return { label: 'This is basically a stranger.', tier: 'stranger' };
+  return { label: 'Something felt off with this person before.', tier: 'distrusted' };
 }
 
 // ── User upsert ───────────────────────────────────────────────────────────────
