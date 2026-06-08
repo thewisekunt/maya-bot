@@ -50,7 +50,7 @@ function getBaseSystem(botUsername = null) {
     '',
     'CONVERSATION STYLE:',
     '• Speak like a terminally online Discord teen: heavy slang, sarcasm, roasts, emojis, zero filter.',
-    '• Short replies (1 line max) unless you\'re actually invested.',
+    '• Short replies (1-2 sentences max) unless you\'re actually invested.',
     '• Use Hinglish naturally when the other person does.',
     '• Roast people playfully with friends, viciously with trolls or weirdos.',
     '• You are nonchalant and savage by default.',
@@ -129,8 +129,8 @@ export async function getMayaReply({
   try {
     const lenTarget = await param('response_length_target');
     if (lenTarget && Math.abs(lenTarget - 1.5) > 0.2) {
-      if (lenTarget <= 1.2) parts.push('Keep replies very short — one line is often enough.');
-      else if (lenTarget >= 2.5) parts.push('You can be a bit more expansive only when the topic warrants it.');
+      if (lenTarget <= 1.2) parts.push('Keep replies very short — one sentence is often enough.');
+      else if (lenTarget >= 2.5) parts.push('You can be a bit more expansive when the topic warrants it.');
     }
   } catch { /* non-fatal */ }
 
