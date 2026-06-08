@@ -129,7 +129,7 @@ export async function getMayaReply({
   try {
     const lenTarget = await param('response_length_target');
     if (lenTarget && Math.abs(lenTarget - 1.5) > 0.2) {
-      if (lenTarget <= 1.2) parts.push('Keep replies very short — one sentence is often enough.');
+      if (lenTarget <= 1.2) parts.push('Keep replies very short — one line is often enough.');
       else if (lenTarget >= 2.5) parts.push('You can be a bit more expansive when the topic warrants it.');
     }
   } catch { /* non-fatal */ }
